@@ -2413,7 +2413,12 @@ class LiteLlm(BaseLlm):
         llm_response = _message_to_generate_content_response(
             ChatCompletionAssistantMessage(
                 role="assistant",
-                content=text,
+                # Set content=None for tool-only messages to avoid duplication.
+                # Planning/reasoning text is already streamed and preserved in
+                # thought_parts. Including it again in content causes duplication
+                # and violates OpenAI/LiteLLM conventions for tool-call messages.
+                # See: https://github.com/google/adk-python/issues/3697
+                content=None,
                 tool_calls=tool_calls,
             ),
             model_version=model_version,
