@@ -176,6 +176,25 @@ def _infer_mime_type_from_uri(uri: str) -> Optional[str]:
     return None
 
 
+def _set_finish_reason(
+    response: types.LlmResponse, finish_reason: Any
+) -> None:
+  """Sets the finish reason on the LlmResponse, mapping from string if necessary.
+  
+  Args:
+    response: The LlmResponse object to update.
+    finish_reason: The finish reason value, either a FinishReason enum or a string
+                   that needs to be mapped.
+  """
+  if isinstance(finish_reason, types.FinishReason):
+    response.finish_reason = finish_reason
+  else:
+    finish_reason_str = str(finish_reason).lower()
+    response.finish_reason = _FINISH_REASON_MAPPING.get(
+        finish_reason_str, types.FinishReason.OTHER
+    )
+
+
 def _decode_inline_text_data(raw_bytes: bytes) -> str:
   """Decodes inline file bytes that represent textual content."""
   try:
@@ -1081,13 +1100,7 @@ def _model_response_to_generate_content_response(
   if finish_reason:
     # If LiteLLM already provides a FinishReason enum (e.g., for Gemini), use
     # it directly. Otherwise, map the finish_reason string to the enum.
-    if isinstance(finish_reason, types.FinishReason):
-      llm_response.finish_reason = finish_reason
-    else:
-      finish_reason_str = str(finish_reason).lower()
-      llm_response.finish_reason = _FINISH_REASON_MAPPING.get(
-          finish_reason_str, types.FinishReason.OTHER
-      )
+    _set_finish_reason(llm_response, finish_reason)
   if response.get("usage", None):
     llm_response.usage_metadata = types.GenerateContentResponseUsageMetadata(
         prompt_token_count=response["usage"].get("prompt_tokens", 0),
@@ -1668,13 +1681,7 @@ class LiteLlm(BaseLlm):
             # to ensure consistent behavior across both streaming and non-streaming modes.
             # Without this, Claude and other models via LiteLLM would hit stop conditions
             # that the agent couldn't properly handle.
-            if isinstance(finish_reason, types.FinishReason):
-              aggregated_llm_response_with_tool_call.finish_reason = finish_reason
-            else:
-              finish_reason_str = str(finish_reason).lower()
-              aggregated_llm_response_with_tool_call.finish_reason = _FINISH_REASON_MAPPING.get(
-                  finish_reason_str, types.FinishReason.OTHER
-              )
+            _set_finish_reason(aggregated_llm_response_with_tool_call, finish_reason)
             text = ""
             reasoning_parts = []
             function_calls.clear()
@@ -1696,13 +1703,7 @@ class LiteLlm(BaseLlm):
             # to ensure consistent behavior across both streaming and non-streaming modes.
             # Without this, Claude and other models via LiteLLM would hit stop conditions
             # that the agent couldn't properly handle.
-            if isinstance(finish_reason, types.FinishReason):
-              aggregated_llm_response.finish_reason = finish_reason
-            else:
-              finish_reason_str = str(finish_reason).lower()
-              aggregated_llm_response.finish_reason = _FINISH_REASON_MAPPING.get(
-                  finish_reason_str, types.FinishReason.OTHER
-              )
+            _set_finish_reason(aggregated_llm_response, finish_reason)
             text = ""
             reasoning_parts = []
 
