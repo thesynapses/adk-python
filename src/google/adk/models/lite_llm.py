@@ -1352,7 +1352,7 @@ def _model_response_to_generate_content_response(
   if finish_reason:
     # If LiteLLM already provides a FinishReason enum (e.g., for Gemini), use
     # it directly. Otherwise, map the finish_reason string to the enum.
-    _set_finish_reason(llm_response, finish_reason)
+    llm_response.finish_reason = _map_finish_reason(finish_reason)
   if response.get("usage", None):
     llm_response.usage_metadata = types.GenerateContentResponseUsageMetadata(
         prompt_token_count=response["usage"].get("prompt_tokens", 0),
