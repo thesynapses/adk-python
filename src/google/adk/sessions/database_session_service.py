@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,12 +25,13 @@ from sqlalchemy import delete
 from sqlalchemy import event
 from sqlalchemy import select
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.ext.asyncio import AsyncSession as DatabaseSessionFactory
 from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy.inspection import inspect
+from sqlalchemy.pool import StaticPool
 from typing_extensions import override
 from tzlocal import get_localzone
 
@@ -103,7 +104,15 @@ class DatabaseSessionService(BaseSessionService):
     # 2. Create all tables based on schema
     # 3. Initialize all properties
     try:
-      db_engine = create_async_engine(db_url, **kwargs)
+      engine_kwargs = dict(kwargs)
+      url = make_url(db_url)
+      if url.get_backend_name() == "sqlite" and url.database == ":memory:":
+        engine_kwargs.setdefault("poolclass", StaticPool)
+        connect_args = dict(engine_kwargs.get("connect_args", {}))
+        connect_args.setdefault("check_same_thread", False)
+        engine_kwargs["connect_args"] = connect_args
+
+      db_engine = create_async_engine(db_url, **engine_kwargs)
       if db_engine.dialect.name == "sqlite":
         # Set sqlite pragma to enable foreign keys constraints
         event.listen(db_engine.sync_engine, "connect", _set_sqlite_pragma)
@@ -168,12 +177,9 @@ class DatabaseSessionService(BaseSessionService):
           self._db_schema_version = await conn.run_sync(
               _schema_check_utils.get_db_schema_version_from_connection
           )
-      except Exception:
-        # If inspection fails, assume the latest schema
-        logger.warning(
-            "Failed to inspect database tables, assuming the latest schema."
-        )
-        self._db_schema_version = _schema_check_utils.LATEST_SCHEMA_VERSION
+      except Exception as e:
+        logger.error("Failed to inspect database tables: %s", e)
+        raise
 
     # Check if tables are created and create them if not
     if self._tables_created:
@@ -268,22 +274,29 @@ class DatabaseSessionService(BaseSessionService):
         storage_user_state.state = storage_user_state.state | user_state_delta
 
       # Store the session
+      now = datetime.now(timezone.utc)
+      is_sqlite = self.db_engine.dialect.name == "sqlite"
+      if is_sqlite:
+        now = now.replace(tzinfo=None)
+
       storage_session = schema.StorageSession(
           app_name=app_name,
           user_id=user_id,
           id=session_id,
           state=session_state,
+          create_time=now,
+          update_time=now,
       )
       sql_session.add(storage_session)
       await sql_session.commit()
-
-      await sql_session.refresh(storage_session)
 
       # Merge states for response
       merged_state = _merge_state(
           storage_app_state.state, storage_user_state.state, session_state
       )
-      session = storage_session.to_session(state=merged_state)
+      session = storage_session.to_session(
+          state=merged_state, is_sqlite=is_sqlite
+      )
     return session
 
   @override
@@ -343,7 +356,10 @@ class DatabaseSessionService(BaseSessionService):
 
       # Convert storage session to session
       events = [e.to_event() for e in reversed(storage_events)]
-      session = storage_session.to_session(state=merged_state, events=events)
+      is_sqlite = self.db_engine.dialect.name == "sqlite"
+      session = storage_session.to_session(
+          state=merged_state, events=events, is_sqlite=is_sqlite
+      )
     return session
 
   @override
@@ -386,11 +402,14 @@ class DatabaseSessionService(BaseSessionService):
           user_states_map[storage_user_state.user_id] = storage_user_state.state
 
       sessions = []
+      is_sqlite = self.db_engine.dialect.name == "sqlite"
       for storage_session in results:
         session_state = storage_session.state
         user_state = user_states_map.get(storage_session.user_id, {})
         merged_state = _merge_state(app_state, user_state, session_state)
-        sessions.append(storage_session.to_session(state=merged_state))
+        sessions.append(
+            storage_session.to_session(state=merged_state, is_sqlite=is_sqlite)
+        )
       return ListSessionsResponse(sessions=sessions)
 
   @override
@@ -426,15 +445,6 @@ class DatabaseSessionService(BaseSessionService):
           schema.StorageSession, (session.app_name, session.user_id, session.id)
       )
 
-      if storage_session.update_timestamp_tz > session.last_update_time:
-        raise ValueError(
-            "The last_update_time provided in the session object"
-            f" {datetime.fromtimestamp(session.last_update_time):'%Y-%m-%d %H:%M:%S'} is"
-            " earlier than the update_time in the storage_session"
-            f" {datetime.fromtimestamp(storage_session.update_timestamp_tz):'%Y-%m-%d %H:%M:%S'}."
-            " Please check if it is a stale session."
-        )
-
       # Fetch states from storage
       storage_app_state = await sql_session.get(
           schema.StorageAppState, (session.app_name)
@@ -442,6 +452,29 @@ class DatabaseSessionService(BaseSessionService):
       storage_user_state = await sql_session.get(
           schema.StorageUserState, (session.app_name, session.user_id)
       )
+
+      is_sqlite = self.db_engine.dialect.name == "sqlite"
+      if (
+          storage_session.get_update_timestamp(is_sqlite)
+          > session.last_update_time
+      ):
+        # Reload the session from storage if it has been updated since it was
+        # loaded.
+        app_state = storage_app_state.state if storage_app_state else {}
+        user_state = storage_user_state.state if storage_user_state else {}
+        session_state = storage_session.state
+        session.state = _merge_state(app_state, user_state, session_state)
+
+        stmt = (
+            select(schema.StorageEvent)
+            .filter(schema.StorageEvent.app_name == session.app_name)
+            .filter(schema.StorageEvent.session_id == session.id)
+            .filter(schema.StorageEvent.user_id == session.user_id)
+            .order_by(schema.StorageEvent.timestamp.asc())
+        )
+        result = await sql_session.stream_scalars(stmt)
+        storage_events = [e async for e in result]
+        session.events = [e.to_event() for e in storage_events]
 
       # Extract state delta
       if event.actions and event.actions.state_delta:
@@ -459,7 +492,7 @@ class DatabaseSessionService(BaseSessionService):
         if session_state_delta:
           storage_session.state = storage_session.state | session_state_delta
 
-      if storage_session._dialect_name == "sqlite":
+      if is_sqlite:
         update_time = datetime.fromtimestamp(
             event.timestamp, timezone.utc
         ).replace(tzinfo=None)
@@ -469,11 +502,22 @@ class DatabaseSessionService(BaseSessionService):
       sql_session.add(schema.StorageEvent.from_event(session, event))
 
       await sql_session.commit()
-      await sql_session.refresh(storage_session)
 
       # Update timestamp with commit time
-      session.last_update_time = storage_session.update_timestamp_tz
+      session.last_update_time = storage_session.get_update_timestamp(is_sqlite)
 
     # Also update the in-memory session
     await super().append_event(session=session, event=event)
     return event
+
+  async def close(self) -> None:
+    """Disposes the SQLAlchemy engine and closes pooled connections."""
+    await self.db_engine.dispose()
+
+  async def __aenter__(self) -> DatabaseSessionService:
+    """Enters the async context manager and returns this service."""
+    return self
+
+  async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+    """Exits the async context manager and closes the service."""
+    await self.close()
