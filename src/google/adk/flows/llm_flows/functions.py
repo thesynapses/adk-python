@@ -174,28 +174,21 @@ def populate_client_function_call_id(model_response_event: Event) -> None:
 
 
 def remove_client_function_call_id(content: Optional[types.Content]) -> None:
-  """Removes ADK-generated function call IDs from content before sending to LLM.
+  """Preserves ADK-generated function call IDs for Claude/OpenAI compatibility.
 
-  Strips client-side function call/response IDs that start with 'adk-' prefix
-  to avoid sending internal tracking IDs to the model.
+  Previously stripped client-side function call/response IDs starting with
+  'adk-' prefix. Now preserves them because:
+  - Claude via Vertex AI requires tool_call_id on tool response messages
+  - OpenAI models also require matching tool_call_id
+  - Gemini ignores extra IDs (generates its own or uses None)
+  - Session continuity requires IDs to persist across replayed history
 
   Args:
-    content: Content containing function calls/responses to clean.
+    content: Content containing function calls/responses (preserved as-is).
   """
-  if content and content.parts:
-    for part in content.parts:
-      if (
-          part.function_call
-          and part.function_call.id
-          and part.function_call.id.startswith(AF_FUNCTION_CALL_ID_PREFIX)
-      ):
-        part.function_call.id = None
-      if (
-          part.function_response
-          and part.function_response.id
-          and part.function_response.id.startswith(AF_FUNCTION_CALL_ID_PREFIX)
-      ):
-        part.function_response.id = None
+  # No-op: Keep adk-* IDs for Claude/OpenAI compatibility
+  # See: https://github.com/google/adk-python/issues/XXXX
+  pass
 
 
 def get_long_running_function_calls(
