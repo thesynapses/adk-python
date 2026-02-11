@@ -19,9 +19,8 @@
   * Update agent simulator by improving prompts and add environment data ([7af1858](https://github.com/google/adk-python/commit/7af1858f46b66fa4471c5ba7943385f2d23d08d3))
   * Add a load MCP resource tool ([e25227d](https://github.com/google/adk-python/commit/e25227da5e91a8c1192af709f8e8bb2a471ded92))
   * Add SkillToolset to adk ([8d02792](https://github.com/google/adk-python/commit/8d0279251ce4fad6f0c84bd7777eb5a74f7ba07a))
-  * Add experimental agent tool simulator ([0b9cbd2](https://github.com/google/adk-python/commit/0b9cbd2d42366f1efda6fc3253cd1aa95a28637d))
 
-* **[UI]**
+* **[Web]**
   * Add `/health` and `/version` endpoints to ADK web server ([25ec2c6](https://github.com/google/adk-python/commit/25ec2c6b614cf8d185ff6dbdac5697a210be68da))
 
 ### Bug Fixes
