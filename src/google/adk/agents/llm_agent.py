@@ -890,9 +890,8 @@ class LlmAgent(BaseAgent):
         and getattr(self.code_executor, 'bypass_multi_tools_limit', True)
     ):
       import os
-      from ..code_executors.agent_engine_sandbox_code_executor import (
-          AgentEngineSandboxCodeExecutor,
-      )
+
+      from ..code_executors.agent_engine_sandbox_code_executor import AgentEngineSandboxCodeExecutor
 
       # Get AGENT_ENGINE_RESOURCE_NAME from environment
       agent_engine_resource = os.getenv('AGENT_ENGINE_RESOURCE_NAME')
