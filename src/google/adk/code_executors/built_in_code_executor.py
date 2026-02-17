@@ -32,6 +32,14 @@ class BuiltInCodeExecutor(BaseCodeExecutor):
   other models.
   """
 
+  bypass_multi_tools_limit: bool = True
+  """Whether to bypass the multi-tools limit by auto-replacing with AgentEngineSandbox.
+  
+  When True and multiple tools are present, automatically replaces this executor
+  with AgentEngineSandboxCodeExecutor to work around Gemini API limitation.
+  TODO(b/448114567): Remove once the workaround is no longer needed.
+  """
+
   @override
   def execute_code(
       self,

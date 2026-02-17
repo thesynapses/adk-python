@@ -878,6 +878,39 @@ class LlmAgent(BaseAgent):
           stacklevel=3,
       )
 
+    # Workaround for b/448114567: Auto-replace BuiltInCodeExecutor with
+    # AgentEngineSandboxCodeExecutor when multiple tools are present.
+    # TODO(b/448114567): Remove once the workaround is no longer needed.
+    from ..code_executors.built_in_code_executor import BuiltInCodeExecutor
+
+    if (
+        self.code_executor
+        and isinstance(self.code_executor, BuiltInCodeExecutor)
+        and len(self.tools) > 1
+        and getattr(self.code_executor, 'bypass_multi_tools_limit', True)
+    ):
+      import os
+      from ..code_executors.agent_engine_sandbox_code_executor import (
+          AgentEngineSandboxCodeExecutor,
+      )
+
+      # Get AGENT_ENGINE_RESOURCE_NAME from environment
+      agent_engine_resource = os.getenv('AGENT_ENGINE_RESOURCE_NAME')
+      if agent_engine_resource:
+        # Replace with AgentEngineSandbox to bypass multi-tools limitation
+        self.code_executor = AgentEngineSandboxCodeExecutor(
+            agent_engine_resource_name=agent_engine_resource,
+            optimize_data_file=self.code_executor.optimize_data_file,
+            stateful=self.code_executor.stateful,
+            error_retry_attempts=self.code_executor.error_retry_attempts,
+        )
+        import logging
+        logging.getLogger('google_adk.agents.llm_agent').debug(
+            'Auto-replaced BuiltInCodeExecutor with'
+            ' AgentEngineSandboxCodeExecutor to bypass multi-tools'
+            ' limitation (b/448114567)'
+        )
+
   @classmethod
   @experimental
   def _resolve_tools(
