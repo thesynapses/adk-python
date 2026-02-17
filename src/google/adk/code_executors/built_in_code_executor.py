@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,6 +30,14 @@ class BuiltInCodeExecutor(BaseCodeExecutor):
 
   Currently only supports Gemini 2.0+ models, but will be expanded to
   other models.
+  """
+
+  bypass_multi_tools_limit: bool = True
+  """Whether to bypass the multi-tools limit by auto-replacing with AgentEngineSandbox.
+  
+  When True and multiple tools are present, automatically replaces this executor
+  with AgentEngineSandboxCodeExecutor to work around Gemini API limitation.
+  TODO(b/448114567): Remove once the workaround is no longer needed.
   """
 
   @override
