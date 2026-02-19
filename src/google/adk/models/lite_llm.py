@@ -1962,24 +1962,22 @@ class LiteLlm(BaseLlm):
                         ),
                     )
                 )
-            aggregated_llm_response_with_tool_call = (
-                _message_to_generate_content_response(
-                    ChatCompletionAssistantMessage(
-                        role="assistant",
-                        # FIX: Set content=None for tool-only messages to avoid duplication
-                        # and follow OpenAI/LiteLLM conventions. Planning/reasoning text is
-                        # already streamed (lines 1288-1296) and preserved in thought_parts
-                        # (line 1357). Including it again in content causes duplication and
-                        # violates API specifications for tool-call messages.
-                        # See: https://github.com/google/adk-python/issues/3697
-                        content=None,
-                        tool_calls=tool_calls,
-                    ),
-                    model_version=part.model,
-                    thought_parts=list(reasoning_parts)
-                    if reasoning_parts
-                    else None,
-                )
+            aggregated_llm_response_with_tool_call = _message_to_generate_content_response(
+                ChatCompletionAssistantMessage(
+                    role="assistant",
+                    # FIX: Set content=None for tool-only messages to avoid duplication
+                    # and follow OpenAI/LiteLLM conventions. Planning/reasoning text is
+                    # already streamed (lines 1288-1296) and preserved in thought_parts
+                    # (line 1357). Including it again in content causes duplication and
+                    # violates API specifications for tool-call messages.
+                    # See: https://github.com/google/adk-python/issues/3697
+                    content=None,
+                    tool_calls=tool_calls,
+                ),
+                model_version=part.model,
+                thought_parts=list(reasoning_parts)
+                if reasoning_parts
+                else None,
             )
             aggregated_llm_response_with_tool_call.finish_reason = (
                 _map_finish_reason(finish_reason)
