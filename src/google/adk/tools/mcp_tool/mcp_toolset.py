@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 import logging
 import sys
 from typing import Any
@@ -44,8 +43,10 @@ from ...auth.auth_tool import AuthConfig
 from ..base_tool import BaseTool
 from ..base_toolset import BaseToolset
 from ..base_toolset import ToolPredicate
+from ..load_mcp_resource_tool import LoadMcpResourceTool
 from ..tool_configs import BaseToolConfig
 from ..tool_configs import ToolArgsConfig
+from ..tool_context import ToolContext
 from .mcp_session_manager import MCPSessionManager
 from .mcp_session_manager import retry_on_errors
 from .mcp_session_manager import SseConnectionParams
@@ -112,6 +113,7 @@ class McpToolset(BaseToolset):
       progress_callback: Optional[
           Union[ProgressFnT, ProgressCallbackFactory]
       ] = None,
+      use_mcp_resources: Optional[bool] = False,
   ):
     """Initializes the McpToolset.
 
@@ -137,18 +139,19 @@ class McpToolset(BaseToolset):
       header_provider: A callable that takes a ReadonlyContext and returns a
         dictionary of headers to be used for the MCP session.
       progress_callback: Optional callback to receive progress notifications
-        from MCP server during long-running tool execution. Can be either:
-
-        - A ``ProgressFnT`` callback that receives (progress, total, message).
-          This callback will be shared by all tools in the toolset.
-
-        - A ``ProgressCallbackFactory`` that creates per-tool callbacks. The
-          factory receives (tool_name, callback_context, **kwargs) and returns
-          a ProgressFnT or None. This allows different tools to have different
-          progress handling logic and access/modify session state via the
-          CallbackContext. The **kwargs parameter allows for future
-          extensibility.
+        from MCP server during long-running tool execution. Can be either:  - A
+        ``ProgressFnT`` callback that receives (progress, total, message). This
+        callback will be shared by all tools in the toolset.  - A
+        ``ProgressCallbackFactory`` that creates per-tool callbacks. The factory
+        receives (tool_name, callback_context, **kwargs) and returns a
+        ProgressFnT or None. This allows different tools to have different
+        progress handling logic and access/modify session state via the
+        CallbackContext. The **kwargs parameter allows for future extensibility.
+      use_mcp_resources: Whether the agent should have access to MCP resources.
+        This will add a `load_mcp_resource` tool to the toolset and include
+        available resources in the agent context. Defaults to False.
     """
+
     super().__init__(tool_filter=tool_filter, tool_name_prefix=tool_name_prefix)
 
     if not connection_params:
@@ -177,6 +180,7 @@ class McpToolset(BaseToolset):
         if auth_scheme
         else None
     )
+    self._use_mcp_resources = use_mcp_resources
 
   def _get_auth_headers(self) -> Optional[Dict[str, str]]:
     """Build authentication headers from exchanged credential.
@@ -277,6 +281,9 @@ class McpToolset(BaseToolset):
           coroutine_func(session), timeout=timeout_in_seconds
       )
     except Exception as e:
+      logger.exception(
+          f"Exception during MCP session execution: {error_message}: {e}"
+      )
       raise ConnectionError(f"{error_message}: {e}") from e
 
   @retry_on_errors
@@ -317,6 +324,13 @@ class McpToolset(BaseToolset):
 
       if self._is_tool_selected(mcp_tool, readonly_context):
         tools.append(mcp_tool)
+
+    if self._use_mcp_resources:
+      load_resource_tool = LoadMcpResourceTool(
+          mcp_toolset=self,
+      )
+      tools.append(load_resource_tool)
+
     return tools
 
   async def read_resource(
@@ -415,6 +429,7 @@ class McpToolset(BaseToolset):
         tool_name_prefix=mcp_toolset_config.tool_name_prefix,
         auth_scheme=mcp_toolset_config.auth_scheme,
         auth_credential=mcp_toolset_config.auth_credential,
+        use_mcp_resources=mcp_toolset_config.use_mcp_resources,
     )
 
 
@@ -450,6 +465,8 @@ class McpToolsetConfig(BaseToolConfig):
   auth_scheme: Optional[AuthScheme] = None
 
   auth_credential: Optional[AuthCredential] = None
+
+  use_mcp_resources: bool = False
 
   @model_validator(mode="after")
   def _check_only_one_params_field(self):
