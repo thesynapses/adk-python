@@ -2012,13 +2012,27 @@ async def _get_completion_inputs(
       messages.append(message_param_or_list)
 
   if llm_request.config.system_instruction:
-    messages.insert(
-        0,
-        ChatCompletionSystemMessage(
-            role="system",
-            content=llm_request.config.system_instruction,
-        ),
-    )
+    # For Claude via Vertex AI (vertex_ai/claude-*), emit the system prompt as
+    # a content-block list with cache_control="ephemeral" so Anthropic caches
+    # the static instruction across requests, reducing cost and latency.
+    # All other providers receive the existing flat-string format.
+    if model.startswith("vertex_ai/claude-"):
+      system_message = ChatCompletionSystemMessage(
+          role="system",
+          content=[
+              {
+                  "type": "text",
+                  "text": llm_request.config.system_instruction,
+                  "cache_control": {"type": "ephemeral"},
+              }
+          ],
+      )
+    else:
+      system_message = ChatCompletionSystemMessage(
+          role="system",
+          content=llm_request.config.system_instruction,
+      )
+    messages.insert(0, system_message)
   messages = _ensure_tool_results(messages, model)
 
   # 2. Convert tool declarations
