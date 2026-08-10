@@ -268,6 +268,43 @@ async def test_get_completion_inputs_formats_pydantic_schema_for_litellm():
   }
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        "anthropic/claude-sonnet-4-5",
+        "vertex_ai/claude-sonnet-4-5",
+    ],
+)
+async def test_get_completion_inputs_marks_anthropic_system_prompt_cacheable(
+    model,
+):
+  llm_request = LlmRequest(
+      config=types.GenerateContentConfig(system_instruction="Static prompt")
+  )
+
+  messages, _, _, _ = await _get_completion_inputs(llm_request, model=model)
+
+  assert messages[0]["content"] == [
+      {
+          "type": "text",
+          "text": "Static prompt",
+          "cache_control": {"type": "ephemeral"},
+      }
+  ]
+
+
+async def test_get_completion_inputs_keeps_non_anthropic_system_prompt_flat():
+  llm_request = LlmRequest(
+      config=types.GenerateContentConfig(system_instruction="Static prompt")
+  )
+
+  messages, _, _, _ = await _get_completion_inputs(
+      llm_request, model="openai/gpt-4o"
+  )
+
+  assert messages[0]["content"] == "Static prompt"
+
+
 def test_to_litellm_response_format_passes_preformatted_dict():
   response_format = {
       "type": "json_object",

@@ -2012,11 +2012,9 @@ async def _get_completion_inputs(
       messages.append(message_param_or_list)
 
   if llm_request.config.system_instruction:
-    # For Claude via Vertex AI (vertex_ai/claude-*), emit the system prompt as
-    # a content-block list with cache_control="ephemeral" so Anthropic caches
-    # the static instruction across requests, reducing cost and latency.
-    # All other providers receive the existing flat-string format.
-    if model.startswith("vertex_ai/claude-"):
+    # Emit supported Anthropic system prompts as cacheable content blocks so
+    # the static instruction can be reused across requests.
+    if model.startswith(("anthropic/claude-", "vertex_ai/claude-")):
       system_message = ChatCompletionSystemMessage(
           role="system",
           content=[
