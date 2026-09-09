@@ -41,6 +41,7 @@ async def test_parallel_confirmation_cancels_unfinished_sibling():
   )
   blocked_started = asyncio.Event()
   blocked_cancelled = asyncio.Event()
+  cancellation_reasons = []
 
   async def execute_call(
       _invocation_context,
@@ -51,8 +52,17 @@ async def test_parallel_confirmation_cancels_unfinished_sibling():
   ):
     if function_call.id == confirming_call.id:
       await blocked_started.wait()
+      confirming_response = types.Part.from_function_response(
+          name=confirming_call.name,
+          response={'status': 'approval_required'},
+      )
+      confirming_response.function_response.id = confirming_call.id
       return Event(
           author='root_agent',
+          content=types.Content(
+              role='user',
+              parts=[confirming_response],
+          ),
           actions=EventActions(
               requested_tool_confirmations={
                   confirming_call.id: ToolConfirmation(
@@ -64,7 +74,8 @@ async def test_parallel_confirmation_cancels_unfinished_sibling():
     blocked_started.set()
     try:
       await asyncio.Event().wait()
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as error:
+      cancellation_reasons.extend(error.args)
       blocked_cancelled.set()
       raise
 
@@ -86,6 +97,20 @@ async def test_parallel_confirmation_cancels_unfinished_sibling():
       confirming_call.id: ToolConfirmation(confirmed=False, hint='Approve')
   }
   assert blocked_cancelled.is_set()
+  assert cancellation_reasons == [
+      functions.PARALLEL_APPROVAL_CANCELLATION_REASON
+    ]
+  function_responses = {
+      part.function_response.id: part.function_response
+      for part in response.content.parts
+      if part.function_response
+  }
+  assert set(function_responses) == {confirming_call.id, blocked_call.id}
+  assert function_responses[blocked_call.id].name == blocked_call.name
+  assert function_responses[blocked_call.id].response == {
+      'status': 'cancelled',
+      'reason': 'A parallel tool call requires approval.',
+  }
 
 
 @pytest.mark.asyncio

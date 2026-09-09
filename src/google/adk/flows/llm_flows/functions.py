@@ -58,6 +58,9 @@ AF_FUNCTION_CALL_ID_PREFIX = 'adk-'
 REQUEST_EUC_FUNCTION_CALL_NAME = 'adk_request_credential'
 REQUEST_CONFIRMATION_FUNCTION_CALL_NAME = 'adk_request_confirmation'
 REQUEST_INPUT_FUNCTION_CALL_NAME = 'adk_request_input'
+PARALLEL_APPROVAL_CANCELLATION_REASON = (
+  'A parallel tool call requires approval.'
+)
 
 logger = logging.getLogger('google_adk.' + __name__)
 
@@ -459,9 +462,32 @@ async def handle_function_call_list_async(
           for result in completed_results
       )
       if confirmation_requested:
-        for task in pending_tasks:
-          task.cancel()
-        await asyncio.gather(*pending_tasks, return_exceptions=True)
+        cancelled_tasks = list(pending_tasks)
+        for task in cancelled_tasks:
+          task.cancel(PARALLEL_APPROVAL_CANCELLATION_REASON)
+        await asyncio.gather(*cancelled_tasks, return_exceptions=True)
+        for task in cancelled_tasks:
+          function_call = filtered_calls[task_indexes[task]]
+          indexed_results[task_indexes[task]] = Event(
+            invocation_id=invocation_context.invocation_id,
+            author=agent.name,
+            branch=invocation_context.branch,
+            content=types.Content(
+              role='user',
+              parts=[
+                types.Part.from_function_response(
+                  name=function_call.name,
+                  response={
+                    'status': 'cancelled',
+                    'reason': PARALLEL_APPROVAL_CANCELLATION_REASON,
+                  },
+                )
+              ],
+            ),
+          )
+          indexed_results[task_indexes[task]].content.parts[
+            0
+          ].function_response.id = function_call.id
         break
   except BaseException:
     for task in pending_tasks:
