@@ -439,15 +439,53 @@ async def handle_function_call_list_async(
       for function_call in filtered_calls
   ]
 
-  # Wait for all tasks to complete
+  task_indexes = {task: index for index, task in enumerate(tasks)}
+  pending_tasks = set(tasks)
+  indexed_results = {}
   try:
-    function_response_events = await asyncio.gather(*tasks)
-  except Exception:
-    for t in tasks:
-      if not t.done():
-        t.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
+    while pending_tasks:
+      completed_tasks, pending_tasks = await asyncio.wait(
+          pending_tasks, return_when=asyncio.FIRST_COMPLETED
+      )
+      completed_results = await asyncio.gather(
+          *completed_tasks, return_exceptions=True
+      )
+      for task, result in zip(completed_tasks, completed_results):
+        indexed_results[task_indexes[task]] = result
+
+      confirmation_requested = any(
+          isinstance(result, Event)
+          and result.actions.requested_tool_confirmations
+          for result in completed_results
+      )
+      if confirmation_requested:
+        for task in pending_tasks:
+          task.cancel()
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
+        break
+  except BaseException:
+    for task in pending_tasks:
+      if not task.done():
+        task.cancel()
+    if pending_tasks:
+      await asyncio.gather(*pending_tasks, return_exceptions=True)
     raise
+
+  results = [indexed_results[index] for index in sorted(indexed_results)]
+  function_response_events = [
+      result for result in results if isinstance(result, Event)
+  ]
+  errors = [result for result in results if isinstance(result, BaseException)]
+  if errors:
+    if function_response_events:
+      completed_event = merge_parallel_function_response_events(
+          function_response_events
+      )
+      await invocation_context.session_service.append_event(
+          session=invocation_context.session,
+          event=completed_event,
+      )
+    raise errors[0]
 
   # Filter out None results
   function_response_events = [
@@ -680,15 +718,22 @@ async def handle_function_calls_live(
       for function_call in function_calls
   ]
 
-  # Wait for all tasks to complete
-  try:
-    function_response_events = await asyncio.gather(*tasks)
-  except Exception:
-    for t in tasks:
-      if not t.done():
-        t.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
-    raise
+  results = await asyncio.gather(*tasks, return_exceptions=True)
+  function_response_events = [
+      result for result in results if isinstance(result, Event)
+  ]
+  errors = [result for result in results if isinstance(result, BaseException)]
+  if errors:
+    if function_response_events:
+      completed_event = merge_parallel_function_response_events(
+          function_response_events
+      )
+      completed_event.live_session_id = function_call_event.live_session_id
+      await invocation_context.session_service.append_event(
+          session=invocation_context.session,
+          event=completed_event,
+      )
+    raise errors[0]
 
   # Filter out None results
   function_response_events = [

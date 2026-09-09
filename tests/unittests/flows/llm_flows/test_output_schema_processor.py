@@ -520,3 +520,65 @@ async def test_flow_yields_only_function_response_for_normal_tools():
   assert first_event.get_function_responses()[0].response == {
       'result': 'Searched for: test query'
   }
+
+
+@pytest.mark.asyncio
+async def test_flow_yields_parallel_responses_before_confirmation_event():
+  """A confirmation pause must not orphan sibling function calls."""
+  from google.adk.events.event import Event
+  from google.adk.events.event_actions import EventActions
+  from google.adk.flows.llm_flows import functions
+  from google.adk.flows.llm_flows.base_llm_flow import BaseLlmFlow
+  from google.adk.tools.tool_confirmation import ToolConfirmation
+  from google.genai import types
+
+  agent = LlmAgent(name='test_agent', model='gemini-2.5-flash')
+  invocation_context = await _create_invocation_context(agent)
+  flow = BaseLlmFlow()
+  llm_request = LlmRequest()
+  function_call_event = Event(
+      author='test_agent',
+      content=types.ModelContent([
+          types.Part(function_call=types.FunctionCall(
+              id='mail-call', name='mail_tool', args={}
+          )),
+          types.Part(function_call=types.FunctionCall(
+              id='drive-call', name='drive_tool', args={}
+          )),
+      ]),
+  )
+  function_response_event = Event(
+      author='test_agent',
+      content=types.UserContent([
+          types.Part(function_response=types.FunctionResponse(
+              id='mail-call', name='mail_tool', response={}
+          )),
+          types.Part(function_response=types.FunctionResponse(
+              id='drive-call', name='drive_tool', response={}
+          )),
+      ]),
+      actions=EventActions(requested_tool_confirmations={
+          'mail-call': ToolConfirmation(hint='Approve mail'),
+          'drive-call': ToolConfirmation(hint='Approve drive'),
+      }),
+  )
+
+  with mock.patch.object(
+      functions,
+      'handle_function_calls_async',
+      return_value=function_response_event,
+  ):
+    events = [
+        event
+        async for event in flow._postprocess_handle_function_calls_async(
+            invocation_context, function_call_event, llm_request
+        )
+    ]
+
+  assert len(events[0].get_function_responses()) == 2
+  assert [
+      call.name for call in events[1].get_function_calls()
+  ] == [
+      functions.REQUEST_CONFIRMATION_FUNCTION_CALL_NAME,
+      functions.REQUEST_CONFIRMATION_FUNCTION_CALL_NAME,
+  ]

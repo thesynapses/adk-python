@@ -31,7 +31,7 @@ def function_call(function_call_id, name, args: dict[str, Any]) -> types.Part:
 
 
 @pytest.mark.asyncio
-async def test_parallel_function_call_error_fail_fast():
+async def test_parallel_function_call_error_preserves_completed_sibling():
   id_1 = 'id_1'
   id_2 = 'id_2'
   responses = [
@@ -60,7 +60,7 @@ async def test_parallel_function_call_error_fail_fast():
     nonlocal sleep_started, sleep_completed, sleep_cancelled
     sleep_started = True
     try:
-      await asyncio.sleep(10)  # Sleep long enough to be cancelled
+      await asyncio.sleep(0)
       sleep_completed = True
       return 'Tool succeeded'
     except asyncio.CancelledError:
@@ -82,5 +82,12 @@ async def test_parallel_function_call_error_fail_fast():
 
   assert fail_called
   assert sleep_started
-  assert not sleep_completed
-  assert sleep_cancelled
+  assert sleep_completed
+  assert not sleep_cancelled
+  session = runner.session
+  response_ids = {
+      response.id
+      for event in session.events
+      for response in event.get_function_responses()
+  }
+  assert response_ids == {id_2}

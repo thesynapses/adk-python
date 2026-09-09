@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from google.adk.agents.llm_agent import LlmAgent
 from google.adk.events.event import Event
+from google.adk.events.event_actions import EventActions
 from google.adk.flows.llm_flows import functions
 from google.adk.flows.llm_flows.request_confirmation import request_processor
 from google.adk.models.llm_request import LlmRequest
@@ -208,6 +209,81 @@ async def test_request_confirmation_processor_success():
     assert (
         args[4][MOCK_FUNCTION_CALL_ID] == user_confirmation
     )  # tool_confirmation_dict
+
+
+@pytest.mark.asyncio
+async def test_request_confirmation_processor_emits_chained_confirmation():
+  agent = LlmAgent(name="test_agent", tools=[mock_tool])
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=agent
+  )
+  llm_request = LlmRequest()
+  original_function_call = types.FunctionCall(
+      name=MOCK_TOOL_NAME, args={"param1": "test"}, id=MOCK_FUNCTION_CALL_ID
+  )
+  invocation_context.session.events.extend([
+      Event(
+          author="agent",
+          content=types.Content(parts=[types.Part(function_call=types.FunctionCall(
+              name=functions.REQUEST_CONFIRMATION_FUNCTION_CALL_NAME,
+              args={
+                  "originalFunctionCall": original_function_call.model_dump(
+                      exclude_none=True, by_alias=True
+                  ),
+                  "toolConfirmation": ToolConfirmation(
+                      confirmed=False, hint="first approval"
+                  ).model_dump(by_alias=True, exclude_none=True),
+              },
+              id=MOCK_CONFIRMATION_FUNCTION_CALL_ID,
+          ))]),
+      ),
+      Event(
+          author="user",
+          content=types.Content(parts=[types.Part(function_response=types.FunctionResponse(
+              name=functions.REQUEST_CONFIRMATION_FUNCTION_CALL_NAME,
+              id=MOCK_CONFIRMATION_FUNCTION_CALL_ID,
+              response={
+                  "response": ToolConfirmation(confirmed=True).model_dump_json()
+              },
+          ))]),
+      ),
+  ])
+  chained_confirmation = ToolConfirmation(
+      confirmed=False,
+      hint="second approval",
+      payload={"step": 2},
+  )
+  resumed_response = Event(
+      author="agent",
+      content=types.Content(parts=[types.Part(function_response=types.FunctionResponse(
+          name=MOCK_TOOL_NAME,
+          id=MOCK_FUNCTION_CALL_ID,
+          response={"result": "waiting"},
+      ))]),
+      actions=EventActions(
+          requested_tool_confirmations={
+              MOCK_FUNCTION_CALL_ID: chained_confirmation
+          }
+      ),
+  )
+
+  with patch(
+      "google.adk.flows.llm_flows.functions.handle_function_call_list_async",
+      return_value=resumed_response,
+  ):
+    events = [
+        event
+        async for event in request_processor.run_async(
+            invocation_context, llm_request
+        )
+    ]
+
+  assert events[0] == resumed_response
+  assert len(events) == 2
+  confirmation_call = events[1].get_function_calls()[0]
+  assert confirmation_call.name == functions.REQUEST_CONFIRMATION_FUNCTION_CALL_NAME
+  assert confirmation_call.args["originalFunctionCall"]["id"] == MOCK_FUNCTION_CALL_ID
+  assert confirmation_call.args["toolConfirmation"]["payload"] == {"step": 2}
 
 
 @pytest.mark.asyncio

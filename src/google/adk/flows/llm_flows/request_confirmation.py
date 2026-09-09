@@ -165,9 +165,10 @@ class _RequestConfirmationLlmRequestProcessor(BaseLlmRequestProcessor):
       return
 
     # Step 4: Re-execute the confirmed tools.
+    resumed_function_calls = list(tools_to_resume_with_args.values())
     if function_response_event := await functions.handle_function_call_list_async(
         invocation_context,
-        tools_to_resume_with_args.values(),
+        resumed_function_calls,
         {
             tool.name: tool
             for tool in await agent.canonical_tools(
@@ -178,6 +179,24 @@ class _RequestConfirmationLlmRequestProcessor(BaseLlmRequestProcessor):
         tools_to_resume_with_confirmation,
     ):
       yield function_response_event
+      resumed_function_call_event = Event(
+          invocation_id=invocation_context.invocation_id,
+          author=agent.name,
+          branch=invocation_context.branch,
+          content=types.Content(
+              role='model',
+              parts=[
+                  types.Part(function_call=function_call)
+                  for function_call in resumed_function_calls
+              ],
+          ),
+      )
+      if confirmation_event := functions.generate_request_confirmation_event(
+          invocation_context,
+          resumed_function_call_event,
+          function_response_event,
+      ):
+        yield confirmation_event
     return
 
 

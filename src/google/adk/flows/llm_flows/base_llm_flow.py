@@ -1212,11 +1212,11 @@ class BaseLlmFlow(ABC):
       tool_confirmation_event = functions.generate_request_confirmation_event(
           invocation_context, function_call_event, function_response_event
       )
-      if tool_confirmation_event:
-        yield tool_confirmation_event
-
       # Always yield the function response event first
       yield function_response_event
+
+      if tool_confirmation_event:
+        yield tool_confirmation_event
 
       # Check if this is a set_model_response function response
       if json_response := _output_schema_processor.get_structured_model_response(

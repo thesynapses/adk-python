@@ -157,6 +157,14 @@ class TestHITLConfirmationFlowWithSingleAgent(BaseHITLTest):
         (
             agent.name,
             Part(
+                function_response=FunctionResponse(
+                    name=tools[0].name, response=TOOL_CALL_ERROR_RESPONSE
+                )
+            ),
+        ),
+        (
+            agent.name,
+            Part(
                 function_call=FunctionCall(
                     name=REQUEST_CONFIRMATION_FUNCTION_CALL_NAME,
                     args={
@@ -173,14 +181,6 @@ class TestHITLConfirmationFlowWithSingleAgent(BaseHITLTest):
                 )
             ),
         ),
-        (
-            agent.name,
-            Part(
-                function_response=FunctionResponse(
-                    name=tools[0].name, response=TOOL_CALL_ERROR_RESPONSE
-                )
-            ),
-        ),
     ]
 
     simplified = testing_utils.simplify_events(copy.deepcopy(events))
@@ -189,9 +189,9 @@ class TestHITLConfirmationFlowWithSingleAgent(BaseHITLTest):
       assert simplified[i][1] == part
 
     ask_for_confirmation_function_call_id = (
-        events[1].content.parts[0].function_call.id
+        events[2].content.parts[0].function_call.id
     )
-    invocation_id = events[1].invocation_id
+    invocation_id = events[2].invocation_id
     user_confirmation = testing_utils.UserContent(
         Part(
             function_response=FunctionResponse(
@@ -285,6 +285,14 @@ class TestHITLConfirmationFlowWithCustomPayloadSchema(BaseHITLTest):
         (
             agent.name,
             Part(
+                function_response=FunctionResponse(
+                    name=tools[0].name, response=TOOL_CALL_ERROR_RESPONSE
+                )
+            ),
+        ),
+        (
+            agent.name,
+            Part(
                 function_call=FunctionCall(
                     name=REQUEST_CONFIRMATION_FUNCTION_CALL_NAME,
                     args={
@@ -311,15 +319,6 @@ class TestHITLConfirmationFlowWithCustomPayloadSchema(BaseHITLTest):
                 )
             ),
         ),
-        (
-            agent.name,
-            Part(
-                function_response=FunctionResponse(
-                    name=tools[0].name, response=TOOL_CALL_ERROR_RESPONSE
-                )
-            ),
-        ),
-        (agent.name, "test llm response after tool call"),
     ]
 
     simplified = testing_utils.simplify_events(copy.deepcopy(events))
@@ -328,9 +327,9 @@ class TestHITLConfirmationFlowWithCustomPayloadSchema(BaseHITLTest):
       assert simplified[i][1] == part
 
     ask_for_confirmation_function_call_id = (
-        events[1].content.parts[0].function_call.id
+        events[2].content.parts[0].function_call.id
     )
-    invocation_id = events[1].invocation_id
+    invocation_id = events[2].invocation_id
     custom_payload = {
         "test_custom_payload": {
             "int_field": 123,
@@ -366,7 +365,7 @@ class TestHITLConfirmationFlowWithCustomPayloadSchema(BaseHITLTest):
                 )
             ),
         ),
-        (agent.name, "test llm response after final tool call"),
+        (agent.name, "test llm response after tool call"),
     ]
     for event in events:
       assert event.invocation_id == invocation_id
@@ -441,6 +440,14 @@ class TestHITLConfirmationFlowWithResumableApp:
         (
             agent.name,
             Part(
+                function_response=FunctionResponse(
+                    name=agent.tools[0].name, response=TOOL_CALL_ERROR_RESPONSE
+                )
+            ),
+        ),
+        (
+            agent.name,
+            Part(
                 function_call=FunctionCall(
                     name=REQUEST_CONFIRMATION_FUNCTION_CALL_NAME,
                     args={
@@ -457,19 +464,11 @@ class TestHITLConfirmationFlowWithResumableApp:
                 )
             ),
         ),
-        (
-            agent.name,
-            Part(
-                function_response=FunctionResponse(
-                    name=agent.tools[0].name, response=TOOL_CALL_ERROR_RESPONSE
-                )
-            ),
-        ),
     ]
     ask_for_confirmation_function_call_id = (
-        events[1].content.parts[0].function_call.id
+        events[2].content.parts[0].function_call.id
     )
-    invocation_id = events[1].invocation_id
+    invocation_id = events[2].invocation_id
     user_confirmation = testing_utils.UserContent(
         Part(
             function_response=FunctionResponse(
@@ -523,6 +522,14 @@ class TestHITLConfirmationFlowWithResumableApp:
         (
             agent.name,
             Part(
+                function_response=FunctionResponse(
+                    name=agent.tools[0].name, response=TOOL_CALL_ERROR_RESPONSE
+                )
+            ),
+        ),
+        (
+            agent.name,
+            Part(
                 function_call=FunctionCall(
                     name=REQUEST_CONFIRMATION_FUNCTION_CALL_NAME,
                     args={
@@ -539,19 +546,11 @@ class TestHITLConfirmationFlowWithResumableApp:
                 )
             ),
         ),
-        (
-            agent.name,
-            Part(
-                function_response=FunctionResponse(
-                    name=agent.tools[0].name, response=TOOL_CALL_ERROR_RESPONSE
-                )
-            ),
-        ),
     ]
     ask_for_confirmation_function_call_id = (
-        events[1].content.parts[0].function_call.id
+        events[2].content.parts[0].function_call.id
     )
-    invocation_id = events[1].invocation_id
+    invocation_id = events[2].invocation_id
     user_confirmation = testing_utils.UserContent(
         Part(
             function_response=FunctionResponse(
@@ -681,6 +680,15 @@ class TestHITLConfirmationFlowWithSequentialAgentAndResumableApp:
         (
             sub_agent1.name,
             Part(
+                function_response=FunctionResponse(
+                    name=sub_agent1.tools[0].name,
+                    response=TOOL_CALL_ERROR_RESPONSE,
+                )
+            ),
+        ),
+        (
+            sub_agent1.name,
+            Part(
                 function_call=FunctionCall(
                     name=REQUEST_CONFIRMATION_FUNCTION_CALL_NAME,
                     args={
@@ -697,20 +705,11 @@ class TestHITLConfirmationFlowWithSequentialAgentAndResumableApp:
                 )
             ),
         ),
-        (
-            sub_agent1.name,
-            Part(
-                function_response=FunctionResponse(
-                    name=sub_agent1.tools[0].name,
-                    response=TOOL_CALL_ERROR_RESPONSE,
-                )
-            ),
-        ),
     ]
     ask_for_confirmation_function_call_id = (
-        events[2].content.parts[0].function_call.id
+        events[3].content.parts[0].function_call.id
     )
-    invocation_id = events[2].invocation_id
+    invocation_id = events[3].invocation_id
 
     # Step 2:
     # Resume the invocation and confirm the tool call from sub_agent1, and
@@ -866,6 +865,15 @@ class TestHITLConfirmationFlowWithParallelAgentAndResumableApp:
         (
             sub_agent1.name,
             Part(
+                function_response=FunctionResponse(
+                    name=sub_agent1.tools[0].name,
+                    response=TOOL_CALL_ERROR_RESPONSE,
+                )
+            ),
+        ),
+        (
+            sub_agent1.name,
+            Part(
                 function_call=FunctionCall(
                     name=REQUEST_CONFIRMATION_FUNCTION_CALL_NAME,
                     args={
@@ -882,15 +890,6 @@ class TestHITLConfirmationFlowWithParallelAgentAndResumableApp:
                 )
             ),
         ),
-        (
-            sub_agent1.name,
-            Part(
-                function_response=FunctionResponse(
-                    name=sub_agent1.tools[0].name,
-                    response=TOOL_CALL_ERROR_RESPONSE,
-                )
-            ),
-        ),
     ]
     assert testing_utils.simplify_resumable_app_events(
         copy.deepcopy(sub_agent2_branch_events)
@@ -900,6 +899,15 @@ class TestHITLConfirmationFlowWithParallelAgentAndResumableApp:
             Part(
                 function_call=FunctionCall(
                     name=sub_agent2.tools[0].name, args={}
+                )
+            ),
+        ),
+        (
+            sub_agent2.name,
+            Part(
+                function_response=FunctionResponse(
+                    name=sub_agent2.tools[0].name,
+                    response=TOOL_CALL_ERROR_RESPONSE,
                 )
             ),
         ),
@@ -922,26 +930,17 @@ class TestHITLConfirmationFlowWithParallelAgentAndResumableApp:
                 )
             ),
         ),
-        (
-            sub_agent2.name,
-            Part(
-                function_response=FunctionResponse(
-                    name=sub_agent2.tools[0].name,
-                    response=TOOL_CALL_ERROR_RESPONSE,
-                )
-            ),
-        ),
     ]
 
     ask_for_confirmation_function_call_ids = [
-        sub_agent1_branch_events[1].content.parts[0].function_call.id,
-        sub_agent2_branch_events[1].content.parts[0].function_call.id,
+        sub_agent1_branch_events[2].content.parts[0].function_call.id,
+        sub_agent2_branch_events[2].content.parts[0].function_call.id,
     ]
     assert (
-        sub_agent1_branch_events[1].invocation_id
-        == sub_agent2_branch_events[1].invocation_id
+        sub_agent1_branch_events[2].invocation_id
+        == sub_agent2_branch_events[2].invocation_id
     )
-    invocation_id = sub_agent1_branch_events[1].invocation_id
+    invocation_id = sub_agent1_branch_events[2].invocation_id
 
     # Resume the invocation and confirm the tool call from sub_agent1.
     user_confirmations = [
