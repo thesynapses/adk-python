@@ -12,8 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import threading
+import unicodedata
+
 from google.adk.events.event import Event
+from google.adk.memory.base_memory_service import BaseMemoryService
+from google.adk.memory.base_memory_service import SearchMemoryResponse
 from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
+from google.adk.platform import thread as platform_thread
 from google.adk.sessions.session import Session
 from google.genai import types
 import pytest
@@ -108,7 +115,7 @@ async def test_add_session_to_memory():
   memory_service = InMemoryMemoryService()
   await memory_service.add_session_to_memory(MOCK_SESSION_1)
 
-  user_key = f'{MOCK_APP_NAME}/{MOCK_USER_ID}'
+  user_key = (MOCK_APP_NAME, MOCK_USER_ID)
   assert user_key in memory_service._session_events
   session_memory = memory_service._session_events[user_key]
   assert MOCK_SESSION_1.id in session_memory
@@ -129,7 +136,7 @@ async def test_add_events_to_memory_with_explicit_events():
       events=[MOCK_SESSION_1.events[0]],
   )
 
-  user_key = f'{MOCK_APP_NAME}/{MOCK_USER_ID}'
+  user_key = (MOCK_APP_NAME, MOCK_USER_ID)
   session_memory = memory_service._session_events[user_key]
   assert len(session_memory[MOCK_SESSION_1.id]) == 1
   assert session_memory[MOCK_SESSION_1.id][0].id == 'event-1a'
@@ -145,7 +152,7 @@ async def test_add_events_to_memory_without_session_id_uses_default_bucket():
       events=[MOCK_SESSION_1.events[0]],
   )
 
-  user_key = f'{MOCK_APP_NAME}/{MOCK_USER_ID}'
+  user_key = (MOCK_APP_NAME, MOCK_USER_ID)
   session_memory = memory_service._session_events[user_key]
   assert len(session_memory) == 1
   unknown_session_events = next(iter(session_memory.values()))
@@ -164,7 +171,7 @@ async def test_add_events_to_memory_alias_is_supported():
       events=[MOCK_SESSION_1.events[0]],
   )
 
-  user_key = f'{MOCK_APP_NAME}/{MOCK_USER_ID}'
+  user_key = (MOCK_APP_NAME, MOCK_USER_ID)
   session_memory = memory_service._session_events[user_key]
   assert [event.id for event in session_memory[MOCK_SESSION_1.id]] == [
       'event-1a'
@@ -191,7 +198,7 @@ async def test_add_events_to_memory_appends_without_replacing():
       events=[new_event],
   )
 
-  user_key = f'{MOCK_APP_NAME}/{MOCK_USER_ID}'
+  user_key = (MOCK_APP_NAME, MOCK_USER_ID)
   session_memory = memory_service._session_events[user_key]
   assert [event.id for event in session_memory[MOCK_SESSION_1.id]] == [
       'event-1a',
@@ -220,7 +227,7 @@ async def test_add_events_to_memory_deduplicates_event_ids():
       events=[duplicate_event],
   )
 
-  user_key = f'{MOCK_APP_NAME}/{MOCK_USER_ID}'
+  user_key = (MOCK_APP_NAME, MOCK_USER_ID)
   session_memory = memory_service._session_events[user_key]
   assert [event.id for event in session_memory[MOCK_SESSION_1.id]] == [
       'event-1a',
@@ -234,7 +241,7 @@ async def test_add_session_with_no_events_to_memory():
   memory_service = InMemoryMemoryService()
   await memory_service.add_session_to_memory(MOCK_SESSION_WITH_NO_EVENTS)
 
-  user_key = f'{MOCK_APP_NAME}/{MOCK_USER_ID}'
+  user_key = (MOCK_APP_NAME, MOCK_USER_ID)
   assert user_key in memory_service._session_events
   session_memory = memory_service._session_events[user_key]
   assert MOCK_SESSION_WITH_NO_EVENTS.id in session_memory
@@ -330,29 +337,677 @@ async def test_search_memory_is_scoped_by_user():
 
 
 @pytest.mark.asyncio
-async def test_search_memory_matches_non_latin_text():
-  """Tests that search matches non-Latin (e.g. Cyrillic) text."""
+async def test_search_memory_does_not_collide_on_slash_in_identifiers():
+  """Tests that a slash in app_name cannot alias another app/user pair."""
   memory_service = InMemoryMemoryService()
+  await memory_service.add_session_to_memory(
+      Session(
+          app_name='app/other-user',
+          user_id='user',
+          id='session-slashed-app',
+          last_update_time=1000,
+          events=[
+              Event(
+                  id='event-slashed-app',
+                  invocation_id='inv-slashed-app',
+                  author='user',
+                  timestamp=12345,
+                  content=types.Content(
+                      parts=[types.Part(text='This is a secret.')]
+                  ),
+              ),
+          ],
+      )
+  )
+
+  result = await memory_service.search_memory(
+      app_name='app', user_id='other-user/user', query='secret'
+  )
+
+  assert not result.memories
+
+
+# --- Non-Latin language tests ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'event_text,query,expected_count',
+    [
+        # Japanese (no space delimiters — substring fallback)
+        ('私の名前は太郎です', '太郎', 1),
+        ('私の名前は太郎です', '天気', 0),
+        # Chinese (no space delimiters — substring fallback)
+        ('我喜欢机器学习', '机器学习', 1),
+        ('我喜欢机器学习', '天气预报', 0),
+        # Korean (space-delimited — token match)
+        ('제 이름은 민수입니다', '민수입니다', 1),
+        # Cyrillic (space-delimited — token match)
+        ('Меня зовут Алексей', 'Алексей', 1),
+        # Mixed: non-Latin substring + Latin token in same event
+        ('太郎 works at ABC Corp', '太郎', 1),
+        ('太郎 works at ABC Corp', 'ABC', 1),
+        # Latin word inside an unspaced script (no space to tokenize on)
+        ('私はPythonでADKを使っています', 'Python', 1),
+        ('私はPythonでADKを使っています', 'adk', 1),
+        ('我用Python写代码', 'python', 1),
+        ('私はPythonでADKを使っています', '使って', 1),
+        ('私はPythonでADKを使っています', 'Java', 0),
+        ('私はmy_var_nameを使う', 'my_var_name', 1),
+        ('私はcafé_1を使う', 'café_1', 1),
+        # Latin partial-word must NOT match (regression guard)
+        ('I like to code in Python.', 'thon', 0),
+        ('私はPythonでADKを使っています', 'thon', 0),
+        # Decomposed (NFD) text: NFC normalization ensures match
+        (
+            unicodedata.normalize('NFD', '私はCaféでADKを使っています'),
+            'Café',
+            1,
+        ),
+        (
+            unicodedata.normalize('NFD', '私はCaféでADKを使っています'),
+            'café',
+            1,
+        ),
+        (
+            unicodedata.normalize('NFD', '私はCaféでADKを使っています'),
+            'Ruby',
+            0,
+        ),
+        (unicodedata.normalize('NFD', 'Meet at the Café'), 'Café', 1),
+        ('Meet at the Café', unicodedata.normalize('NFD', 'Café'), 1),
+        (
+            unicodedata.normalize('NFD', 'プログラミングを学ぶ'),
+            'プログラミング',
+            1,
+        ),
+        (unicodedata.normalize('NFD', '제 이름은 민수입니다'), '민수입니다', 1),
+    ],
+)
+async def test_search_memory_non_latin(event_text, query, expected_count):
+  """Tests search_memory with non-Latin scripts and mixed content."""
   session = Session(
       app_name=MOCK_APP_NAME,
       user_id=MOCK_USER_ID,
-      id='session-non-latin',
-      last_update_time=5000,
+      id='session-i18n',
+      last_update_time=7000,
       events=[
           Event(
-              id='event-non-latin',
-              invocation_id='inv-non-latin',
+              id='event-i18n',
+              invocation_id='inv-i18n',
               author='user',
-              timestamp=70000,
-              content=types.Content(parts=[types.Part(text='Привет мир')]),
+              timestamp=90000,
+              content=types.Content(parts=[types.Part(text=event_text)]),
           ),
       ],
   )
+  memory_service = InMemoryMemoryService()
   await memory_service.add_session_to_memory(session)
 
   result = await memory_service.search_memory(
-      app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, query='привет'
+      app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, query=query
+  )
+  assert len(result.memories) == expected_count
+
+
+def _text_event(tag: str, text: str) -> Event:
+  return Event(
+      id=f'event-{tag}',
+      invocation_id=f'inv-{tag}',
+      author='user',
+      timestamp=1.0,
+      content=types.Content(parts=[types.Part(text=text)]),
+  )
+
+
+@pytest.mark.asyncio
+async def test_search_memory_ranks_by_number_of_matching_words():
+  """Tests that the events matching the most query words come first."""
+  memory_service = InMemoryMemoryService()
+  await memory_service.add_session_to_memory(
+      Session(
+          app_name=MOCK_APP_NAME,
+          user_id=MOCK_USER_ID,
+          id='session-ranked',
+          last_update_time=1000,
+          events=[
+              _text_event('ranked-a', 'The deploy is ready.'),
+              _text_event('ranked-b', 'Ready.'),
+              _text_event('ranked-c', 'The deploy status is ready.'),
+          ],
+      )
+  )
+
+  result = await memory_service.search_memory(
+      app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, query='deploy status ready'
+  )
+
+  assert [memory.content.parts[0].text for memory in result.memories] == [
+      'The deploy status is ready.',
+      'The deploy is ready.',
+      'Ready.',
+  ]
+
+
+@pytest.mark.asyncio
+async def test_search_memory_returns_at_most_ten_memories():
+  """Tests that a word shared with the whole store cannot return the store."""
+  memory_service = InMemoryMemoryService()
+  events = [_text_event(f'note-{i}', f'note {i} about work') for i in range(20)]
+  events.append(_text_event('backlog', 'the backlog note about work'))
+  await memory_service.add_session_to_memory(
+      Session(
+          app_name=MOCK_APP_NAME,
+          user_id=MOCK_USER_ID,
+          id='session-many',
+          last_update_time=1000,
+          events=events,
+      )
+  )
+
+  result = await memory_service.search_memory(
+      app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, query='work backlog note'
+  )
+
+  texts = [memory.content.parts[0].text for memory in result.memories]
+  # The best match is stored last but ranks first, and the rest tie, so they
+  # keep the order they were added in.
+  assert texts == ['the backlog note about work'] + [
+      f'note {i} about work' for i in range(9)
+  ]
+
+
+def _make_event(tag: str) -> Event:
+  return Event(
+      id=f'event-{tag}',
+      invocation_id=f'inv-{tag}',
+      author='user',
+      timestamp=1.0,
+      content=types.Content(parts=[types.Part(text=f'fact about {tag}')]),
+  )
+
+
+def _make_session(tag: str) -> Session:
+  return Session(
+      app_name=MOCK_APP_NAME,
+      user_id=MOCK_USER_ID,
+      id=f'session-{tag}',
+      last_update_time=1,
+      events=[_make_event(tag)],
+  )
+
+
+def test_search_memory_is_thread_safe_against_concurrent_writes():
+  """Searching while other threads add memory must not crash.
+
+  InMemoryMemoryService documents itself as thread-safe. search_memory must
+  therefore iterate a stable snapshot taken under the lock; iterating a live
+  reference to the shared store while a concurrent writer mutates it raises
+  "RuntimeError: dictionary changed size during iteration".
+  """
+  memory_service = InMemoryMemoryService()
+  seed_loop = asyncio.new_event_loop()
+  try:
+    for i in range(50):
+      seed_loop.run_until_complete(
+          memory_service.add_session_to_memory(_make_session(f'seed-{i}'))
+      )
+  finally:
+    seed_loop.close()
+
+  errors = []
+  stop = threading.Event()
+  barrier = threading.Barrier(3)
+
+  def writer():
+    loop = asyncio.new_event_loop()
+    barrier.wait()
+    try:
+      for i in range(500):
+        if stop.is_set():
+          return
+        loop.run_until_complete(
+            memory_service.add_session_to_memory(_make_session(f'writer-{i}'))
+        )
+    except Exception as e:  # pylint: disable=broad-except
+      errors.append(e)
+      stop.set()
+    finally:
+      loop.close()
+
+  def reader():
+    loop = asyncio.new_event_loop()
+    barrier.wait()
+    try:
+      for _ in range(500):
+        if stop.is_set():
+          return
+        loop.run_until_complete(
+            memory_service.search_memory(
+                app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, query='fact'
+            )
+        )
+    except Exception as e:  # pylint: disable=broad-except
+      errors.append(e)
+      stop.set()
+    finally:
+      loop.close()
+
+  threads = [
+      platform_thread.create_thread(writer),
+      platform_thread.create_thread(reader),
+      platform_thread.create_thread(reader),
+  ]
+  for thread in threads:
+    thread.start()
+  for thread in threads:
+    thread.join()
+
+  assert (
+      not errors
+  ), f'search_memory raced with concurrent writes: {errors[0]!r}'
+
+
+def _event_without_parts(tag: str) -> Event:
+  return Event(
+      id=f'event-{tag}', author='user', content=types.Content(parts=None)
+  )
+
+
+@pytest.mark.asyncio
+async def test_add_session_to_memory_skips_events_without_parts():
+  """An event without parts is not stored, so its id stays free."""
+  memory_service = InMemoryMemoryService()
+  await memory_service.add_session_to_memory(
+      Session(
+          app_name=MOCK_APP_NAME,
+          user_id=MOCK_USER_ID,
+          id='session-empty',
+          events=[_event_without_parts('reused-id')],
+      )
+  )
+
+  await memory_service.add_events_to_memory(
+      app_name=MOCK_APP_NAME,
+      user_id=MOCK_USER_ID,
+      session_id='session-empty',
+      events=[_text_event('reused-id', 'stored later')],
+  )
+
+  result = await memory_service.search_memory(
+      app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, query='later'
+  )
+  assert [m.content.parts[0].text for m in result.memories] == ['stored later']
+
+
+@pytest.mark.asyncio
+async def test_add_events_to_memory_skips_events_without_parts():
+  """An added event without parts is not stored, so its id stays free."""
+  memory_service = InMemoryMemoryService()
+  await memory_service.add_events_to_memory(
+      app_name=MOCK_APP_NAME,
+      user_id=MOCK_USER_ID,
+      events=[
+          Event(id='event-no-content', author='user', content=None),
+          _event_without_parts('reused-id'),
+      ],
+  )
+
+  await memory_service.add_events_to_memory(
+      app_name=MOCK_APP_NAME,
+      user_id=MOCK_USER_ID,
+      events=[_text_event('reused-id', 'stored later')],
+  )
+
+  result = await memory_service.search_memory(
+      app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, query='later'
+  )
+  assert [m.content.parts[0].text for m in result.memories] == ['stored later']
+
+
+@pytest.mark.asyncio
+async def test_add_events_to_memory_empty_and_none_session_id_share_bucket():
+  """session_id '' and None write to one bucket, deduplicated by event id."""
+  memory_service = InMemoryMemoryService()
+  await memory_service.add_events_to_memory(
+      app_name=MOCK_APP_NAME,
+      user_id=MOCK_USER_ID,
+      session_id='',
+      events=[_text_event('shared-id', 'first copy')],
+  )
+  await memory_service.add_events_to_memory(
+      app_name=MOCK_APP_NAME,
+      user_id=MOCK_USER_ID,
+      session_id=None,
+      events=[_text_event('shared-id', 'second copy')],
+  )
+
+  result = await memory_service.search_memory(
+      app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, query='copy'
+  )
+  assert [m.content.parts[0].text for m in result.memories] == ['first copy']
+
+
+def _blob_part() -> types.Part:
+  return types.Part(inline_data=types.Blob(data=b'abc', mime_type='text/plain'))
+
+
+@pytest.mark.asyncio
+async def test_search_memory_ignores_parts_without_text():
+  """A part without text does not stop the event's text from matching."""
+  memory_service = InMemoryMemoryService()
+  event = _text_event('mixed', 'hello world')
+  event.content.parts.insert(0, _blob_part())
+  await memory_service.add_events_to_memory(
+      app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, events=[event]
+  )
+
+  result = await memory_service.search_memory(
+      app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, query='hello'
+  )
+  assert len(result.memories) == 1
+
+
+@pytest.mark.asyncio
+async def test_search_memory_continues_past_event_without_words():
+  """An event with no searchable words does not end the search."""
+  memory_service = InMemoryMemoryService()
+  blob_only = Event(
+      id='event-blob',
+      author='user',
+      content=types.Content(parts=[_blob_part()]),
+  )
+  await memory_service.add_events_to_memory(
+      app_name=MOCK_APP_NAME,
+      user_id=MOCK_USER_ID,
+      events=[blob_only, _text_event('later', 'hello world')],
+  )
+
+  result = await memory_service.search_memory(
+      app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, query='hello'
+  )
+  assert len(result.memories) == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_memory():
+  """Tests that delete_memory purges a single memory entry by its id."""
+  memory_service = InMemoryMemoryService()
+  await memory_service.add_session_to_memory(MOCK_SESSION_1)
+  await memory_service.add_session_to_memory(MOCK_SESSION_2)
+
+  res = await memory_service.search_memory(
+      app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, query='ADK'
+  )
+  assert len(res.memories) == 2
+  assert all(m.id for m in res.memories)
+
+  target_id = res.memories[0].id
+  surviving_id = res.memories[1].id
+
+  await memory_service.delete_memory(
+      app_name=MOCK_APP_NAME,
+      user_id=MOCK_USER_ID,
+      memory_id=target_id,
+  )
+
+  res_after = await memory_service.search_memory(
+      app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, query='ADK'
+  )
+  assert len(res_after.memories) == 1
+  assert res_after.memories[0].id == surviving_id
+
+  # Re-ingesting the session (e.g. after the next turn in an agent callback)
+  # must not restore the deleted memory entry.
+  await memory_service.add_session_to_memory(MOCK_SESSION_1)
+  res_reingest = await memory_service.search_memory(
+      app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, query='ADK'
+  )
+  assert len(res_reingest.memories) == 1
+  assert res_reingest.memories[0].id == surviving_id
+
+  # Re-ingesting via add_events_to_memory must not restore the deleted entry.
+  deleted_event = next(e for e in MOCK_SESSION_1.events if e.id == target_id)
+  await memory_service.add_events_to_memory(
+      app_name=MOCK_APP_NAME,
+      user_id=MOCK_USER_ID,
+      events=[deleted_event],
+      session_id=MOCK_SESSION_1.id,
+  )
+  res_reingest_events = await memory_service.search_memory(
+      app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, query='ADK'
+  )
+  assert len(res_reingest_events.memories) == 1
+  assert res_reingest_events.memories[0].id == surviving_id
+
+  # Adding new events to the same session proceeds normally while deleted
+  # entries stay excluded.
+  new_turn_event = Event(
+      id='event-1d',
+      invocation_id='inv-new',
+      author='user',
+      timestamp=12348,
+      content=types.Content(
+          parts=[types.Part(text='ADK handles memory deletion cleanly.')]
+      ),
+  )
+  session_with_new_turn = Session(
+      app_name=MOCK_APP_NAME,
+      user_id=MOCK_USER_ID,
+      id=MOCK_SESSION_1.id,
+      events=[*MOCK_SESSION_1.events, new_turn_event],
+  )
+  await memory_service.add_session_to_memory(session_with_new_turn)
+  res_new_turn = await memory_service.search_memory(
+      app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, query='ADK'
+  )
+  assert len(res_new_turn.memories) == 2
+  result_ids = {m.id for m in res_new_turn.memories}
+  assert target_id not in result_ids
+  assert surviving_id in result_ids
+  assert 'event-1d' in result_ids
+
+
+@pytest.mark.asyncio
+async def test_delete_memory_nonexistent_is_noop():
+  """Tests that deleting a nonexistent memory ID or user does not error."""
+  memory_service = InMemoryMemoryService()
+
+  await memory_service.delete_memory(
+      app_name=MOCK_APP_NAME,
+      user_id='nonexistent-user',
+      memory_id='nonexistent-id',
+  )
+  await memory_service.delete_memory(
+      app_name=MOCK_APP_NAME,
+      user_id=MOCK_USER_ID,
+      memory_id='event-1a',
+  )
+
+  await memory_service.add_session_to_memory(MOCK_SESSION_1)
+  await memory_service.delete_memory(
+      app_name=MOCK_APP_NAME,
+      user_id=MOCK_USER_ID,
+      memory_id='nonexistent-id',
+  )
+  await memory_service.delete_memory(
+      app_name=MOCK_APP_NAME,
+      user_id=MOCK_USER_ID,
+      memory_id=None,
+  )
+  res = await memory_service.search_memory(
+      app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, query='ADK'
+  )
+  assert len(res.memories) == 2
+
+
+@pytest.mark.asyncio
+async def test_base_memory_service_default_delete_memory():
+  """Tests that BaseMemoryService.delete_memory raises NotImplementedError."""
+
+  class _DummyMemoryService(BaseMemoryService):
+
+    async def add_session_to_memory(self, session: Session) -> None:
+      pass
+
+    async def search_memory(
+        self, *, app_name: str, user_id: str, query: str
+    ) -> SearchMemoryResponse:
+      return SearchMemoryResponse()
+
+  dummy = _DummyMemoryService()
+  with pytest.raises(
+      NotImplementedError,
+      match='does not support deleting individual memories',
+  ):
+    await dummy.delete_memory(
+        app_name=MOCK_APP_NAME,
+        user_id=MOCK_USER_ID,
+        memory_id='mem-1',
+    )
+
+
+def test_delete_memory_is_thread_safe_against_concurrent_searches():
+  """Deleting memory while other threads search must not crash."""
+  memory_service = InMemoryMemoryService()
+  seed_loop = asyncio.new_event_loop()
+  memory_ids = []
+  try:
+    for i in range(50):
+      seed_loop.run_until_complete(
+          memory_service.add_session_to_memory(_make_session(f'seed-{i}'))
+      )
+    search_res = seed_loop.run_until_complete(
+        memory_service.search_memory(
+            app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, query='fact'
+        )
+    )
+    memory_ids = [m.id for m in search_res.memories if m.id]
+  finally:
+    seed_loop.close()
+
+  errors = []
+  stop = threading.Event()
+  barrier = threading.Barrier(3)
+
+  def deleter():
+    loop = asyncio.new_event_loop()
+    barrier.wait()
+    try:
+      for mid in memory_ids:
+        if stop.is_set():
+          return
+        loop.run_until_complete(
+            memory_service.delete_memory(
+                app_name=MOCK_APP_NAME,
+                user_id=MOCK_USER_ID,
+                memory_id=mid,
+            )
+        )
+    except Exception as e:
+      errors.append(e)
+      stop.set()
+    finally:
+      loop.close()
+
+  def reader():
+    loop = asyncio.new_event_loop()
+    barrier.wait()
+    try:
+      for _ in range(500):
+        if stop.is_set():
+          return
+        loop.run_until_complete(
+            memory_service.search_memory(
+                app_name=MOCK_APP_NAME, user_id=MOCK_USER_ID, query='fact'
+            )
+        )
+    except Exception as e:
+      errors.append(e)
+      stop.set()
+    finally:
+      loop.close()
+
+  threads = [
+      platform_thread.create_thread(deleter),
+      platform_thread.create_thread(reader),
+      platform_thread.create_thread(reader),
+  ]
+  for thread in threads:
+    thread.start()
+  for thread in threads:
+    thread.join()
+
+  assert (
+      not errors
+  ), f'search_memory raced with concurrent deletes: {errors[0]!r}'
+
+
+@pytest.mark.parametrize('ingest_session', [True, False])
+async def test_ingested_events_are_detached_from_the_caller(
+    ingest_session: bool,
+) -> None:
+  """Changing an ingested event must not rewrite stored memory."""
+  service = InMemoryMemoryService()
+  session = MOCK_SESSION_1.model_copy(deep=True)
+  event = session.events[0]
+  original_content = event.content.model_copy(deep=True)
+  if ingest_session:
+    await service.add_session_to_memory(session)
+  else:
+    await service.add_events_to_memory(
+        app_name=session.app_name,
+        user_id=session.user_id,
+        session_id=session.id,
+        events=[event],
+    )
+
+  event.id = 'changed-id'
+  event.content.parts[0].text = 'replaced by the caller'
+  result = await service.search_memory(
+      app_name=session.app_name, user_id=session.user_id, query='toolkit'
   )
 
   assert len(result.memories) == 1
-  assert result.memories[0].content.parts[0].text == 'Привет мир'
+  assert result.memories[0].id == 'event-1a'
+  assert result.memories[0].content == original_content
+
+
+@pytest.mark.parametrize('ingest_session', [True, False])
+async def test_search_results_are_detached_from_stored_memory(
+    ingest_session: bool,
+) -> None:
+  """Editing returned content must not affect memory or the source session."""
+  service = InMemoryMemoryService()
+  session = MOCK_SESSION_1.model_copy(deep=True)
+  event = session.events[0]
+  event.content.parts.append(
+      types.Part.from_function_call(
+          name='lookup', args={'options': {'color': 'blue'}}
+      )
+  )
+  original_content = event.content.model_copy(deep=True)
+  if ingest_session:
+    await service.add_session_to_memory(session)
+  else:
+    await service.add_events_to_memory(
+        app_name=session.app_name,
+        user_id=session.user_id,
+        session_id=session.id,
+        events=[event],
+    )
+  result = await service.search_memory(
+      app_name=session.app_name, user_id=session.user_id, query='toolkit'
+  )
+
+  returned_content = result.memories[0].content
+  returned_content.parts[0].text = 'replaced by the caller'
+  returned_content.parts[1].function_call.args['options']['color'] = 'red'
+  returned_content.parts.append(types.Part(text='extra content'))
+  repeated = await service.search_memory(
+      app_name=session.app_name, user_id=session.user_id, query='toolkit'
+  )
+
+  assert len(repeated.memories) == 1
+  assert repeated.memories[0].content == original_content
+  assert event.content == original_content

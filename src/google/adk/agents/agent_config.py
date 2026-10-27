@@ -23,8 +23,6 @@ from pydantic import RootModel
 from pydantic import Tag
 from typing_extensions import deprecated
 
-from ..features import experimental
-from ..features import FeatureName
 from .base_agent_config import BaseAgentConfig
 from .llm_agent_config import LlmAgentConfig
 from .loop_agent_config import LoopAgentConfig
@@ -69,7 +67,10 @@ ConfigsUnion = Annotated[
 
 # Use a RootModel to represent the agent directly at the top level.
 # The `discriminator` is applied to the union within the RootModel.
-@deprecated("AgentConfig is deprecated and will be removed in future versions.")
-@experimental(FeatureName.AGENT_CONFIG)
+@deprecated(
+    "AgentConfig is deprecated and will be removed in future versions. "
+    "Config is now loaded via reflection so the separate config class is no "
+    "longer needed."
+)
 class AgentConfig(RootModel[ConfigsUnion]):
   """The config for the YAML schema to create an agent."""

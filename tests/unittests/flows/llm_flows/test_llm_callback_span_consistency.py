@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests that before/after/error model callbacks all observe the same call_llm span.
-
-Regression tests for https://github.com/google/adk-python/issues/4851.
-"""
+"""Tests that before/after/error model callbacks all observe the same call_llm span."""
 
 from typing import AsyncGenerator
 from typing import Optional
@@ -45,12 +42,19 @@ from ... import testing_utils
 _SPAN_ID_INVALID = 0
 
 
+@pytest.fixture(autouse=True, params=['1', '2'], ids=['schema-v1', 'schema-v2'])
+def schema_version(request, monkeypatch) -> str:
+  monkeypatch.setenv('ADK_TELEMETRY_SCHEMA_VERSION_OPT_IN', request.param)
+  return request.param
+
+
 class _SpanCapture:
-  """Stores the span ID and trace ID observed from within a callback."""
+  """Stores the span observed from within a callback."""
 
   def __init__(self):
     self.span_id: int = _SPAN_ID_INVALID
     self.trace_id: int = 0
+    self.span: Optional[trace.Span] = None
 
   def capture(self):
     span = trace.get_current_span()
@@ -58,6 +62,7 @@ class _SpanCapture:
     if ctx and ctx.span_id != _SPAN_ID_INVALID:
       self.span_id = ctx.span_id
       self.trace_id = ctx.trace_id
+      self.span = span
 
 
 class SpanCapturingPlugin(BasePlugin):
@@ -223,6 +228,121 @@ def test_short_circuit_before_callback_sees_valid_span():
   assert plugin.after_capture.span_id == _SPAN_ID_INVALID
 
 
+@pytest.mark.parametrize('schema_version', ['1'], indirect=True)
+def test_short_circuit_call_llm_span_has_attributes():
+  """A short-circuited model call still records the call_llm attributes.
+
+  Trace consumers look a span up by its event id attribute and discard spans
+  that do not carry one, so an attribute-less span is an invisible span.
+  """
+  plugin = SpanCapturingPlugin()
+  plugin._short_circuit_before = True
+  plugin._short_circuit_response = LlmResponse(
+      content=testing_utils.ModelContent(
+          [types.Part.from_text(text='short_circuited')]
+      )
+  )
+  mock_model = testing_utils.MockModel.create(responses=['unused'])
+  agent = Agent(name='root_agent', model=mock_model)
+  runner = testing_utils.InMemoryRunner(agent, plugins=[plugin])
+
+  events = runner.run('test')
+
+  span = plugin.before_capture.span
+  assert span is not None, 'no call_llm span was captured'
+  assert span.name == 'call_llm'
+  attributes = dict(span.attributes or {})
+
+  model_event_ids = {
+      event.id for event in events if event.author == 'root_agent'
+  }
+  assert model_event_ids, 'the short-circuit response produced no event'
+  assert attributes.get('gcp.vertex.agent.event_id') in model_event_ids, (
+      'call_llm span carries no event id on the short-circuit path, so the'
+      f' trace for that event is unreachable; attributes={attributes}'
+  )
+  for key in (
+      'gen_ai.system',
+      'gcp.vertex.agent.invocation_id',
+      'gcp.vertex.agent.session_id',
+      'gcp.vertex.agent.llm_request',
+      'gcp.vertex.agent.llm_response',
+  ):
+    assert key in attributes, (
+        f'call_llm span is missing {key} on the short-circuit path;'
+        f' attributes={attributes}'
+    )
+
+
+@pytest.mark.parametrize('schema_version', ['1'], indirect=True)
+def test_short_circuit_call_llm_span_names_the_callback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  """The span says the response came from the callback, not the model."""
+  monkeypatch.setenv('ADK_EXPERIMENTAL_TELEMETRY', 'true')
+  plugin = SpanCapturingPlugin()
+  plugin._short_circuit_before = True
+  plugin._short_circuit_response = LlmResponse(
+      content=testing_utils.ModelContent(
+          [types.Part.from_text(text='short_circuited')]
+      )
+  )
+  mock_model = testing_utils.MockModel.create(responses=['unused'])
+  agent = Agent(name='root_agent', model=mock_model)
+  runner = testing_utils.InMemoryRunner(agent, plugins=[plugin])
+
+  runner.run('test')
+
+  span = plugin.before_capture.span
+  assert span is not None, 'no call_llm span was captured'
+  attributes = dict(span.attributes or {})
+  assert (
+      attributes.get('adk.experimental.response.source')
+      == 'before_model_callback'
+  )
+
+
+@pytest.mark.parametrize('schema_version', ['2'], indirect=True)
+def test_short_circuit_under_schema_v2_names_no_callback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  """Schema v2 has no call_llm span, so the agent span names no callback."""
+  monkeypatch.setenv('ADK_EXPERIMENTAL_TELEMETRY', 'true')
+  plugin = SpanCapturingPlugin()
+  plugin._short_circuit_before = True
+  plugin._short_circuit_response = LlmResponse(
+      content=testing_utils.ModelContent(
+          [types.Part.from_text(text='short_circuited')]
+      )
+  )
+  mock_model = testing_utils.MockModel.create(responses=['unused'])
+  agent = Agent(name='root_agent', model=mock_model)
+  runner = testing_utils.InMemoryRunner(agent, plugins=[plugin])
+
+  runner.run('test')
+
+  span = plugin.before_capture.span
+  assert span is not None, 'no agent span was captured'
+  assert span.name == 'invoke_agent root_agent'
+  assert 'adk.experimental.response.source' not in dict(span.attributes or {})
+
+
+@pytest.mark.parametrize('schema_version', ['1'], indirect=True)
+def test_model_call_span_names_no_callback():
+  """A response the model produced carries no response source."""
+  plugin = SpanCapturingPlugin()
+  mock_model = testing_utils.MockModel.create(responses=['hello'])
+  agent = Agent(name='root_agent', model=mock_model)
+  runner = testing_utils.InMemoryRunner(agent, plugins=[plugin])
+
+  runner.run('test')
+
+  span = plugin.after_capture.span
+  assert span is not None, 'no call_llm span was captured'
+  assert span.name == 'call_llm'
+  assert 'adk.experimental.response.source' not in dict(span.attributes or {})
+
+
 # ---------------------------------------------------------------------------
 # Tests: all three callbacks share same span on error path
 # ---------------------------------------------------------------------------
@@ -253,6 +373,56 @@ def test_all_three_callbacks_share_span_on_error():
   assert (
       plugin.before_capture.span_id == plugin.after_capture.span_id
   ), 'before and after callbacks saw different spans on error recovery'
+
+
+@pytest.mark.parametrize('schema_version', ['1'], indirect=True)
+def test_error_recovery_call_llm_span_names_the_callback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  """The span says the recovery response came from the callback."""
+  monkeypatch.setenv('ADK_EXPERIMENTAL_TELEMETRY', 'true')
+  plugin = SpanCapturingPlugin()
+  mock_model = testing_utils.MockModel.create(error=_MOCK_ERROR, responses=[])
+  agent = Agent(name='root_agent', model=mock_model)
+  runner = testing_utils.InMemoryRunner(agent, plugins=[plugin])
+
+  runner.run('test')
+
+  span = plugin.error_capture.span
+  assert span is not None, 'no call_llm span was captured'
+  attributes = dict(span.attributes or {})
+  assert (
+      attributes.get('adk.experimental.response.source')
+      == 'on_model_error_callback'
+  )
+
+
+@pytest.mark.parametrize('short_circuit', [True, False])
+def test_call_llm_span_has_no_response_source_by_default(
+    monkeypatch: pytest.MonkeyPatch, short_circuit: bool
+):
+  """Without experimental telemetry, a callback's answer is not marked."""
+  monkeypatch.delenv('ADK_EXPERIMENTAL_TELEMETRY', raising=False)
+  monkeypatch.delenv('ADK_EXPERIMENTAL_TELEMETRY_FEATURES', raising=False)
+  plugin = SpanCapturingPlugin()
+  if short_circuit:
+    plugin._short_circuit_before = True
+    plugin._short_circuit_response = LlmResponse(
+        content=testing_utils.ModelContent(
+            [types.Part.from_text(text='short_circuited')]
+        )
+    )
+    mock_model = testing_utils.MockModel.create(responses=['unused'])
+  else:
+    mock_model = testing_utils.MockModel.create(error=_MOCK_ERROR, responses=[])
+  agent = Agent(name='root_agent', model=mock_model)
+  runner = testing_utils.InMemoryRunner(agent, plugins=[plugin])
+
+  runner.run('test')
+
+  span = plugin.before_capture.span
+  assert span is not None, 'no call_llm span was captured'
+  assert 'adk.experimental.response.source' not in dict(span.attributes or {})
 
 
 # ---------------------------------------------------------------------------
@@ -304,15 +474,17 @@ async def test_cfc_before_and_after_callbacks_share_same_span():
   )
 
   responses = []
-  async with Aclosing(
-      flow._call_llm_async(
-          invocation_context,
-          LlmRequest(model='mock'),
-          model_response_event,
-      )
-  ) as agen:
-    async for resp in agen:
-      responses.append(resp)
+  # The runner's agent span, which schema v2 callbacks observe.
+  with _provider.get_tracer(__name__).start_as_current_span('invoke_agent'):
+    async with Aclosing(
+        flow._call_llm_async(
+            invocation_context,
+            LlmRequest(model='mock'),
+            model_response_event,
+        )
+    ) as agen:
+      async for resp in agen:
+        responses.append(resp)
 
   assert len(responses) >= 1
   assert (
@@ -362,15 +534,17 @@ async def test_cfc_error_callback_shares_span():
   )
 
   responses = []
-  async with Aclosing(
-      flow._call_llm_async(
-          invocation_context,
-          LlmRequest(model='mock'),
-          model_response_event,
-      )
-  ) as agen:
-    async for resp in agen:
-      responses.append(resp)
+  # The runner's agent span, which schema v2 callbacks observe.
+  with _provider.get_tracer(__name__).start_as_current_span('invoke_agent'):
+    async with Aclosing(
+        flow._call_llm_async(
+            invocation_context,
+            LlmRequest(model='mock'),
+            model_response_event,
+        )
+    ) as agen:
+      async for resp in agen:
+        responses.append(resp)
 
   assert (
       plugin.before_capture.span_id != _SPAN_ID_INVALID

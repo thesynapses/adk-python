@@ -69,9 +69,11 @@ def test_generate_files_with_api_key(agent_folder: Path) -> None:
   env_content = (agent_folder / ".env").read_text()
   assert "GOOGLE_API_KEY=dummy-key" in env_content
   assert "GOOGLE_GENAI_USE_ENTERPRISE=0" in env_content
-  assert (agent_folder / ".gitignore").read_text() == ".env\n"
+  assert (agent_folder / ".gitignore").read_text() == ".env\n.adk/\n"
   assert (agent_folder / "agent.py").exists()
-  assert (agent_folder / "__init__.py").exists()
+  assert (
+      agent_folder / "__init__.py"
+  ).read_text() == "from . import agent as agent\n"
 
 
 def test_generate_files_with_gcp(agent_folder: Path) -> None:
@@ -162,7 +164,9 @@ def test_generate_files_appends_dotenv_to_existing_gitignore(
       str(agent_folder), model="gemini-2.0-flash-001", type="code"
   )
 
-  assert (agent_folder / ".gitignore").read_text() == "__pycache__\n.env\n"
+  assert (
+      agent_folder / ".gitignore"
+  ).read_text() == "__pycache__\n.env\n.adk/\n"
 
 
 def test_generate_files_appends_dotenv_to_existing_gitignore_with_newline(
@@ -176,13 +180,31 @@ def test_generate_files_appends_dotenv_to_existing_gitignore_with_newline(
       str(agent_folder), model="gemini-2.0-flash-001", type="code"
   )
 
-  assert (agent_folder / ".gitignore").read_text() == "__pycache__\n.env\n"
+  assert (
+      agent_folder / ".gitignore"
+  ).read_text() == "__pycache__\n.env\n.adk/\n"
 
 
 def test_generate_files_does_not_duplicate_dotenv_gitignore_entry(
     agent_folder: Path,
 ) -> None:
-  """Existing .env ignore entries should not be duplicated."""
+  """Existing .env and .adk/ ignore entries should not be duplicated."""
+  agent_folder.mkdir(parents=True, exist_ok=True)
+  (agent_folder / ".gitignore").write_text("__pycache__\n.env\n.adk/\n")
+
+  cli_create._generate_files(
+      str(agent_folder), model="gemini-2.0-flash-001", type="code"
+  )
+
+  assert (
+      agent_folder / ".gitignore"
+  ).read_text() == "__pycache__\n.env\n.adk/\n"
+
+
+def test_generate_files_adds_missing_adk_entry_to_existing_gitignore(
+    agent_folder: Path,
+) -> None:
+  """A .gitignore missing only .adk/ should have it appended."""
   agent_folder.mkdir(parents=True, exist_ok=True)
   (agent_folder / ".gitignore").write_text("__pycache__\n.env\n")
 
@@ -190,7 +212,9 @@ def test_generate_files_does_not_duplicate_dotenv_gitignore_entry(
       str(agent_folder), model="gemini-2.0-flash-001", type="code"
   )
 
-  assert (agent_folder / ".gitignore").read_text() == "__pycache__\n.env\n"
+  assert (
+      agent_folder / ".gitignore"
+  ).read_text() == "__pycache__\n.env\n.adk/\n"
 
 
 # run_cmd
@@ -265,16 +289,60 @@ def test_run_cmd_with_type_config(
   assert "model: gemini-2.5-flash" in yaml_content
   assert "description: A helpful assistant for user questions." in yaml_content
 
-  # Should create empty __init__.py
-  init_file = agent_dir / "__init__.py"
-  assert init_file.exists()
-  assert init_file.read_text().strip() == ""
+  # Config agents are YAML-loaded; do not emit a package marker.
+  assert not (agent_dir / "__init__.py").exists()
 
   # Should still create .env file
   env_file = agent_dir / ".env"
   assert env_file.exists()
   assert "GOOGLE_API_KEY=test-key" in env_file.read_text()
-  assert (agent_dir / ".gitignore").read_text() == ".env\n"
+  assert (agent_dir / ".gitignore").read_text() == ".env\n.adk/\n"
+
+
+def test_run_cmd_prints_next_steps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+  """A new agent should come with the commands to run it and grow it."""
+  echo = _Recorder()
+  monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
+  monkeypatch.setattr(click, "echo", echo)
+
+  cli_create.run_cmd(
+      "my_agent",
+      model="gemini-3.5-flash",
+      google_api_key="test-key",
+      google_cloud_project=None,
+      google_cloud_region=None,
+      type="code",
+  )
+
+  (message,), _ = echo.calls[-1]
+  assert "adk run my_agent\n" in message
+  assert "adk web .\n" in message
+  assert "uvx google-agents-cli setup\n" in message
+
+
+def test_run_cmd_next_steps_point_adk_web_at_parent_folder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+  """A nested agent path should make adk web serve the folder holding it."""
+  echo = _Recorder()
+  monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
+  monkeypatch.setattr(click, "echo", echo)
+  agent_path = os.path.join("agents", "my_agent")
+
+  cli_create.run_cmd(
+      agent_path,
+      model="gemini-3.5-flash",
+      google_api_key="test-key",
+      google_cloud_project=None,
+      google_cloud_region=None,
+      type="code",
+  )
+
+  (message,), _ = echo.calls[-1]
+  assert f"adk run {agent_path}\n" in message
+  assert "adk web agents\n" in message
 
 
 # Prompt helpers
@@ -304,11 +372,19 @@ def test_prompt_for_model_gemini(monkeypatch: pytest.MonkeyPatch) -> None:
   assert cli_create._prompt_for_model() == "gemini-3.5-flash"
 
 
+def test_prompt_for_model_gemini_38_flash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """Selecting option '2' should return the gemini-3.8-flash model string."""
+  monkeypatch.setattr(click, "prompt", lambda *a, **k: "2")
+  assert cli_create._prompt_for_model() == "gemini-3.8-flash"
+
+
 def test_prompt_for_model_other(monkeypatch: pytest.MonkeyPatch) -> None:
-  """Selecting option '2' should return placeholder and call secho."""
+  """Selecting option '3' should return placeholder and call secho."""
   called: Dict[str, bool] = {}
 
-  monkeypatch.setattr(click, "prompt", lambda *a, **k: "2")
+  monkeypatch.setattr(click, "prompt", lambda *a, **k: "3")
 
   def _fake_secho(*_a: Any, **_k: Any) -> None:
     called["secho"] = True
@@ -558,3 +634,105 @@ def test_get_gcp_region_from_gcloud_fail(
       ),
   )
   assert _onboarding.get_gcp_region_from_gcloud() == ""
+
+
+# express_mode_action telemetry
+def _onboard_and_get_root_meta() -> Dict[str, Any]:
+  """Runs onboarding under a nested context and returns the *root* context meta.
+
+  `TelemetryGroup` reads `express_mode_action` off the root context, so the
+  assertion has to be made there rather than on the subcommand context the
+  onboarding code happens to run under.
+  """
+  root_ctx = click.Context(click.Command("adk"))
+  sub_ctx = click.Context(click.Command("create"), parent=root_ctx)
+  with root_ctx, sub_ctx:
+    try:
+      _onboarding.handle_login_with_google()
+    except click.Abort:
+      pass
+  return root_ctx.meta
+
+
+def test_express_action_recorded_for_existing_express(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """Reusing an existing Express project records EXISTING_EXPRESS."""
+  monkeypatch.setattr(gcp_utils, "check_adc", lambda: True)
+  monkeypatch.setattr(
+      gcp_utils,
+      "retrieve_express_project",
+      lambda: {"api_key": "key", "project_id": "proj", "region": "us-central1"},
+  )
+
+  meta = _onboard_and_get_root_meta()
+  assert meta.get("express_mode_action") == "EXISTING_EXPRESS"
+
+
+def test_express_action_recorded_for_manual_project(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """Entering a project ID by hand records MANUAL_PROJECT."""
+  monkeypatch.setattr(gcp_utils, "check_adc", lambda: True)
+  monkeypatch.setattr(gcp_utils, "retrieve_express_project", lambda: None)
+  monkeypatch.setattr(gcp_utils, "list_gcp_projects", lambda limit: [])
+  prompts = iter(["1", "test-proj", "us-east1"])
+  monkeypatch.setattr(click, "prompt", lambda *a, **k: next(prompts))
+
+  meta = _onboard_and_get_root_meta()
+  assert meta.get("express_mode_action") == "MANUAL_PROJECT"
+
+
+def test_express_action_recorded_for_manual_project_from_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """Opting out of the project list to type an ID records MANUAL_PROJECT."""
+  monkeypatch.setattr(gcp_utils, "check_adc", lambda: True)
+  monkeypatch.setattr(gcp_utils, "retrieve_express_project", lambda: None)
+  monkeypatch.setattr(
+      gcp_utils, "list_gcp_projects", lambda limit: [("p1", "Project 1")]
+  )
+  prompts = iter([0, "manual-proj", "us-east1"])
+  monkeypatch.setattr(click, "prompt", lambda *a, **k: next(prompts))
+
+  meta = _onboard_and_get_root_meta()
+  assert meta.get("express_mode_action") == "MANUAL_PROJECT"
+
+
+def test_express_action_recorded_for_create_express(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """Signing up for a new Express project records CREATE_EXPRESS."""
+  monkeypatch.setattr(gcp_utils, "check_adc", lambda: True)
+  monkeypatch.setattr(gcp_utils, "retrieve_express_project", lambda: None)
+  monkeypatch.setattr(gcp_utils, "list_gcp_projects", lambda limit: [])
+  monkeypatch.setattr(gcp_utils, "check_express_eligibility", lambda: True)
+  monkeypatch.setattr(click, "confirm", lambda *a, **k: True)
+  prompts = iter(["2", "1"])
+  monkeypatch.setattr(click, "prompt", lambda *a, **k: next(prompts))
+  monkeypatch.setattr(
+      gcp_utils,
+      "sign_up_express",
+      lambda location="us-central1": {
+          "api_key": "new-key",
+          "project_id": "new-proj",
+          "region": location,
+      },
+  )
+  monkeypatch.setattr(_onboarding, "get_gcp_project_from_gcloud", lambda: "")
+
+  meta = _onboard_and_get_root_meta()
+  assert meta.get("express_mode_action") == "CREATE_EXPRESS"
+
+
+def test_express_action_recorded_for_abandon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """Choosing to abandon onboarding records ABANDON."""
+  monkeypatch.setattr(gcp_utils, "check_adc", lambda: True)
+  monkeypatch.setattr(gcp_utils, "retrieve_express_project", lambda: None)
+  monkeypatch.setattr(gcp_utils, "list_gcp_projects", lambda limit: [])
+  monkeypatch.setattr(click, "prompt", lambda *a, **k: "3")
+
+  meta = _onboard_and_get_root_meta()
+  assert meta.get("express_mode_action") == "ABANDON"

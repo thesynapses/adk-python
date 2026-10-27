@@ -26,7 +26,7 @@ from typing_extensions import TypeAlias
 
 from .app_details import AppDetails
 from .common import EvalBaseModel
-from .conversation_scenarios import ConversationScenario
+from .conversation_scenarios import ConversationScenario as ConversationScenario
 from .eval_rubrics import Rubric
 
 
@@ -61,11 +61,27 @@ class InvocationEvent(EvalBaseModel):
   is intended for the Eval System.
   """
 
+  # The adk web eval editor serializes UI-only transcript indices
+  # (invocationIndex, toolUseIndex) onto each event. Those are not part of the
+  # persisted eval-case schema; ignore them so PUT /eval-cases does not 422.
+  model_config = pydantic.ConfigDict(extra="ignore")
+
   author: str
   """The name of the agent that authored/owned this event."""
 
-  content: Optional[genai_types.Content]
+  content: Optional[genai_types.Content] = None
   """The content of the event."""
+
+  grounding_metadata: Optional[genai_types.GroundingMetadata] = None
+  """Grounding metadata emitted with the event."""
+
+  usage_metadata: Optional[genai_types.GenerateContentResponseUsageMetadata] = (
+      None
+  )
+  """Token usage reported by the model for this event."""
+
+  model_version: Optional[str] = None
+  """The version/name of the model that served this call."""
 
 
 class InvocationEvents(EvalBaseModel):
@@ -100,6 +116,35 @@ class Invocation(EvalBaseModel):
   creation_timestamp: float = 0.0
   """Timestamp for the current invocation, primarily intended for debugging purposes."""
 
+  duration: Optional[float] = None
+  """Wall-clock seconds this invocation took, measured while it ran.
+
+  Set only when the eval performed the inference itself; an invocation read
+  back from a stored session or a hand-written eval case carries no timing, and
+  leaves this None rather than reporting a reconstructed figure. Timings cannot
+  be recovered afterwards from event timestamps: an event is stamped when it is
+  constructed, which for a model call is before the request is even sent.
+  """
+
+  model_duration: Optional[float] = None
+  """Of `duration`, the seconds with at least one model call in flight.
+
+  Measured from the interval each model call occupied, with concurrent calls
+  counted once, so this is how long the turn spent awaiting a model rather
+  than the sum of how long each call took. Set under the same conditions as
+  `duration` and None otherwise.
+  """
+
+  tool_duration: Optional[float] = None
+  """Of `duration`, the seconds inside a tool but not awaiting a model.
+
+  Time a tool spent awaiting a model -- an `AgentTool` runs model calls inside
+  its own tool interval -- is excluded here and reported as `model_duration`
+  instead, so the two never double count. What is left of `duration` after both
+  is the framework's own time. Set under the same conditions as `duration` and
+  None otherwise.
+  """
+
   rubrics: Optional[list[Rubric]] = Field(
       default=None,
   )
@@ -123,6 +168,16 @@ class SessionInput(EvalBaseModel):
 
   user_id: str
   """The user id."""
+
+  session_id: Optional[str] = None
+  """A fixed session id to use for this eval case, if set.
+
+  Artifacts are keyed by (app_name, user_id, session_id), so a fixed session id
+  lets an eval case reach artifacts that were pre-loaded for that session. When
+  unset, a random session id is generated per case. An existing session under
+  this id is reused as-is, so `state` only applies when the session has to be
+  created.
+  """
 
   state: SessionState = Field(default_factory=dict)
   """The state of the session."""
@@ -245,7 +300,9 @@ def get_all_tool_calls_with_responses(
     intermediate_data: Optional[IntermediateDataType],
 ) -> list[ToolCallAndResponse]:
   """Returns tool calls with the corresponding responses, if available."""
-  tool_responses_by_call_id: dict[str, genai_types.FunctionResponse] = {
+  tool_responses_by_call_id: dict[
+      Optional[str], genai_types.FunctionResponse
+  ] = {
       tool_response.id: tool_response
       for tool_response in get_all_tool_responses(intermediate_data)
   }
@@ -257,3 +314,16 @@ def get_all_tool_calls_with_responses(
     tool_call_and_responses.append((tool_call, response))
 
   return tool_call_and_responses
+
+
+def get_all_usage_metadata(
+    invocation: Invocation,
+) -> list[genai_types.GenerateContentResponseUsageMetadata]:
+  """Returns the usage metadata for every invocation event that reported it."""
+  if not isinstance(invocation.intermediate_data, InvocationEvents):
+    return []
+  return [
+      event.usage_metadata
+      for event in invocation.intermediate_data.invocation_events
+      if event.usage_metadata is not None
+  ]

@@ -1,0 +1,44 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Component-owner map for adk_pr_triaging_agent.
+
+Imported as LABEL_TO_OWNER. One of a component's owners becomes the PR assignee
+(its shepherd), taking turns by PR number when a component has several.
+
+github login != corp ldap, so these are the login form. Keep each component's
+first owner in sync with the OWNERS file, which is the authority.
+"""
+
+# Component label -> GitHub logins of the owners who shepherd that component.
+LABEL_TO_OWNER = {
+    "a2a": ["mykytanetipa"],
+    "agent engine": ["yeesian"],
+    "auth": ["xuanyang15"],
+    "bq": ["shobsi"],
+    "cli": ["wyf7107"],
+    "core": ["DeanChensj"],
+    "documentation": ["joefernandez"],
+    "eval": ["i-yliu"],
+    "integrations": ["wukath"],
+    "live": ["wuliang229"],
+    "mcp": ["wukath"],
+    "models": ["xuanyang15"],
+    "services": ["DeanChensj", "asugumar-google"],
+    "skills": ["wukath"],
+    "tools": ["xuanyang15", "asugumar-google"],
+    "tracing": ["jawoszek"],
+    "web": ["wyf7107"],
+    "workflow": ["DeanChensj"],
+}

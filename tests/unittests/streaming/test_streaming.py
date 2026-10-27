@@ -13,17 +13,100 @@
 # limitations under the License.
 
 import asyncio
+from contextlib import aclosing
 from typing import Any
 from typing import AsyncGenerator
 from typing import Awaitable
+from unittest import mock
 
-from google.adk.agents.live_request_queue import LiveRequestQueue
+from google.adk.agents.invocation_context import InvocationContext
 from google.adk.agents.llm_agent import Agent
+from google.adk.live import LiveRequestQueue
+from google.adk.live._active_background_tool import ActiveBackgroundTool
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types
 import pytest
 
 from .. import testing_utils
+
+
+async def _wait_for_queue_empty(queue: LiveRequestQueue):
+  """Wait until the queue is empty and the background consumer has finished."""
+  while not queue._queue.empty():
+    await asyncio.sleep(0)
+  # Give opportunity for send_to_model to finish processing (e.g. append_event)
+  for _ in range(10):
+    await asyncio.sleep(0)
+
+
+class StreamingTestRunner(testing_utils.InMemoryRunner):
+  """A robust runner for streaming tests that avoids resource leaks."""
+
+  def __init__(self, *args, max_responses=3, **kwargs):
+    super().__init__(*args, **kwargs)
+    self.max_responses = max_responses
+
+  def _run_with_loop(self, coro):
+    try:
+      old_loop = asyncio.get_event_loop()
+    except RuntimeError:
+      old_loop = None
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+      loop.run_until_complete(coro)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+      pass
+    finally:
+      # Cancel all pending tasks to prevent leaks and warnings
+      pending = asyncio.all_tasks(loop)
+      for task in pending:
+        task.cancel()
+      if pending:
+        try:
+          loop.run_until_complete(
+              asyncio.gather(*pending, return_exceptions=True)
+          )
+        except Exception:  # pylint: disable=broad-except
+          pass
+      loop.close()
+      asyncio.set_event_loop(old_loop)
+
+  def run_live(
+      self,
+      live_request_queue: LiveRequestQueue,
+      run_config: testing_utils.RunConfig = None,
+  ) -> list[testing_utils.Event]:
+    collected_responses = []
+
+    async def consume_responses(session: testing_utils.Session):
+      run_res = self.runner.run_live(
+          session=session,
+          live_request_queue=live_request_queue,
+          run_config=run_config or testing_utils.RunConfig(),
+      )
+
+      async with aclosing(run_res) as agen:
+        async for response in agen:
+          collected_responses.append(response)
+          if len(collected_responses) >= self.max_responses:
+            await _wait_for_queue_empty(live_request_queue)
+            return
+
+    self._run_with_loop(
+        asyncio.wait_for(consume_responses(self.session), timeout=5.0)
+    )
+
+    return collected_responses
+
+  def run_live_and_get_session(
+      self,
+      live_request_queue: LiveRequestQueue,
+      run_config: testing_utils.RunConfig = None,
+  ) -> tuple[list[testing_utils.Event], testing_utils.Session]:
+    events = self.run_live(live_request_queue, run_config)
+    return events, self.session
 
 
 def test_streaming():
@@ -87,52 +170,8 @@ def test_live_streaming_function_call_single():
       tools=[get_weather],
   )
 
-  # Create a custom runner class that collects all events
-  class CustomTestRunner(testing_utils.InMemoryRunner):
+  runner = StreamingTestRunner(root_agent=root_agent, max_responses=3)
 
-    def _run_with_loop(self, coro):
-      try:
-        old_loop = asyncio.get_event_loop()
-      except RuntimeError:
-        old_loop = None
-
-      loop = asyncio.new_event_loop()
-      asyncio.set_event_loop(loop)
-      try:
-        loop.run_until_complete(coro)
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-      finally:
-        loop.close()
-        asyncio.set_event_loop(old_loop)
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          # Collect a reasonable number of events, don't wait for too many
-          if len(collected_responses) >= 3:
-            return
-
-      self._run_with_loop(
-          asyncio.wait_for(consume_responses(self.session), timeout=5.0)
-      )
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=root_agent)
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=types.Blob(
@@ -208,50 +247,7 @@ def test_live_streaming_function_call_multiple():
   )
 
   # Use the custom runner
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def _run_with_loop(self, coro):
-      try:
-        old_loop = asyncio.get_event_loop()
-      except RuntimeError:
-        old_loop = None
-
-      loop = asyncio.new_event_loop()
-      asyncio.set_event_loop(loop)
-      try:
-        loop.run_until_complete(coro)
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-      finally:
-        loop.close()
-        asyncio.set_event_loop(old_loop)
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          if len(collected_responses) >= 3:
-            return
-
-      self._run_with_loop(
-          asyncio.wait_for(consume_responses(self.session), timeout=5.0)
-      )
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=root_agent)
+  runner = StreamingTestRunner(root_agent=root_agent, max_responses=3)
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=types.Blob(
@@ -320,50 +316,7 @@ def test_live_streaming_function_call_parallel():
   )
 
   # Use the custom runner
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def _run_with_loop(self, coro):
-      try:
-        old_loop = asyncio.get_event_loop()
-      except RuntimeError:
-        old_loop = None
-
-      loop = asyncio.new_event_loop()
-      asyncio.set_event_loop(loop)
-      try:
-        loop.run_until_complete(coro)
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-      finally:
-        loop.close()
-        asyncio.set_event_loop(old_loop)
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          if len(collected_responses) >= 3:
-            return
-
-      self._run_with_loop(
-          asyncio.wait_for(consume_responses(self.session), timeout=5.0)
-      )
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=root_agent)
+  runner = StreamingTestRunner(root_agent=root_agent, max_responses=3)
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=types.Blob(
@@ -426,50 +379,7 @@ def test_live_streaming_function_call_with_error():
   )
 
   # Use the custom runner
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def _run_with_loop(self, coro):
-      try:
-        old_loop = asyncio.get_event_loop()
-      except RuntimeError:
-        old_loop = None
-
-      loop = asyncio.new_event_loop()
-      asyncio.set_event_loop(loop)
-      try:
-        loop.run_until_complete(coro)
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-      finally:
-        loop.close()
-        asyncio.set_event_loop(old_loop)
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          if len(collected_responses) >= 3:
-            return
-
-      self._run_with_loop(
-          asyncio.wait_for(consume_responses(self.session), timeout=5.0)
-      )
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=root_agent)
+  runner = StreamingTestRunner(root_agent=root_agent, max_responses=3)
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=types.Blob(
@@ -523,50 +433,7 @@ def test_live_streaming_function_call_sync_tool():
   )
 
   # Use the custom runner
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def _run_with_loop(self, coro):
-      try:
-        old_loop = asyncio.get_event_loop()
-      except RuntimeError:
-        old_loop = None
-
-      loop = asyncio.new_event_loop()
-      asyncio.set_event_loop(loop)
-      try:
-        loop.run_until_complete(coro)
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-      finally:
-        loop.close()
-        asyncio.set_event_loop(old_loop)
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          if len(collected_responses) >= 3:
-            return
-
-      self._run_with_loop(
-          asyncio.wait_for(consume_responses(self.session), timeout=5.0)
-      )
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=root_agent)
+  runner = StreamingTestRunner(root_agent=root_agent, max_responses=3)
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=types.Blob(data=b"Calculate 5 plus 3", mime_type="audio/pcm")
@@ -629,50 +496,7 @@ def test_live_streaming_simple_streaming_tool():
   )
 
   # Use the custom runner
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def _run_with_loop(self, coro):
-      try:
-        old_loop = asyncio.get_event_loop()
-      except RuntimeError:
-        old_loop = None
-
-      loop = asyncio.new_event_loop()
-      asyncio.set_event_loop(loop)
-      try:
-        loop.run_until_complete(coro)
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-      finally:
-        loop.close()
-        asyncio.set_event_loop(old_loop)
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          if len(collected_responses) >= 3:
-            return
-
-      self._run_with_loop(
-          asyncio.wait_for(consume_responses(self.session), timeout=5.0)
-      )
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=root_agent)
+  runner = StreamingTestRunner(root_agent=root_agent, max_responses=3)
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=types.Blob(data=b"Monitor AAPL stock price", mime_type="audio/pcm")
@@ -747,50 +571,7 @@ def test_live_streaming_video_streaming_tool():
   )
 
   # Use the custom runner
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def _run_with_loop(self, coro):
-      try:
-        old_loop = asyncio.get_event_loop()
-      except RuntimeError:
-        old_loop = None
-
-      loop = asyncio.new_event_loop()
-      asyncio.set_event_loop(loop)
-      try:
-        loop.run_until_complete(coro)
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-      finally:
-        loop.close()
-        asyncio.set_event_loop(old_loop)
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          if len(collected_responses) >= 3:
-            return
-
-      self._run_with_loop(
-          asyncio.wait_for(consume_responses(self.session), timeout=5.0)
-      )
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=root_agent)
+  runner = StreamingTestRunner(root_agent=root_agent, max_responses=3)
   live_request_queue = LiveRequestQueue()
 
   # Send some mock video frames
@@ -869,50 +650,7 @@ def test_live_streaming_stop_streaming_tool():
   )
 
   # Use the custom runner
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def _run_with_loop(self, coro):
-      try:
-        old_loop = asyncio.get_event_loop()
-      except RuntimeError:
-        old_loop = None
-
-      loop = asyncio.new_event_loop()
-      asyncio.set_event_loop(loop)
-      try:
-        loop.run_until_complete(coro)
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-      finally:
-        loop.close()
-        asyncio.set_event_loop(old_loop)
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          if len(collected_responses) >= 3:
-            return
-
-      self._run_with_loop(
-          asyncio.wait_for(consume_responses(self.session), timeout=5.0)
-      )
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=root_agent)
+  runner = StreamingTestRunner(root_agent=root_agent, max_responses=3)
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=types.Blob(data=b"Monitor TSLA and then stop", mime_type="audio/pcm")
@@ -992,50 +730,7 @@ def test_live_streaming_multiple_streaming_tools():
   )
 
   # Use the custom runner
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def _run_with_loop(self, coro):
-      try:
-        old_loop = asyncio.get_event_loop()
-      except RuntimeError:
-        old_loop = None
-
-      loop = asyncio.new_event_loop()
-      asyncio.set_event_loop(loop)
-      try:
-        loop.run_until_complete(coro)
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-      finally:
-        loop.close()
-        asyncio.set_event_loop(old_loop)
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          if len(collected_responses) >= 3:
-            return
-
-      self._run_with_loop(
-          asyncio.wait_for(consume_responses(self.session), timeout=5.0)
-      )
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=root_agent)
+  runner = StreamingTestRunner(root_agent=root_agent, max_responses=3)
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=types.Blob(
@@ -1107,50 +802,7 @@ def test_live_streaming_function_call_yielded_before_finished_transcription():
       tools=[get_weather],
   )
 
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def _run_with_loop(self, coro):
-      try:
-        old_loop = asyncio.get_event_loop()
-      except RuntimeError:
-        old_loop = None
-
-      loop = asyncio.new_event_loop()
-      asyncio.set_event_loop(loop)
-      try:
-        loop.run_until_complete(coro)
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-      finally:
-        loop.close()
-        asyncio.set_event_loop(old_loop)
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          if len(collected_responses) >= 5:
-            return
-
-      self._run_with_loop(
-          asyncio.wait_for(consume_responses(self.session), timeout=5.0)
-      )
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=root_agent)
+  runner = StreamingTestRunner(root_agent=root_agent, max_responses=5)
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=types.Blob(data=b"Show me the weather", mime_type="audio/pcm")
@@ -1209,55 +861,7 @@ def test_live_streaming_text_content_persisted_in_session():
       tools=[],
   )
 
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def _run_with_loop(self, coro):
-      try:
-        old_loop = asyncio.get_event_loop()
-      except RuntimeError:
-        old_loop = None
-
-      loop = asyncio.new_event_loop()
-      asyncio.set_event_loop(loop)
-      try:
-        loop.run_until_complete(coro)
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-      finally:
-        loop.close()
-        asyncio.set_event_loop(old_loop)
-
-    def run_live_and_get_session(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> tuple[list[testing_utils.Event], testing_utils.Session]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-        async for response in run_res:
-          collected_responses.append(response)
-          if len(collected_responses) >= 1:
-            return
-
-      self._run_with_loop(
-          asyncio.wait_for(consume_responses(self.session), timeout=5.0)
-      )
-
-      # Get the updated session
-      updated_session = self.runner.session_service.get_session_sync(
-          app_name=self.app_name,
-          user_id=self.session.user_id,
-          session_id=self.session.id,
-      )
-      return collected_responses, updated_session
-
-  runner = CustomTestRunner(root_agent=root_agent)
+  runner = StreamingTestRunner(root_agent=root_agent, max_responses=1)
   live_request_queue = LiveRequestQueue()
 
   # Send text content (not audio blob)
@@ -1306,6 +910,17 @@ class _LiveTestRunner(testing_utils.InMemoryRunner):
     except (asyncio.TimeoutError, asyncio.CancelledError):
       pass
     finally:
+      # Cancel all pending tasks to prevent leaks and warnings
+      pending = asyncio.all_tasks(loop)
+      for task in pending:
+        task.cancel()
+      if pending:
+        try:
+          loop.run_until_complete(
+              asyncio.gather(*pending, return_exceptions=True)
+          )
+        except Exception:  # pylint: disable=broad-except
+          pass
       loop.close()
       asyncio.set_event_loop(old_loop)
 
@@ -1318,13 +933,16 @@ class _LiveTestRunner(testing_utils.InMemoryRunner):
     collected = []
 
     async def consume(session: testing_utils.Session):
-      async for response in self.runner.run_live(
+      run_res = self.runner.run_live(
           session=session,
           live_request_queue=live_request_queue,
-      ):
-        collected.append(response)
-        if len(collected) >= max_responses:
-          return
+      )
+      async with aclosing(run_res) as agen:
+        async for response in agen:
+          collected.append(response)
+          if len(collected) >= max_responses:
+            await _wait_for_queue_empty(live_request_queue)
+            return
 
     self._run_with_loop(asyncio.wait_for(consume(self.session), timeout=5.0))
     return collected
@@ -1374,7 +992,7 @@ def test_input_streaming_tool_registered_lazily_with_stream():
 
   # Capture the invocation context to inspect registration state.
   captured_context = None
-  original_method = runner.runner._new_invocation_context_for_live
+  original_method = runner.runner._new_invocation_context
 
   def capturing_method(*args, **kwargs) -> Any:
     nonlocal captured_context
@@ -1382,7 +1000,7 @@ def test_input_streaming_tool_registered_lazily_with_stream():
     captured_context = ctx
     return ctx
 
-  runner.runner._new_invocation_context_for_live = capturing_method
+  runner.runner._new_invocation_context = capturing_method
 
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
@@ -1396,25 +1014,30 @@ def test_input_streaming_tool_registered_lazily_with_stream():
 
   async def consume(session: testing_utils.Session):
     nonlocal not_registered_before_call
-    async for response in runner.runner.run_live(
+    run_res = runner.runner.run_live(
         session=session,
         live_request_queue=live_request_queue,
-    ):
-      collected.append(response)
-      # On the first non-function-call event, verify the tool is not
-      # yet registered (lazy registration).
-      active = (
-          captured_context.active_streaming_tools if captured_context else None
-      )
-      if (
-          not_registered_before_call is None
-          and not response.get_function_calls()
-      ):
-        not_registered_before_call = (
-            active is None or "monitor_video_stream" not in active
+    )
+    async with aclosing(run_res) as agen:
+      async for response in agen:
+        collected.append(response)
+        # On the first non-function-call event, verify the tool is not
+        # yet registered (lazy registration).
+        active = (
+            (captured_context._active_background_tools or {}).values()
+            if captured_context
+            else []
         )
-      if len(collected) >= 4:
-        return
+        if (
+            not_registered_before_call is None
+            and not response.get_function_calls()
+        ):
+          not_registered_before_call = not any(
+              entry.tool_name == "monitor_video_stream" for entry in active
+          )
+        if len(collected) >= 4:
+          await _wait_for_queue_empty(live_request_queue)
+          return
 
   runner._run_with_loop(asyncio.wait_for(consume(runner.session), timeout=5.0))
 
@@ -1428,8 +1051,8 @@ def test_input_streaming_tool_registered_lazily_with_stream():
   ), "Expected input_stream to be provided to the streaming tool when called"
 
 
-def test_stop_streaming_resets_stream_to_none():
-  """Test that stop_streaming sets stream back to None."""
+def test_stop_streaming_stops_the_tool():
+  """Test that stop_streaming stops the running streaming tool."""
   start_call = types.Part.from_function_call(
       name="monitor_stock_price", args={"stock_symbol": "GOOG"}
   )
@@ -1470,21 +1093,6 @@ def test_stop_streaming_resets_stream_to_none():
 
   runner = _LiveTestRunner(root_agent=root_agent)
 
-  # Capture the child invocation context (created by _create_invocation_context
-  # inside base_agent.run_live) to inspect active_streaming_tools.
-  # We cannot use the parent context from _new_invocation_context_for_live
-  # because model_copy creates a separate child object.
-  captured_child_context = None
-  original_create = root_agent._create_invocation_context
-
-  def capturing_create(*args, **kwargs) -> Any:
-    nonlocal captured_child_context
-    ctx = original_create(*args, **kwargs)
-    captured_child_context = ctx
-    return ctx
-
-  root_agent._create_invocation_context = capturing_create
-
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=types.Blob(data=b"Monitor GOOG then stop", mime_type="audio/pcm")
@@ -1501,31 +1109,22 @@ def test_stop_streaming_resets_stream_to_none():
       "stop_streaming" in call_names
   ), "Expected stop_streaming function call."
 
-  # Verify that stop_streaming reset the stream to None.
-  assert (
-      captured_child_context is not None
-  ), "Expected child invocation context to be captured"
-  active_tools = captured_child_context.active_streaming_tools or {}
-  assert (
-      "monitor_stock_price" in active_tools
-  ), "Expected monitor_stock_price in active_streaming_tools"
-  assert (
-      active_tools["monitor_stock_price"].stream is None
-  ), "Expected stream to be reset to None after stop_streaming"
+  # Check the stop response rather than the registry or the task: the live
+  # run cancels its tools and clears the registry when it ends, so those look
+  # the same whether or not stop_streaming worked.
+  stop_responses = [
+      function_response.response
+      for event in res_events
+      for function_response in event.get_function_responses()
+      if function_response.name == "stop_streaming"
+  ]
+  assert stop_responses == [
+      {"status": "Successfully stopped streaming function monitor_stock_price"}
+  ]
 
 
-def test_output_streaming_tool_registered_lazily_without_stream():
-  """Test that output-streaming tools are registered lazily when called, with stream=None."""
-  function_call = types.Part.from_function_call(
-      name="monitor_stock_price", args={"stock_symbol": "GOOG"}
-  )
-  response1 = LlmResponse(
-      content=types.Content(role="model", parts=[function_call]),
-      turn_complete=False,
-  )
-  response2 = LlmResponse(turn_complete=True)
-
-  mock_model = testing_utils.MockModel.create([response1, response2])
+def test_output_streaming_tool_registered_without_stream():
+  """Test that output-streaming tools are registered when called, with input_stream=None."""
 
   async def monitor_stock_price(
       stock_symbol: str,
@@ -1533,44 +1132,19 @@ def test_output_streaming_tool_registered_lazily_without_stream():
     """Yield periodic price updates."""
     yield f"price for {stock_symbol}"
 
-  root_agent = Agent(
-      name="root_agent",
-      model=mock_model,
-      tools=[monitor_stock_price],
+  registered = _run_single_tool_live(
+      monitor_stock_price,
+      "monitor_stock_price",
+      func_args={"stock_symbol": "GOOG"},
   )
 
-  runner = _LiveTestRunner(root_agent=root_agent)
-
-  # Capture the child invocation context (created by _create_invocation_context
-  # inside base_agent.run_live) to inspect active_streaming_tools.
-  captured_child_context = None
-  original_create = root_agent._create_invocation_context
-
-  def capturing_create(*args, **kwargs) -> Any:
-    nonlocal captured_child_context
-    ctx = original_create(*args, **kwargs)
-    captured_child_context = ctx
-    return ctx
-
-  root_agent._create_invocation_context = capturing_create
-
-  live_request_queue = LiveRequestQueue()
-  live_request_queue.send_realtime(
-      blob=types.Blob(data=b"test", mime_type="audio/pcm")
-  )
-
-  runner.run_live(live_request_queue, max_responses=3)
-
-  # After the model calls the tool, it should be registered with
-  # stream=None (output-streaming tools don't consume the live stream).
-  assert captured_child_context is not None
-  active_tools = captured_child_context.active_streaming_tools or {}
+  # Output-streaming tools don't consume the live stream.
   assert (
-      "monitor_stock_price" in active_tools
+      "monitor_stock_price" in registered
   ), "Expected output-streaming tool to be registered when called"
   assert (
-      active_tools["monitor_stock_price"].stream is None
-  ), "Expected stream to be None for output-streaming tool"
+      registered["monitor_stock_price"].input_stream is None
+  ), "Expected input_stream to be None for output-streaming tool"
 
 
 def _run_single_tool_live(
@@ -1578,12 +1152,21 @@ def _run_single_tool_live(
     func_name: str,
     func_args: dict[str, Any] | None = None,
     max_responses: int = 3,
-) -> dict[str, Any]:
-  """Run a live session that invokes a single tool and return active_streaming_tools.
+) -> dict[str, ActiveBackgroundTool]:
+  """Run a live session that invokes a single tool and return what it registered.
 
   Sets up a mock model that issues one function call then completes,
-  creates an agent with the given tool, captures the invocation context,
-  and returns the ``active_streaming_tools`` dict after execution.
+  creates an agent with the given tool, and records background tool entries
+  as they are registered, because a tool unregisters itself when it finishes.
+
+  Args:
+    tool_func: The tool function to give the agent.
+    func_name: The name the model calls the tool by.
+    func_args: The arguments the model calls the tool with.
+    max_responses: The number of responses to collect before stopping.
+
+  Returns:
+    Every entry registered during the run, keyed by tool name.
   """
   function_call = types.Part.from_function_call(
       name=func_name, args=func_args or {}
@@ -1604,30 +1187,28 @@ def _run_single_tool_live(
 
   runner = _LiveTestRunner(root_agent=root_agent)
 
-  captured_child_context = None
-  original_create = root_agent._create_invocation_context
+  registered: dict[str, ActiveBackgroundTool] = {}
+  original_add = InvocationContext._add_background_tool
 
-  def capturing_create(*args, **kwargs) -> Any:
-    nonlocal captured_child_context
-    ctx = original_create(*args, **kwargs)
-    captured_child_context = ctx
-    return ctx
-
-  root_agent._create_invocation_context = capturing_create
+  def recording_add(self, entry: ActiveBackgroundTool) -> None:
+    registered[entry.tool_name] = entry
+    original_add(self, entry)
 
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=types.Blob(data=b"test", mime_type="audio/pcm")
   )
 
-  runner.run_live(live_request_queue, max_responses=max_responses)
+  with mock.patch.object(
+      InvocationContext, "_add_background_tool", recording_add
+  ):
+    runner.run_live(live_request_queue, max_responses=max_responses)
 
-  assert captured_child_context is not None
-  return captured_child_context.active_streaming_tools or {}
+  return registered
 
 
 def test_input_streaming_tool_has_stream_set_at_registration():
-  """Test that input-streaming tools get .stream set to a LiveRequestQueue during registration."""
+  """Test that input-streaming tools get .input_stream set to a LiveRequestQueue during registration."""
 
   async def monitor_video_stream(
       input_stream: LiveRequestQueue,
@@ -1644,11 +1225,11 @@ def test_input_streaming_tool_has_stream_set_at_registration():
   ), "Expected input-streaming tool to be registered when called"
   # Stream should be a LiveRequestQueue, not None.
   assert (
-      active_tools["monitor_video_stream"].stream is not None
-  ), "Expected .stream to be set for input-streaming tool"
+      active_tools["monitor_video_stream"].input_stream is not None
+  ), "Expected .input_stream to be set for input-streaming tool"
   assert isinstance(
-      active_tools["monitor_video_stream"].stream, LiveRequestQueue
-  ), "Expected .stream to be a LiveRequestQueue instance"
+      active_tools["monitor_video_stream"].input_stream, LiveRequestQueue
+  ), "Expected .input_stream to be a LiveRequestQueue instance"
 
 
 def test_input_streaming_tool_stream_recreated_after_stop():
@@ -1678,6 +1259,7 @@ def test_input_streaming_tool_stream_recreated_after_stop():
   )
 
   call_count = 0
+  streams: list[LiveRequestQueue] = []
 
   async def monitor_video(
       input_stream: LiveRequestQueue,
@@ -1685,6 +1267,7 @@ def test_input_streaming_tool_stream_recreated_after_stop():
     """Simulate an input-streaming tool that tracks invocation count."""
     nonlocal call_count
     call_count += 1
+    streams.append(input_stream)
     yield f"started (call {call_count})"
     while True:
       await asyncio.sleep(0.1)
@@ -1718,7 +1301,8 @@ def test_input_streaming_tool_stream_recreated_after_stop():
       blob=types.Blob(data=b"test", mime_type="audio/pcm")
   )
 
-  res_events = runner.run_live(live_request_queue, max_responses=8)
+  # Three calls, a response event for each, and the closing turn_complete.
+  res_events = runner.run_live(live_request_queue, max_responses=7)
 
   # monitor_video should appear at least twice in function calls
   # (start + restart). Function response events may add extra
@@ -1730,13 +1314,18 @@ def test_input_streaming_tool_stream_recreated_after_stop():
       call_names.count("monitor_video") >= 2
   ), f"Expected monitor_video called at least twice, got: {call_names}"
 
-  # After re-invocation, stream should be set again (not None).
+  # After re-invocation the tool is handed a stream again, and a fresh one:
+  # not the queue that stop_streaming tore down. This is asserted from what
+  # the tool was passed rather than from the registry, because the registry
+  # entry is retired when the live run ends.
   assert captured_child_context is not None
-  active_tools = captured_child_context.active_streaming_tools or {}
-  assert "monitor_video" in active_tools
   assert (
-      active_tools["monitor_video"].stream is not None
-  ), "Expected .stream to be recreated after stop + re-invocation"
+      len(streams) >= 2
+  ), f"Expected monitor_video to run twice, got {len(streams)} stream(s)"
+  assert all(stream is not None for stream in streams)
+  assert (
+      streams[0] is not streams[1]
+  ), "Expected a new stream to be created after stop + re-invocation"
 
 
 def test_async_gen_with_input_stream_wrong_annotation_gets_no_stream():
@@ -1757,8 +1346,8 @@ def test_async_gen_with_input_stream_wrong_annotation_gets_no_stream():
       "my_tool" in active_tools
   ), "Expected async generator tool to be registered"
   # Stream should be None because annotation is str, not LiveRequestQueue.
-  assert active_tools["my_tool"].stream is None, (
-      "Expected .stream to be None when input_stream annotation is not"
+  assert active_tools["my_tool"].input_stream is None, (
+      "Expected .input_stream to be None when input_stream annotation is not"
       " LiveRequestQueue"
   )
   # The tool should have received the model-provided arg value, not a

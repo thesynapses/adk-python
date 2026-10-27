@@ -91,6 +91,12 @@ class TestPlugin(BasePlugin):
   async def on_model_error_callback(self, **kwargs):
     return await self._handle_callback("on_model_error_callback")
 
+  async def on_agent_error_callback(self, **kwargs):
+    return await self._handle_callback("on_agent_error_callback")
+
+  async def on_run_error_callback(self, **kwargs):
+    return await self._handle_callback("on_run_error_callback")
+
 
 @pytest.fixture
 def service() -> PluginManager:
@@ -252,6 +258,15 @@ async def test_all_callbacks_are_supported(
       llm_request=mock_context,
       error=mock_context,
   )
+  await service.run_on_agent_error_callback(
+      agent=mock_context,
+      callback_context=mock_context,
+      error=mock_context,
+  )
+  await service.run_on_run_error_callback(
+      invocation_context=mock_context,
+      error=mock_context,
+  )
 
   # Verify all callbacks were logged
   expected_callbacks = [
@@ -267,6 +282,8 @@ async def test_all_callbacks_are_supported(
       "before_model_callback",
       "after_model_callback",
       "on_model_error_callback",
+      "on_agent_error_callback",
+      "on_run_error_callback",
   ]
   assert set(plugin1.call_log) == set(expected_callbacks)
 
@@ -298,6 +315,64 @@ async def test_close_raises_runtime_error_on_plugin_exception(
     await service.close()
 
   plugin1.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_close_closes_remaining_plugins_and_reraises_cancellation():
+  """Tests that cancellation propagates only after all plugins are closed."""
+  plugins = [TestPlugin(name=f"plugin{i}") for i in range(1, 4)]
+  for plugin in plugins:
+    plugin.close = AsyncMock()
+  plugins[1].close = AsyncMock(side_effect=asyncio.CancelledError())
+  service = PluginManager(plugins=plugins)
+
+  with pytest.raises(asyncio.CancelledError):
+    await service.close()
+
+  for plugin in plugins:
+    plugin.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_close_closes_remaining_plugins_when_task_is_cancelled():
+  """Tests that a real task cancellation still closes the remaining plugins."""
+  started = asyncio.Event()
+
+  async def blocking_close():
+    started.set()
+    await asyncio.sleep(10)
+
+  plugins = [TestPlugin(name=f"plugin{i}") for i in range(1, 4)]
+  plugins[0].close = AsyncMock()
+  plugins[1].close = blocking_close
+  plugins[2].close = AsyncMock()
+  service = PluginManager(plugins=plugins)
+  task = asyncio.create_task(service.close())
+  await started.wait()
+
+  task.cancel()
+
+  with pytest.raises(asyncio.CancelledError):
+    await task
+
+  plugins[0].close.assert_awaited_once()
+  plugins[2].close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_close_closes_remaining_plugins_after_plugin_error():
+  """Tests that a failing plugin does not stop the remaining ones closing."""
+  plugins = [TestPlugin(name=f"plugin{i}") for i in range(1, 4)]
+  for plugin in plugins:
+    plugin.close = AsyncMock()
+  plugins[1].close = AsyncMock(side_effect=ValueError("Shutdown error"))
+  service = PluginManager(plugins=plugins)
+
+  with pytest.raises(RuntimeError, match="'plugin2': ValueError"):
+    await service.close()
+
+  for plugin in plugins:
+    plugin.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio

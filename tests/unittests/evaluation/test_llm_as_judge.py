@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
 from google.adk.evaluation.eval_case import Invocation
@@ -26,10 +27,12 @@ from google.adk.evaluation.evaluator import EvaluationResult
 from google.adk.evaluation.evaluator import PerInvocationResult
 from google.adk.evaluation.llm_as_judge import AutoRaterScore
 from google.adk.evaluation.llm_as_judge import LlmAsJudge
+from google.adk.evaluation.llm_as_judge_utils import build_judge_request_config
 from google.adk.evaluation.llm_as_judge_utils import get_eval_status
 from google.adk.evaluation.llm_as_judge_utils import get_text_from_content
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types as genai_types
+import pydantic
 import pytest
 
 
@@ -62,6 +65,15 @@ class MockLlmAsJudge(LlmAsJudge):
     return EvaluationResult(
         overall_score=1.0, overall_eval_status=EvalStatus.PASSED
     )
+
+
+class PerInvocationReportingLlmAsJudge(MockLlmAsJudge):
+  """Surfaces the per-invocation results the base class graded."""
+
+  def aggregate_invocation_results(
+      self, per_invocation_results: list[PerInvocationResult]
+  ) -> EvaluationResult:
+    return EvaluationResult(per_invocation_results=per_invocation_results)
 
 
 @pytest.fixture
@@ -237,3 +249,303 @@ async def test_evaluate_invocations_with_mock(
   assert mock_llm_as_judge.format_auto_rater_prompt.call_count == 2
   assert mock_llm_as_judge.convert_auto_rater_response_to_score.call_count == 6
   assert mock_llm_as_judge.aggregate_invocation_results.call_count == 1
+
+
+def test_build_judge_request_config_disables_afc_when_user_config_is_none():
+  # No user config: a fresh GenerateContentConfig with AFC explicitly disabled.
+  config = build_judge_request_config(None)
+  assert config.automatic_function_calling is not None
+  assert config.automatic_function_calling.disable is True
+
+
+def test_build_judge_request_config_force_disables_afc_in_user_config():
+  # User passed a config that tweaks temperature but did not mention AFC. We
+  # force AFC off anyway, so the per-request google-genai warning does not
+  # survive a caller merely overriding an unrelated field.
+  user_config = genai_types.GenerateContentConfig(temperature=0.3)
+  config = build_judge_request_config(user_config)
+  assert config.temperature == 0.3
+  assert config.automatic_function_calling is not None
+  assert config.automatic_function_calling.disable is True
+  # Caller's object is untouched.
+  assert user_config.automatic_function_calling is None
+
+
+def test_build_judge_request_config_overrides_user_enabled_afc():
+  # Even if the user explicitly left AFC on, judges never call tools so we
+  # still disable it. If this ever stops being true, flip this test.
+  user_config = genai_types.GenerateContentConfig(
+      automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
+          disable=False
+      )
+  )
+  config = build_judge_request_config(user_config)
+  assert config.automatic_function_calling.disable is True
+  assert user_config.automatic_function_calling.disable is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "user_judge_model_config",
+    [
+        None,
+        genai_types.GenerateContentConfig(temperature=0.3),
+    ],
+    ids=["default_config", "user_supplied_config"],
+)
+async def test_evaluate_invocations_judge_request_disables_afc(
+    mock_judge_model, user_judge_model_config
+):
+  # The judge request must disable google-genai's automatic function calling
+  # regardless of whether the caller supplied a judge_model_config, since the
+  # judge never calls tools and leaving AFC on only produces a spurious
+  # per-request warning on every eval run.
+  judge = MockLlmAsJudge(
+      eval_metric=EvalMetric(
+          metric_name="test_metric",
+          threshold=0.5,
+          criterion=LlmAsAJudgeCriterion(
+              threshold=0.5,
+              judge_model_options=JudgeModelOptions(
+                  judge_model="gemini-2.5-flash",
+                  judge_model_config=user_judge_model_config,
+                  num_samples=1,
+              ),
+          ),
+      ),
+      criterion_type=LlmAsAJudgeCriterion,
+  )
+  judge._judge_model = mock_judge_model
+  captured_requests = []
+  original_generate_content_async = mock_judge_model.generate_content_async
+
+  def capturing_generate_content_async(llm_request):
+    captured_requests.append(llm_request)
+    return original_generate_content_async(llm_request)
+
+  judge._judge_model.generate_content_async = capturing_generate_content_async
+
+  actual_invocations = [
+      Invocation(
+          invocation_id="id1",
+          user_content=genai_types.Content(
+              parts=[genai_types.Part(text="user content 1")],
+              role="user",
+          ),
+          final_response=genai_types.Content(
+              parts=[genai_types.Part(text="final response 1")],
+              role="model",
+          ),
+      )
+  ]
+
+  await judge.evaluate_invocations(actual_invocations)
+
+  assert len(captured_requests) == 1
+  config = captured_requests[0].config
+  assert config.automatic_function_calling is not None
+  assert config.automatic_function_calling.disable is True
+
+
+@pytest.mark.asyncio
+async def test_evaluate_invocations_grades_criterion_only_metric(
+    mock_judge_model,
+):
+  # A metric configured with just a criterion carries no deprecated threshold,
+  # and must still be graded against the criterion's own threshold.
+  judge = PerInvocationReportingLlmAsJudge(
+      eval_metric=EvalMetric(
+          metric_name="test_metric",
+          criterion=LlmAsAJudgeCriterion(
+              threshold=0.5,
+              judge_model_options=JudgeModelOptions(
+                  judge_model="gemini-2.5-flash",
+                  judge_model_config=genai_types.GenerateContentConfig(),
+                  num_samples=1,
+              ),
+          ),
+      ),
+      criterion_type=LlmAsAJudgeCriterion,
+  )
+  judge._judge_model = mock_judge_model
+  actual_invocations = [
+      Invocation(
+          invocation_id="id1",
+          user_content=genai_types.Content(
+              parts=[genai_types.Part(text="user content 1")],
+              role="user",
+          ),
+          final_response=genai_types.Content(
+              parts=[genai_types.Part(text="final response 1")],
+              role="model",
+          ),
+      )
+  ]
+
+  result = await judge.evaluate_invocations(actual_invocations)
+
+  # The auto-rater scores 1.0, which clears the criterion's 0.5 threshold.
+  assert [r.eval_status for r in result.per_invocation_results] == [
+      EvalStatus.PASSED
+  ]
+
+
+@pytest.mark.asyncio
+async def test_evaluate_invocations_parallelism_limit(
+    mock_llm_as_judge, mocker
+):
+  mock_llm_as_judge._judge_model_options.parallelism_limit = 2
+
+  active_calls = 0
+  max_active_calls = 0
+
+  async def mock_generate_content_async(llm_request):
+    nonlocal active_calls, max_active_calls
+    active_calls += 1
+    max_active_calls = max(max_active_calls, active_calls)
+    await asyncio.sleep(0.1)
+    active_calls -= 1
+    yield LlmResponse(
+        content=genai_types.Content(
+            parts=[genai_types.Part(text="auto rater response")],
+        )
+    )
+
+  mock_judge_model = mocker.MagicMock()
+  mock_judge_model.generate_content_async = mock_generate_content_async
+  mock_llm_as_judge._judge_model = mock_judge_model
+
+  actual_invocations = [
+      Invocation(
+          invocation_id="id1",
+          user_content=genai_types.Content(parts=[genai_types.Part(text="u1")]),
+          final_response=genai_types.Content(
+              parts=[genai_types.Part(text="r1")]
+          ),
+      ),
+      Invocation(
+          invocation_id="id2",
+          user_content=genai_types.Content(parts=[genai_types.Part(text="u2")]),
+          final_response=genai_types.Content(
+              parts=[genai_types.Part(text="r2")]
+          ),
+      ),
+  ]
+
+  mock_llm_as_judge._judge_model_options.num_samples = 3
+
+  await mock_llm_as_judge.evaluate_invocations(
+      actual_invocations, actual_invocations
+  )
+
+  assert max_active_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_evaluate_invocations_sample_failure(mock_llm_as_judge, mocker):
+  call_count = 0
+
+  async def mock_generate_content_async(llm_request):
+    nonlocal call_count
+    call_count += 1
+    if call_count == 1:
+      raise RuntimeError("Simulated LLM failure")
+    yield LlmResponse(
+        content=genai_types.Content(
+            parts=[genai_types.Part(text="auto rater response")],
+        )
+    )
+
+  mock_judge_model = mocker.MagicMock()
+  mock_judge_model.generate_content_async = mock_generate_content_async
+  mock_llm_as_judge._judge_model = mock_judge_model
+
+  mock_aggregate_per_invocation_samples = mocker.MagicMock(
+      wraps=mock_llm_as_judge.aggregate_per_invocation_samples
+  )
+  mock_llm_as_judge.aggregate_per_invocation_samples = (
+      mock_aggregate_per_invocation_samples
+  )
+
+  def mock_aggregate_invocation_results(per_invocation_results):
+    return EvaluationResult(
+        per_invocation_results=per_invocation_results,
+    )
+
+  mock_llm_as_judge.aggregate_invocation_results = (
+      mock_aggregate_invocation_results
+  )
+
+  actual_invocations = [
+      Invocation(
+          invocation_id="id1",
+          user_content=genai_types.Content(parts=[genai_types.Part(text="u1")]),
+          final_response=genai_types.Content(
+              parts=[genai_types.Part(text="r1")]
+          ),
+      ),
+      Invocation(
+          invocation_id="id2",
+          user_content=genai_types.Content(parts=[genai_types.Part(text="u2")]),
+          final_response=genai_types.Content(
+              parts=[genai_types.Part(text="r2")]
+          ),
+      ),
+  ]
+
+  mock_llm_as_judge._judge_model_options.num_samples = 2
+
+  result = await mock_llm_as_judge.evaluate_invocations(
+      actual_invocations, actual_invocations
+  )
+
+  assert len(result.per_invocation_results) == 2
+  assert (
+      result.per_invocation_results[0].eval_status == EvalStatus.NOT_EVALUATED
+  )
+  assert result.per_invocation_results[0].score is None
+  assert result.per_invocation_results[1].eval_status == EvalStatus.PASSED
+  assert result.per_invocation_results[1].score == 1.0
+  assert mock_aggregate_per_invocation_samples.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_evaluate_invocations_cancelled_sample(mock_llm_as_judge, mocker):
+  """A cancelled sample marks its invocation not evaluated."""
+
+  async def mock_generate_content_async(llm_request):
+    raise asyncio.CancelledError()
+    yield  # makes this an async generator, like the real method
+
+  mock_judge_model = mocker.MagicMock()
+  mock_judge_model.generate_content_async = mock_generate_content_async
+  mock_llm_as_judge._judge_model = mock_judge_model
+  mock_llm_as_judge.aggregate_invocation_results = (
+      lambda per_invocation_results: EvaluationResult(
+          per_invocation_results=per_invocation_results,
+      )
+  )
+  actual_invocations = [
+      Invocation(
+          invocation_id="id1",
+          user_content=genai_types.Content(parts=[genai_types.Part(text="u1")]),
+          final_response=genai_types.Content(
+              parts=[genai_types.Part(text="r1")]
+          ),
+      ),
+  ]
+
+  result = await mock_llm_as_judge.evaluate_invocations(
+      actual_invocations, actual_invocations
+  )
+
+  assert len(result.per_invocation_results) == 1
+  assert (
+      result.per_invocation_results[0].eval_status == EvalStatus.NOT_EVALUATED
+  )
+
+
+@pytest.mark.parametrize("invalid_limit", [0, -1])
+def test_judge_model_options_invalid_parallelism_limit(invalid_limit):
+  with pytest.raises(pydantic.ValidationError):
+    JudgeModelOptions(parallelism_limit=invalid_limit)

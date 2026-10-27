@@ -222,12 +222,12 @@ def _create_function_response_content(name: str, call_id: str) -> types.Content:
 async def test_filter_preserves_function_call_response_pairs():
   """Tests that function_call and function_response pairs are kept together.
 
-  This tests the fix for issue #4027 where filtering could create orphaned
+  This tests the fix for the case where filtering could create orphaned
   function_response messages without their corresponding function_call.
   """
   plugin = ContextFilterPlugin(num_invocations_to_keep=2)
 
-  # Simulate conversation from issue #4027:
+  # Simulate the reported conversation:
   # user -> model -> user -> model(function_call) -> user(function_response)
   # -> model -> user -> model(function_call) -> user(function_response)
   contents = [
@@ -343,3 +343,220 @@ async def test_last_invocation_with_tool_call_keeps_user_prompt():
 
   assert "user_prompt_2" in texts
   assert "final_answer_2" in texts
+
+
+@pytest.mark.asyncio
+async def test_filter_with_remove_amount():
+  """Tests that remove_amount correctly removes additional invocations."""
+  plugin = ContextFilterPlugin(num_invocations_to_keep=2, remove_amount=1)
+  contents = [
+      _create_content("user", "user_prompt_1"),
+      _create_content("model", "model_response_1"),
+      _create_content("user", "user_prompt_2"),
+      _create_content("model", "model_response_2"),
+      _create_content("user", "user_prompt_3"),
+      _create_content("model", "model_response_3"),
+  ]
+  llm_request = LlmRequest(contents=contents)
+
+  await plugin.before_model_callback(
+      callback_context=mock.create_autospec(CallbackContext, instance=True),
+      llm_request=llm_request,
+  )
+
+  # With num_invocations_to_keep=2 and remove_amount=1, keeps last 2.
+  assert len(llm_request.contents) == 4
+  assert llm_request.contents[0].parts[0].text == "user_prompt_2"
+  assert llm_request.contents[1].parts[0].text == "model_response_2"
+  assert llm_request.contents[2].parts[0].text == "user_prompt_3"
+  assert llm_request.contents[3].parts[0].text == "model_response_3"
+
+
+@pytest.mark.asyncio
+async def test_filter_with_higher_remove_amount():
+  """Tests remove_amount with a higher value to remove more invocations."""
+  plugin = ContextFilterPlugin(num_invocations_to_keep=3, remove_amount=2)
+  contents = [
+      _create_content("user", "user_prompt_1"),
+      _create_content("model", "model_response_1"),
+      _create_content("user", "user_prompt_2"),
+      _create_content("model", "model_response_2"),
+      _create_content("user", "user_prompt_3"),
+      _create_content("model", "model_response_3"),
+      _create_content("user", "user_prompt_4"),
+      _create_content("model", "model_response_4"),
+      _create_content("user", "user_prompt_5"),
+      _create_content("model", "model_response_5"),
+  ]
+  llm_request = LlmRequest(contents=contents)
+
+  await plugin.before_model_callback(
+      callback_context=mock.create_autospec(CallbackContext, instance=True),
+      llm_request=llm_request,
+  )
+
+  # With num_invocations_to_keep=3 and remove_amount=2, keeps last 3.
+  assert len(llm_request.contents) == 6
+  assert llm_request.contents[0].parts[0].text == "user_prompt_3"
+  assert llm_request.contents[1].parts[0].text == "model_response_3"
+  assert llm_request.contents[2].parts[0].text == "user_prompt_4"
+  assert llm_request.contents[3].parts[0].text == "model_response_4"
+  assert llm_request.contents[4].parts[0].text == "user_prompt_5"
+  assert llm_request.contents[5].parts[0].text == "model_response_5"
+
+
+def test_invalid_remove_amount():
+  """Tests that initializing with remove_amount < 1 raises ValueError."""
+  with pytest.raises(ValueError, match="remove_amount must be at least 1"):
+    ContextFilterPlugin(num_invocations_to_keep=1, remove_amount=0)
+
+  with pytest.raises(ValueError, match="remove_amount must be at least 1"):
+    ContextFilterPlugin(num_invocations_to_keep=1, remove_amount=-1)
+
+
+@pytest.mark.asyncio
+async def test_filter_remove_amount_with_multiple_user_turns():
+  """Tests remove_amount with multiple user turns in invocations."""
+  plugin = ContextFilterPlugin(num_invocations_to_keep=2, remove_amount=1)
+  contents = [
+      _create_content("user", "user_prompt_1"),
+      _create_content("model", "model_response_1"),
+      _create_content("user", "user_prompt_2a"),
+      _create_content("user", "user_prompt_2b"),
+      _create_content("model", "model_response_2"),
+      _create_content("user", "user_prompt_3"),
+      _create_content("model", "model_response_3"),
+  ]
+  llm_request = LlmRequest(contents=contents)
+
+  await plugin.before_model_callback(
+      callback_context=mock.create_autospec(CallbackContext, instance=True),
+      llm_request=llm_request,
+  )
+
+  # Should keep last 2 invocations including multiple user turns
+  assert len(llm_request.contents) == 5
+  assert llm_request.contents[0].parts[0].text == "user_prompt_2a"
+  assert llm_request.contents[1].parts[0].text == "user_prompt_2b"
+  assert llm_request.contents[2].parts[0].text == "model_response_2"
+  assert llm_request.contents[3].parts[0].text == "user_prompt_3"
+  assert llm_request.contents[4].parts[0].text == "model_response_3"
+
+
+@pytest.mark.asyncio
+async def test_filter_bypass_when_under_remove_threshold():
+  """Tests that filtering is bypassed when total invocations are between keep limit and keep+remove limit."""
+  plugin = ContextFilterPlugin(num_invocations_to_keep=2, remove_amount=2)
+  contents = [
+      _create_content("user", "user_prompt_1"),
+      _create_content("model", "model_response_1"),
+      _create_content("user", "user_prompt_2"),
+      _create_content("model", "model_response_2"),
+      _create_content("user", "user_prompt_3"),
+      _create_content("model", "model_response_3"),
+  ]
+  llm_request = LlmRequest(contents=contents)
+  original_contents = list(llm_request.contents)
+
+  await plugin.before_model_callback(
+      callback_context=mock.create_autospec(CallbackContext, instance=True),
+      llm_request=llm_request,
+  )
+
+  # With num_invocations_to_keep=2 and remove_amount=2, threshold is 4.
+  # We have 3 invocations, so no filtering should occur.
+  assert llm_request.contents == original_contents
+
+
+@pytest.mark.parametrize("num_to_keep", [0, -1])
+@pytest.mark.asyncio
+async def test_filter_with_non_positive_invocations_to_keep_does_not_truncate(
+    num_to_keep: int,
+):
+  """num_invocations_to_keep of 0 or less keeps every invocation."""
+  plugin = ContextFilterPlugin(num_invocations_to_keep=num_to_keep)
+  original_contents = [
+      _create_content("model", "initial_greeting"),
+      _create_content("user", "user_prompt_1"),
+      _create_content("model", "model_response_1"),
+      _create_content("user", "user_prompt_2"),
+      _create_content("model", "model_response_2"),
+  ]
+  llm_request = LlmRequest(contents=list(original_contents))
+
+  await plugin.before_model_callback(
+      callback_context=mock.create_autospec(CallbackContext, instance=True),
+      llm_request=llm_request,
+  )
+
+  assert llm_request.contents == original_contents
+
+
+async def _filter_keeping_one_invocation(
+    contents: list[types.Content],
+) -> list[types.Content]:
+  plugin = ContextFilterPlugin(num_invocations_to_keep=1)
+  llm_request = LlmRequest(contents=list(contents))
+  await plugin.before_model_callback(
+      callback_context=mock.create_autospec(CallbackContext, instance=True),
+      llm_request=llm_request,
+  )
+  return llm_request.contents
+
+
+@pytest.mark.asyncio
+async def test_filter_tolerates_content_with_none_parts():
+  """A content whose parts are None is dropped like any older content."""
+  contents = [
+      types.Content(role="user", parts=None),
+      _create_content("user", "old_prompt"),
+      _create_content("model", "old_answer"),
+      _create_content("user", "latest_prompt"),
+      _create_content("model", "final_answer"),
+  ]
+
+  assert await _filter_keeping_one_invocation(contents) == contents[3:]
+
+
+@pytest.mark.asyncio
+async def test_filter_ignores_function_call_and_response_without_ids():
+  """A call and response without ids do not move the split point."""
+  contents = [
+      _create_content("user", "old_prompt"),
+      _create_content("model", "old_answer"),
+      _create_content("user", "latest_prompt"),
+      types.Content(
+          role="model",
+          parts=[
+              types.Part(
+                  function_call=types.FunctionCall(id=None, name="no_id_tool")
+              )
+          ],
+      ),
+      types.Content(
+          role="user",
+          parts=[
+              types.Part(
+                  function_response=types.FunctionResponse(
+                      id=None, name="no_id_tool", response={"ok": True}
+                  )
+              )
+          ],
+      ),
+      _create_content("model", "final_answer"),
+  ]
+
+  assert await _filter_keeping_one_invocation(contents) == contents[2:]
+
+
+@pytest.mark.asyncio
+async def test_filter_keeps_everything_when_response_has_no_matching_call():
+  """A function response whose call is never found keeps all contents."""
+  contents = [
+      _create_content("user", "old_prompt"),
+      _create_content("model", "old_answer"),
+      _create_content("user", "latest_prompt"),
+      _create_function_response_content("orphan_tool", "unmatched_call_id"),
+  ]
+
+  assert await _filter_keeping_one_invocation(contents) == contents

@@ -57,3 +57,44 @@ def test_state_content(mock_invocation_context):
 def test_user_id(mock_invocation_context):
   readonly_context = ReadonlyContext(mock_invocation_context)
   assert readonly_context.user_id == "test-user-id"
+
+
+def test_custom_metadata(mock_invocation_context):
+  mock_invocation_context._custom_metadata = {"meta_key": "meta_value"}
+  readonly_context = ReadonlyContext(mock_invocation_context)
+  metadata = readonly_context.custom_metadata
+
+  assert isinstance(metadata, MappingProxyType)
+  assert metadata["meta_key"] == "meta_value"
+  with pytest.raises(TypeError):
+    metadata["new_key"] = "new_value"
+
+
+@pytest.mark.parametrize(
+    "attribute", ["user_content", "session", "run_config", "is_aborted"]
+)
+def test_property_passes_through_invocation_context(
+    mock_invocation_context, attribute
+):
+  readonly_context = ReadonlyContext(mock_invocation_context)
+  assert getattr(readonly_context, attribute) is getattr(
+      mock_invocation_context, attribute
+  )
+
+
+_CREDENTIAL = object()
+
+
+@pytest.mark.parametrize(
+    "credential_by_key, key, expected",
+    [
+        ({"oauth_key": _CREDENTIAL}, "oauth_key", _CREDENTIAL),
+        ({}, "missing_key", None),
+    ],
+)
+def test_get_credential(
+    mock_invocation_context, credential_by_key, key, expected
+):
+  mock_invocation_context.credential_by_key = credential_by_key
+  readonly_context = ReadonlyContext(mock_invocation_context)
+  assert readonly_context.get_credential(key) is expected

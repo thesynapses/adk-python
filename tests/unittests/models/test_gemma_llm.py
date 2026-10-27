@@ -99,12 +99,13 @@ def test_supported_models_matches_gemma3():
 
 
 @pytest.mark.asyncio
-async def test_not_gemma_model():
+@pytest.mark.parametrize("bad_model", ["not-a-gemma-model", None])
+async def test_not_gemma_model(bad_model: str | None) -> None:
   llm = Gemma()
   llm_request_bad_model = LlmRequest(
-      model="not-a-gemma-model",
+      model=bad_model,
   )
-  with pytest.raises(AssertionError, match=r".*model.*"):
+  with pytest.raises(ValueError, match=r".*model.*"):
     async for _ in llm.generate_content_async(llm_request_bad_model):
       pass
 
@@ -516,6 +517,51 @@ def test_process_response_last_json_object():
   assert part.function_call.name == "second_call"
   assert part.function_call.args == {"b": 2}
   assert part.text is None
+
+
+def test_process_response_skips_partial_streaming_chunk():
+  """A partial chunk is a fragment; parsing it would eat the streamed text."""
+  # Text that WOULD parse as a function call if the guard were missing.
+  json_function_call_str = (
+      '{"name": "search_web", "parameters": {"query": "latest news"}}'
+  )
+  llm_response = LlmResponse(
+      content=Content(
+          role="model", parts=[Part.from_text(text=json_function_call_str)]
+      ),
+      partial=True,
+  )
+
+  gemma = Gemma()
+  gemma._extract_function_calls_from_response(llm_response)
+
+  assert llm_response.content
+  assert llm_response.content.parts
+  assert len(llm_response.content.parts) == 1
+  assert llm_response.content.parts[0].text == json_function_call_str
+  assert llm_response.content.parts[0].function_call is None
+
+
+def test_process_response_skips_turn_complete_marker():
+  """The turn_complete marker closes the turn; its text must not be reparsed."""
+  json_function_call_str = (
+      '{"name": "search_web", "parameters": {"query": "latest news"}}'
+  )
+  llm_response = LlmResponse(
+      content=Content(
+          role="model", parts=[Part.from_text(text=json_function_call_str)]
+      ),
+      turn_complete=True,
+  )
+
+  gemma = Gemma()
+  gemma._extract_function_calls_from_response(llm_response)
+
+  assert llm_response.content
+  assert llm_response.content.parts
+  assert len(llm_response.content.parts) == 1
+  assert llm_response.content.parts[0].text == json_function_call_str
+  assert llm_response.content.parts[0].function_call is None
 
 
 # Tests for Gemma 4 registry routing

@@ -16,28 +16,24 @@ from __future__ import annotations
 
 from pydantic import model_validator
 
-from ...features import experimental
-from ...features import FeatureName
 from .._google_credentials import BaseGoogleCredentialsConfig
 
 PUBSUB_TOKEN_CACHE_KEY = "pubsub_token_cache"
 PUBSUB_DEFAULT_SCOPE = ("https://www.googleapis.com/auth/pubsub",)
 
 
-@experimental(FeatureName.GOOGLE_CREDENTIALS_CONFIG)
 class PubSubCredentialsConfig(BaseGoogleCredentialsConfig):
-  """Pub/Sub Credentials Configuration for Google API tools (Experimental).
-
-  Please do not use this in production, as it may be deprecated later.
-  """
+  """Pub/Sub Credentials Configuration for Google API tools."""
 
   @model_validator(mode="after")
   def __post_init__(self) -> PubSubCredentialsConfig:
     """Populate default scope if scopes is None."""
-    super().__post_init__()
+    # pydantic wraps the base @model_validator in a descriptor proxy that mypy
+    # does not treat as callable; it binds to the function normally at runtime.
+    super().__post_init__()  # type: ignore[operator]
 
     if not self.scopes:
-      self.scopes = PUBSUB_DEFAULT_SCOPE
+      self.scopes = list(PUBSUB_DEFAULT_SCOPE)
 
     # Set the token cache key
     self._token_cache_key = PUBSUB_TOKEN_CACHE_KEY

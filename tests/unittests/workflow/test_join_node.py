@@ -14,13 +14,20 @@
 
 """Testings for the JoinNode."""
 
+import asyncio
+
 from google.adk import workflow
 from google.adk.apps import app
+from google.adk.apps.app import ResumabilityConfig
+from google.adk.events._interrupts import extract_event_interrupt_ids
+from google.adk.events.event import Event
+from google.adk.events.request_input import RequestInput
 from google.adk.workflow import _base_node as base_node
 from google.adk.workflow import _graph as workflow_graph
 from google.adk.workflow import _join_node as join_node
 from google.adk.workflow import START
 from google.adk.workflow._workflow import Workflow
+from google.adk.workflow.utils import _workflow_hitl_utils as hitl_utils
 from pydantic import BaseModel
 import pytest
 
@@ -57,16 +64,6 @@ def _build_join_node_workflow(
   return node_capture, testing_utils.InMemoryRunner(app=app_instance)
 
 
-def test_get_common_branch_prefix():
-  """Tests _get_common_branch_prefix."""
-  assert join_node._get_common_branch_prefix(['A@1', 'A@2']) == ''
-  assert join_node._get_common_branch_prefix(['A@1.B@1', 'A@1.B@2']) == 'A@1'
-  assert join_node._get_common_branch_prefix(['A@1', 'A@1']) == 'A@1'
-  assert join_node._get_common_branch_prefix(['A@1', '']) == ''
-  assert join_node._get_common_branch_prefix(['', '']) == ''
-  assert join_node._get_common_branch_prefix([]) == ''
-
-
 @pytest.mark.asyncio
 async def test_join_node_waits_for_all_inputs(request: pytest.FixtureRequest):
   """Tests JoinNode with fan-in."""
@@ -77,6 +74,89 @@ async def test_join_node_waits_for_all_inputs(request: pytest.FixtureRequest):
       'NodeA': {'a': 1, 'b': 1},
       'NodeB': {'b': 2},
   }]
+
+
+@pytest.mark.asyncio
+async def test_join_node_waits_when_start_is_a_predecessor(
+    request: pytest.FixtureRequest,
+):
+  """Tests JoinNode with a direct START edge alongside parallel branches."""
+  node_a = workflow_testing_utils.TestingNode(name='NodeA', output={'a': 1})
+  node_b = workflow_testing_utils.TestingNode(name='NodeB', output={'b': 2})
+  node_join = join_node.JoinNode(name='NodeJoin')
+  node_capture = workflow_testing_utils.InputCapturingNode(name='NodeCapture')
+  agent = workflow.Workflow(
+      name='test_join_node_start_predecessor',
+      edges=[
+          workflow_graph.Edge(from_node=base_node.START, to_node=node_a),
+          workflow_graph.Edge(from_node=base_node.START, to_node=node_b),
+          workflow_graph.Edge(from_node=base_node.START, to_node=node_join),
+          workflow_graph.Edge(from_node=node_a, to_node=node_join),
+          workflow_graph.Edge(from_node=node_b, to_node=node_join),
+          workflow_graph.Edge(from_node=node_join, to_node=node_capture),
+      ],
+  )
+  app_instance = app.App(name=request.function.__name__, root_agent=agent)
+  runner = testing_utils.InMemoryRunner(app=app_instance)
+
+  user_content = testing_utils.get_user_content('start')
+  await runner.run_async(user_content)
+
+  assert node_capture.received_inputs == [{
+      base_node.START.name: user_content,
+      'NodeA': {'a': 1},
+      'NodeB': {'b': 2},
+  }]
+
+
+@pytest.mark.asyncio
+async def test_join_node_start_predecessor_keeps_nested_branch(
+    request: pytest.FixtureRequest,
+):
+  """Tests a START-fed JoinNode emits on its own workflow's branch."""
+  node_a = workflow_testing_utils.TestingNode(name='NodeA', output={'a': 1})
+  node_b = workflow_testing_utils.TestingNode(name='NodeB', output={'b': 2})
+  node_join = join_node.JoinNode(name='NodeJoin')
+  node_capture = workflow_testing_utils.InputCapturingNode(name='NodeCapture')
+  inner = workflow.Workflow(
+      name='Inner',
+      edges=[
+          workflow_graph.Edge(from_node=base_node.START, to_node=node_a),
+          workflow_graph.Edge(from_node=base_node.START, to_node=node_b),
+          workflow_graph.Edge(from_node=base_node.START, to_node=node_join),
+          workflow_graph.Edge(from_node=node_a, to_node=node_join),
+          workflow_graph.Edge(from_node=node_b, to_node=node_join),
+          workflow_graph.Edge(from_node=node_join, to_node=node_capture),
+      ],
+  )
+  # A second START edge in the outer workflow gives Inner a sub-branch of its
+  # own, so the join's predecessors run under 'Inner@1.<node>@1'.
+  node_sibling = workflow_testing_utils.TestingNode(name='Sibling')
+  outer = workflow.Workflow(
+      name='Outer',
+      edges=[
+          workflow_graph.Edge(from_node=base_node.START, to_node=inner),
+          workflow_graph.Edge(from_node=base_node.START, to_node=node_sibling),
+      ],
+  )
+  app_instance = app.App(name=request.function.__name__, root_agent=outer)
+  runner = testing_utils.InMemoryRunner(app=app_instance)
+
+  events = await runner.run_async(testing_utils.get_user_content('start'))
+
+  a_events = [e for e in events if 'NodeA' in e.node_info.path]
+  assert any(e.branch == 'Inner@1.NodeA@1' for e in a_events)
+
+  # START contributes Inner's own branch, so the common prefix of
+  # ['Inner@1', 'Inner@1.NodeA@1', 'Inner@1.NodeB@1'] is still 'Inner@1'.
+  # Recording an empty branch for START would collapse it to the root.
+  join_events = [
+      e
+      for e in events
+      if 'NodeJoin' in e.node_info.path and e.output is not None
+  ]
+  assert len(join_events) == 1
+  assert join_events[0].branch == 'Inner@1'
 
 
 @pytest.mark.asyncio
@@ -275,3 +355,213 @@ async def test_join_node_computes_common_branch_prefix(
   assert len(capture_events) > 0
   for e in capture_events:
     assert e.branch is None
+
+
+@pytest.mark.asyncio
+async def test_join_node_in_loop_waits_for_each_iteration(
+    request: pytest.FixtureRequest,
+) -> None:
+  """Tests JoinNode in a loop waits for every predecessor's new run."""
+  join_inputs: list[dict[str, str]] = []
+
+  def node_a() -> str:
+    return 'A2' if join_inputs else 'A1'
+
+  def node_b() -> str:
+    return 'B2' if join_inputs else 'B1'
+
+  def node_check(node_input: dict[str, str]) -> Event | None:
+    join_inputs.append(node_input)
+    return Event(route='again') if len(join_inputs) == 1 else None
+
+  join = join_node.JoinNode(name='join')
+  agent = Workflow(
+      name='wf',
+      edges=[
+          (START, node_a, node_b),
+          ((node_a, node_b), join, node_check),
+          (node_check, {'again': node_a}),
+      ],
+  )
+  runner = testing_utils.InMemoryRunner(
+      app=app.App(name=request.function.__name__, root_agent=agent)
+  )
+
+  await runner.run_async('start')
+
+  assert join_inputs == [
+      {'node_a': 'A1', 'node_b': 'B1'},
+      {'node_a': 'A2', 'node_b': 'B2'},
+  ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('is_resumable', [False, True])
+async def test_join_node_in_loop_waits_for_predecessor_paused_for_input(
+    request: pytest.FixtureRequest, is_resumable: bool
+) -> None:
+  """Tests JoinNode in a loop waits for a predecessor that asks the user."""
+  join_inputs: list[dict[str, str]] = []
+
+  def node_a() -> str:
+    return 'A2' if join_inputs else 'A1'
+
+  def node_b() -> RequestInput | str:
+    return RequestInput(message='Continue?') if join_inputs else 'B1'
+
+  def node_check(node_input: dict[str, str]) -> Event | None:
+    join_inputs.append(node_input)
+    return Event(route='again') if len(join_inputs) == 1 else None
+
+  join = join_node.JoinNode(name='join')
+  agent = Workflow(
+      name='wf',
+      edges=[
+          (START, node_a, node_b),
+          ((node_a, node_b), join, node_check),
+          (node_check, {'again': node_a}),
+      ],
+  )
+  runner = testing_utils.InMemoryRunner(
+      app=app.App(
+          name=request.function.__name__,
+          root_agent=agent,
+          resumability_config=ResumabilityConfig(is_resumable=is_resumable),
+      )
+  )
+
+  events = await runner.run_async('start')
+
+  assert join_inputs == [{'node_a': 'A1', 'node_b': 'B1'}]
+
+  request_events = workflow_testing_utils.get_request_input_events(events)
+  [interrupt_id] = extract_event_interrupt_ids(request_events[0])
+  await runner.run_async(
+      new_message=hitl_utils.create_request_input_response(
+          interrupt_id, {'result': 'B2'}
+      ),
+      invocation_id=events[0].invocation_id,
+  )
+
+  assert join_inputs == [
+      {'node_a': 'A1', 'node_b': 'B1'},
+      {'node_a': 'A2', 'node_b': 'B2'},
+  ]
+
+
+@pytest.mark.asyncio
+async def test_join_node_in_loop_clears_prior_output_when_node_returns_none(
+    request: pytest.FixtureRequest,
+) -> None:
+  """Tests JoinNode receives None when a rerun predecessor returns None."""
+  join_inputs: list[dict[str, str | None]] = []
+
+  def node_a() -> str | None:
+    return None if join_inputs else 'A1'
+
+  def node_b() -> str:
+    return 'B2' if join_inputs else 'B1'
+
+  def node_check(node_input: dict[str, str | None]) -> Event | None:
+    join_inputs.append(node_input)
+    return Event(route='again') if len(join_inputs) == 1 else None
+
+  join = join_node.JoinNode(name='join')
+  agent = Workflow(
+      name='wf',
+      edges=[
+          (START, node_a, node_b),
+          ((node_a, node_b), join, node_check),
+          (node_check, {'again': node_a}),
+      ],
+  )
+  runner = testing_utils.InMemoryRunner(
+      app=app.App(name=request.function.__name__, root_agent=agent)
+  )
+
+  await runner.run_async('start')
+
+  assert join_inputs == [
+      {'node_a': 'A1', 'node_b': 'B1'},
+      {'node_a': None, 'node_b': 'B2'},
+  ]
+
+
+@pytest.mark.asyncio
+async def test_join_node_does_not_fire_when_predecessor_routes_away(
+    request: pytest.FixtureRequest,
+) -> None:
+  """Tests JoinNode does not fire when a predecessor routes away from it."""
+
+  def node_a() -> Event:
+    return Event(output='A1', route='away')
+
+  def node_b() -> str:
+    return 'B1'
+
+  join = join_node.JoinNode(name='join')
+  other_node = workflow_testing_utils.InputCapturingNode(name='other_node')
+  capture = workflow_testing_utils.InputCapturingNode(name='capture')
+  agent = Workflow(
+      name='wf',
+      edges=[
+          (START, (node_a, node_b)),
+          (node_a, {'to_join': join, 'away': other_node}),
+          (node_b, join),
+          (join, capture),
+      ],
+  )
+  runner = testing_utils.InMemoryRunner(
+      app=app.App(name=request.function.__name__, root_agent=agent)
+  )
+
+  await runner.run_async('start')
+
+  assert other_node.received_inputs == ['A1']
+  assert capture.received_inputs == []
+
+
+@pytest.mark.asyncio
+async def test_join_node_waits_for_retriggered_in_flight_predecessor(
+    request: pytest.FixtureRequest,
+) -> None:
+  """Tests JoinNode waits when an arrived predecessor has a run in flight."""
+  a_runs = 0
+  b_runs = 0
+
+  async def node_a() -> str:
+    nonlocal a_runs
+    a_runs += 1
+    if a_runs == 2:
+      for _ in range(5):
+        await asyncio.sleep(0)
+    return f'A{a_runs}'
+
+  def node_b() -> Event:
+    nonlocal b_runs
+    b_runs += 1
+    route = 'retry' if b_runs == 1 else 'to_join'
+    return Event(output=f'B{b_runs}', route=route)
+
+  def restart() -> None:
+    return None
+
+  join = join_node.JoinNode(name='join')
+  capture = workflow_testing_utils.InputCapturingNode(name='capture')
+  agent = Workflow(
+      name='wf',
+      edges=[
+          (START, (node_a, node_b)),
+          (node_a, join),
+          (node_b, {'to_join': join, 'retry': restart}),
+          (restart, (node_a, node_b)),
+          (join, capture),
+      ],
+  )
+  runner = testing_utils.InMemoryRunner(
+      app=app.App(name=request.function.__name__, root_agent=agent)
+  )
+
+  await runner.run_async('start')
+
+  assert capture.received_inputs == [{'node_a': 'A2', 'node_b': 'B2'}]

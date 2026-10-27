@@ -56,35 +56,51 @@ class InterceptionResult:
 
 def check_interception(
     *,
-    node_path: str,
     node: BaseNode,
     recovered: _ChildScanState | None = None,
     current_run: DynamicNodeRun | None = None,
-    curr_parent_ctx: Context,
 ) -> InterceptionResult:
   """Determine if a node execution should be intercepted based on history."""
   from .._workflow import Workflow  # pylint: disable=g-import-not-at-top
 
-  # Case 1: Same-turn completed or waiting interception (dynamic nodes only).
-  # If a node already successfully executed or is currently blocked in the
-  # current turn, bypass execution and return its current turn results.
-  if current_run:
+  # Case 1: Same-turn completed, failed, or waiting interception.
+  # A dynamic run that already completed in the current turn is replayed with
+  # its output, route and transfer target instead of running again. A dynamic
+  # run that failed in the current turn is run again, with any interrupt
+  # responses already resolved for it; the recovered events the cases below
+  # look at were scanned before that failure, so they must not decide. A
+  # dynamic run still blocked on interrupts keeps waiting; a static one falls
+  # through.
+  if current_run and not current_run.is_static:
     if current_run.state.status == NodeStatus.COMPLETED:
       return InterceptionResult(
           should_run=False,
           output=current_run.output,
+          route=current_run.route,
           transfer_to_agent=current_run.transfer_to_agent,
       )
-    if current_run.state.status == NodeStatus.WAITING:
-      if current_run.state.interrupts:
-        return InterceptionResult(
-            should_run=False,
-            interrupts=set(current_run.state.interrupts),
-        )
+    if current_run.state.status == NodeStatus.FAILED:
+      return InterceptionResult(
+          should_run=True,
+          resume_inputs=recovered.resolved_responses if recovered else None,
+      )
+    if (
+        current_run.state.status == NodeStatus.WAITING
+        and current_run.state.interrupts
+    ):
+      return InterceptionResult(
+          should_run=False,
+          interrupts=set(current_run.state.interrupts),
+      )
 
-  # Intercept executions based on historical session events (cross-turn replay).
   if not recovered:
     return InterceptionResult(should_run=True)
+
+  if isinstance(node, Workflow):
+    return InterceptionResult(
+        should_run=True,
+        resume_inputs=recovered.resolved_responses,
+    )
 
   unresolved = recovered.interrupt_ids - recovered.resolved_ids
 
@@ -104,47 +120,61 @@ def check_interception(
     else:
       interrupts = unresolved
 
+  elif recovered.error_code is not None:
+    # Case 3: Cross-turn failed in a prior turn.
+    # A failure left no result to fast-forward, so rerun the node instead of
+    # replaying it as one that completed with no output.
+    should_run = True
+    resume_inputs = recovered.resolved_responses
+
   elif (
       recovered.route is not None
       or recovered.output is not None
       or recovered.transfer_to_agent is not None
   ):
-    # Case 3: Cross-turn successfully completed in a prior turn (fast-forward).
+    # Case 4: Cross-turn successfully completed in a prior turn (fast-forward).
     # Bypass execution completely and return the cached output and route.
     output = _process_rehydrated_output(node, recovered.output)
     route = recovered.route
 
   elif recovered.interrupt_ids:
-    # Case 4: Cross-turn all prior interrupts are resolved, but no output yet.
+    # Case 5: Cross-turn all prior interrupts are resolved, but no output yet.
     # Extract responses directly if the node does not support rerun; otherwise
-    # rerun natively with resolved responses to produce output.
+    # rerun natively with resolved responses to produce output, unless the node
+    # already reran with them and finished without output.
     if not node.rerun_on_resume:
       child_resume_inputs = recovered.resolved_responses
       if len(child_resume_inputs) == 1:
         output = list(child_resume_inputs.values())[0]
       else:
         output = dict(child_resume_inputs)
+    elif recovered.finished_after_resume and not node.wait_for_output:
+      # The node already reran after its interrupts were resolved and finished
+      # with None output. Fast-forward it so its side effects do not run again.
+      should_run = False
     else:
       should_run = True
       resume_inputs = recovered.resolved_responses
 
   else:
-    # Case 5: Cross-turn no events, or events contain no output, route, or interrupts.
-    # Rerun Workflow nodes to guide nested children; otherwise fall through.
-    if (
-        isinstance(node, Workflow)
-        and node.wait_for_output
-        and recovered.output is None
-    ):
+    # Case 6: Cross-turn no events, or events contain no output, route, or interrupts.
+    if node.wait_for_output:
       should_run = True
       resume_inputs = recovered.resolved_responses
+    elif node.rerun_on_resume:
+      if recovered.finished_after_resume:
+        # The node already emitted a direct completion event in a prior turn and
+        # returned None. Fast-forward it so its side effects do not run again.
+        should_run = False
+      else:
+        # Rerun rerun_on_resume nodes that have not yet emitted a direct
+        # completion event so they can guide nested children or resume execution.
+        should_run = True
+        resume_inputs = recovered.resolved_responses
     else:
       # Allow fresh execution for crashed/timeout dynamic nodes;
       # static nodes with no outcome (e.g. return None) should be fast-forwarded.
-      if current_run is not None:
-        should_run = True
-      else:
-        should_run = False
+      should_run = current_run is not None and not current_run.is_static
 
   return InterceptionResult(
       should_run=should_run,
@@ -152,7 +182,7 @@ def check_interception(
       route=route,
       interrupts=interrupts,
       resume_inputs=resume_inputs,
-      transfer_to_agent=recovered.transfer_to_agent if recovered else None,
+      transfer_to_agent=recovered.transfer_to_agent,
   )
 
 
@@ -168,8 +198,8 @@ def create_mock_context(
 ) -> Context:
   """Build a Context with cached results (no execution)."""
   ic = parent_ctx._invocation_context  # pylint: disable=protected-access
-  if branch:
-    ic = ic.model_copy(update={"branch": branch})
+  if branch is not None:
+    ic = ic.model_copy(update={"branch": branch or None})
 
   mock_ctx = Context(
       ic,

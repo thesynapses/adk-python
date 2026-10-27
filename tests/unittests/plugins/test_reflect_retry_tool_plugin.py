@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 from typing import Any
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import Mock
@@ -57,8 +58,8 @@ class CustomErrorExtractionPlugin(ReflectAndRetryToolPlugin):
     return None
 
 
-# Inheriting from IsolatedAsyncioTestCase ensures consistent behavior.
-# See https://github.com/pytest-dev/pytest-asyncio/issues/1039
+# Inheriting from IsolatedAsyncioTestCase ensures consistent behavior, because
+# pytest-asyncio's own event-loop scoping varies across versions.
 class TestReflectAndRetryToolPlugin(IsolatedAsyncioTestCase):
   """Comprehensive tests for ReflectAndRetryToolPlugin focusing on behavior."""
 
@@ -666,3 +667,65 @@ class TestReflectAndRetryToolPlugin(IsolatedAsyncioTestCase):
     # Assert that the third event is a function call with the correct name
     assert events[2].content.parts[0].function_call.name == "increase"
     self.assertEqual(function_called, 1)
+
+  async def test_negative_max_retries_rejected(self):
+    """Test that a negative retry budget is rejected at construction."""
+    with self.assertRaises(ValueError) as cm:
+      ReflectAndRetryToolPlugin(max_retries=-1)
+
+    self.assertIn("non-negative", str(cm.exception))
+
+  async def test_reflection_response_does_not_reset_the_retry_count(self):
+    """Test that feeding a reflection response back does not clear failures.
+
+    The plugin's own reflection guidance is delivered to the model as the
+    tool result, so it comes back through after_tool_callback. Treating it
+    as a success would reset the counter and make the retry budget
+    unenforceable.
+    """
+    mock_tool = self.get_mock_tool()
+    mock_tool_context = self.get_mock_tool_context()
+    sample_tool_args = self.get_sample_tool_args()
+    plugin = ReflectAndRetryToolPlugin(max_retries=3)
+    error = ValueError("Test error")
+
+    reflection = await plugin.on_tool_error_callback(
+        tool=mock_tool,
+        tool_args=sample_tool_args,
+        tool_context=mock_tool_context,
+        error=error,
+    )
+    self.assertEqual(reflection["retry_count"], 1)
+
+    passthrough = await plugin.after_tool_callback(
+        tool=mock_tool,
+        tool_args=sample_tool_args,
+        tool_context=mock_tool_context,
+        result=reflection,
+    )
+    self.assertIsNone(passthrough)
+
+    next_failure = await plugin.on_tool_error_callback(
+        tool=mock_tool,
+        tool_args=sample_tool_args,
+        tool_context=mock_tool_context,
+        error=error,
+    )
+    self.assertEqual(next_failure["retry_count"], 2)
+
+  async def test_cancelled_error_ignored(self):
+    """Test that cancelled tool calls do not increment retry count or raise."""
+    mock_tool = self.get_mock_tool()
+    mock_tool_context = self.get_mock_tool_context()
+    sample_tool_args = self.get_sample_tool_args()
+    plugin = ReflectAndRetryToolPlugin(
+        max_retries=0, throw_exception_if_retry_exceeded=True
+    )
+
+    result = await plugin.on_tool_error_callback(
+        tool=mock_tool,
+        tool_args=sample_tool_args,
+        tool_context=mock_tool_context,
+        error=asyncio.CancelledError(),
+    )
+    self.assertIsNone(result)

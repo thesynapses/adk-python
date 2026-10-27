@@ -18,47 +18,44 @@ from typing import TYPE_CHECKING
 
 from google.adk.telemetry import tracing
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 import pytest
 
+from .functional._aclosing import aclosing_wrapping_assertions
+from .functional._recording import check_case
+from .functional.scenarios.agent import run_node_scenario
+from .functional.scenarios.conversation import TOOL_ERROR
+from .functional.scenarios.inference import mock_test_model
+from .functional.scenarios.telemetry_setup import ADK_TELEMETRY_SCHEMA_VERSION_OPT_IN
+from .functional.scenarios.telemetry_setup import EXPERIMENTAL_OPT_IN
+from .functional.scenarios.telemetry_setup import install_telemetry
+from .functional.scenarios.telemetry_setup import OTEL_OPT_IN
 from .functional_node_test_cases import ALL_NODE_CASES
-from .functional_test_helpers import aclosing_wrapping_assertions
-from .functional_test_helpers import install_telemetry
-from .functional_test_helpers import run_node_scenario
-from .functional_test_helpers import SpanDigest
 
 if TYPE_CHECKING:
   from google.adk.events.event import Event
   from opentelemetry.sdk.trace import ReadableSpan
 
-  from .functional_test_helpers import FunctionalTestCase
+  from .functional._recording import FunctionalTestCase
 
 
-@pytest.mark.parametrize('case', ALL_NODE_CASES, ids=lambda c: c.test_id)
+@pytest.mark.parametrize("case", ALL_NODE_CASES, ids=lambda c: c.test_id)
 @pytest.mark.asyncio
-async def test_telemetry_schema(
-    case: FunctionalTestCase,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_telemetry_schema(case: FunctionalTestCase) -> None:
   """Tests creation of multiple spans/logs in an E2E runner invocation with a
 
   workflow.
 
   Asserts the entire telemetry schema (spans + attributes + per-span logs)
-  matches the hand-written expected shape for the given semconv +
-  content-capture configuration.
+  ADK's own instrumentation records matches the golden, under the case's
+  semconv + content-capture configuration, and that the OTel instrumentor
+  diverges from it only where it already did.
   """
-  case.apply_env(monkeypatch)
-  span_exporter = InMemorySpanExporter()
-  log_exporter = InMemoryLogRecordExporter()
-  install_telemetry(monkeypatch, span_exporter, log_exporter)
+  recording = await check_case(case)
 
-  events = await run_node_scenario()
-  spans = span_exporter.get_finished_spans()
-  digest = SpanDigest.build(spans, log_exporter.get_finished_logs())
-
-  assert digest == case.expected_root
-  _verify_associated_events(spans, events)
+  _verify_associated_events(recording.spans, recording.events)
 
 
 @pytest.mark.asyncio
@@ -75,39 +72,42 @@ async def test_async_generators_wrapped_in_aclosing(
   ``gc.get_referrers`` walk is expensive (~5 seconds per scenario).
   """
   install_telemetry(
-      monkeypatch, InMemorySpanExporter(), InMemoryLogRecordExporter()
+      monkeypatch,
+      InMemorySpanExporter(),
+      InMemoryLogRecordExporter(),
+      InMemoryMetricReader(),
   )
 
   with aclosing_wrapping_assertions():
-    _ = await run_node_scenario()
+    _ = await run_node_scenario(mock_test_model())
 
 
 def _verify_associated_events(
     spans: tuple[ReadableSpan, ...], events: list[Event]
 ):
   def _nodelike_name(span: ReadableSpan) -> str:
-    for prefix in ['invoke_node ', 'invoke_workflow ', 'invoke_agent ']:
+    for prefix in ["invoke_node ", "invoke_workflow ", "invoke_agent "]:
       if span.name.startswith(prefix):
-        return span.name.replace(prefix, '')
-    return ''
+        return span.name.replace(prefix, "")
+    return ""
 
   def _emitting_node_name(event: Event) -> str:
     # Strip out
     # 1. Path except for the last node (everything before "/")
     # 2. Retry count (everything after "@")
-    return event.node_info.path.split('/')[-1].split('@')[0]
+    return event.node_info.path.split("/")[-1].split("@")[0]
 
   events_by_id = {event.id: event for event in events}
   for span in spans:
     if not span.attributes:
       continue
     associated_ids = span.attributes.get(
-        'gcp.vertex.agent.associated_event_ids', None
+        "gcp.vertex.agent.associated_event_ids", None
     )
     if associated_ids is None:
       continue
     assert isinstance(associated_ids, tuple)
-    assert len(associated_ids) > 0, f'Span name {span.name} emitted no events'
+    assert len(associated_ids) > 0, f"Span name {span.name} emitted no events"
     for event_id in associated_ids:
       event = events_by_id[str(event_id)]
       assert _nodelike_name(span) == _emitting_node_name(event)
@@ -120,61 +120,133 @@ async def test_exception_preserves_attributes(
   """Test when an exception occurs during tool execution, span attributes are still present on spans where they are expected."""
 
   span_exporter = InMemorySpanExporter()
-  install_telemetry(monkeypatch, span_exporter, InMemoryLogRecordExporter())
+  install_telemetry(
+      monkeypatch,
+      span_exporter,
+      InMemoryLogRecordExporter(),
+      InMemoryMetricReader(),
+  )
 
   captured_events: list[Event] = []
-  with pytest.raises(ValueError, match='This tool always fails'):
-    await run_node_scenario(failing=True, event_sink=captured_events)
+  with pytest.raises(ValueError, match="This tool always fails"):
+    await run_node_scenario(
+        mock_test_model(),
+        tool_exception=TOOL_ERROR,
+        event_sink=captured_events,
+    )
 
   # Assert
   spans = span_exporter.get_finished_spans()
   _verify_associated_events(spans, captured_events)
   spans_by_name = {span.name: span for span in spans}
 
-  assert 'execute_tool some_tool' in spans_by_name
-  tool_span = spans_by_name['execute_tool some_tool']
+  assert "execute_tool some_tool" in spans_by_name
+  tool_span = spans_by_name["execute_tool some_tool"]
 
   attrs = dict(tool_span.attributes)
   # Dynamic ID
-  tool_call_id = attrs.get('gen_ai.tool.call.id')
+  tool_call_id = attrs.get("gen_ai.tool.call.id")
 
   assert dict(tool_span.attributes) == {
-      'gen_ai.operation.name': 'execute_tool',
-      'gen_ai.tool.name': 'some_tool',
-      'gen_ai.tool.description': 'A sample tool.',
-      'gen_ai.tool.type': 'FunctionTool',
-      'error.type': 'ValueError',
-      'gcp.vertex.agent.llm_request': '{}',
-      'gcp.vertex.agent.llm_response': '{}',
-      'gcp.vertex.agent.tool_call_args': '{"arg1": "val1"}',
-      'gen_ai.tool.call.id': tool_call_id,
-      'gcp.vertex.agent.tool_response': '{"result": "<not specified>"}',
+      "gen_ai.operation.name": "execute_tool",
+      "gen_ai.agent.name": "some_root_agent",
+      "gen_ai.tool.name": "some_tool",
+      "gen_ai.tool.description": "A sample tool.",
+      "gen_ai.tool.type": "FunctionTool",
+      "error.type": "ValueError",
+      "gen_ai.tool.call.id": tool_call_id,
   }
 
 
 @pytest.mark.asyncio
-async def test_no_generate_content_for_gemini_model_when_already_instrumented(
+async def test_failed_turn_is_not_reported_as_a_successful_workflow(
     monkeypatch: pytest.MonkeyPatch,
 ):
-  """Tests that generate_content span is not created if already instrumented."""
+  """A workflow whose node failed must not close its span clean.
+
+  A workflow catches a failing node's exception so the graph can act on it,
+  which leaves nothing unwinding by the time the span closes. The root span
+  and its duration metric read that as success, so an error rate measured on
+  them stayed at zero however many turns failed.
+  """
+  span_exporter = InMemorySpanExporter()
+  metric_reader = InMemoryMetricReader()
+  install_telemetry(
+      monkeypatch,
+      span_exporter,
+      InMemoryLogRecordExporter(),
+      metric_reader,
+  )
+
+  with pytest.raises(ValueError, match="This tool always fails"):
+    await run_node_scenario(mock_test_model(), tool_exception=TOOL_ERROR)
+
+  # The outermost workflow is the one not marked as nested inside another.
+  outermost = [
+      span
+      for span in span_exporter.get_finished_spans()
+      if span.name.startswith("invoke_workflow")
+      and dict(span.attributes or {}).get("gen_ai.workflow.nested") is None
+  ]
+  assert len(outermost) == 1
+  assert outermost[0].status.status_code is StatusCode.ERROR
+
+  error_types = [
+      dict(point.attributes).get("error.type")
+      for resource in metric_reader.get_metrics_data().resource_metrics
+      for scope in resource.scope_metrics
+      for metric in scope.metrics
+      if metric.name == "gen_ai.invoke_workflow.duration"
+      for point in metric.data.data_points
+      if dict(point.attributes).get("gen_ai.workflow.nested") is None
+  ]
+  assert error_types == ["ValueError"]
+
+
+@pytest.mark.parametrize(
+    "semconv_opt_in,adk_records",
+    [
+        (EXPERIMENTAL_OPT_IN, False),
+        (None, True),
+    ],
+    ids=["experimental_defers_to_instrumentor", "stable_is_recorded_by_adk"],
+)
+@pytest.mark.asyncio
+async def test_who_records_the_inference_when_already_instrumented(
+    monkeypatch: pytest.MonkeyPatch,
+    semconv_opt_in: str | None,
+    adk_records: bool,
+):
+  """Which of ADK and the instrumentor records the inference, under a node."""
 
   span_exporter = InMemorySpanExporter()
-  install_telemetry(monkeypatch, span_exporter, InMemoryLogRecordExporter())
+  install_telemetry(
+      monkeypatch,
+      span_exporter,
+      InMemoryLogRecordExporter(),
+      InMemoryMetricReader(),
+  )
 
   # Arrange
+  if semconv_opt_in is None:
+    monkeypatch.delenv(OTEL_OPT_IN, raising=False)
+    monkeypatch.setenv(ADK_TELEMETRY_SCHEMA_VERSION_OPT_IN, "1")
+  else:
+    monkeypatch.setenv(OTEL_OPT_IN, semconv_opt_in)
   monkeypatch.setattr(
-      tracing,
-      '_instrumented_with_opentelemetry_instrumentation_google_genai',
-      lambda: True,
+      "google.adk.telemetry._genai_instrumentor.is_instrumented", lambda: True
   )
   monkeypatch.setattr(
       tracing,
-      '_is_gemini_agent',
+      "_is_gemini_agent",
       lambda _: True,
   )
 
-  _ = await run_node_scenario()
+  _ = await run_node_scenario(mock_test_model())
 
-  # Assert
+  # `MockModel` never reaches the wrapped SDK, so these spans are ADK's.
   spans = span_exporter.get_finished_spans()
-  assert not any(span.name.startswith('generate_content') for span in spans)
+  recorded_natively = any(
+      span.name.startswith("generate_content") for span in spans
+  )
+  assert recorded_natively == adk_records

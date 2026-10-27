@@ -14,13 +14,19 @@
 
 
 import json
+import os
+import socket
 import ssl
 from unittest import mock
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
+from fastapi.openapi.models import APIKey
 from fastapi.openapi.models import MediaType
+from fastapi.openapi.models import OAuth2
+from fastapi.openapi.models import OAuthFlowAuthorizationCode
+from fastapi.openapi.models import OAuthFlows
 from fastapi.openapi.models import Operation
 from fastapi.openapi.models import Parameter as OpenAPIParameter
 from fastapi.openapi.models import RequestBody
@@ -29,21 +35,42 @@ from google.adk.auth.auth_credential import AuthCredential
 from google.adk.auth.auth_credential import AuthCredentialTypes
 from google.adk.auth.auth_credential import HttpAuth
 from google.adk.auth.auth_credential import HttpCredentials
+from google.adk.auth.auth_credential import OAuth2Auth
+from google.adk.errors.input_validation_error import InputValidationError
 from google.adk.features import FeatureName
 from google.adk.features._feature_registry import temporary_feature_override
 from google.adk.sessions.state import State
+from google.adk.tools import application_integration_tool
+from google.adk.tools.apihub_tool.apihub_toolset import APIHubToolset
+from google.adk.tools.apihub_tool.clients.apihub_client import BaseAPIHubClient
+from google.adk.tools.openapi_tool import OpenAPIToolset
 from google.adk.tools.openapi_tool.auth.auth_helpers import token_to_scheme_credential
 from google.adk.tools.openapi_tool.common.common import ApiParameter
 from google.adk.tools.openapi_tool.openapi_spec_parser.openapi_spec_parser import OperationEndpoint
+from google.adk.tools.openapi_tool.openapi_spec_parser.openapi_spec_parser import ParsedOperation
 from google.adk.tools.openapi_tool.openapi_spec_parser.operation_parser import OperationParser
+from google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool import _encode_path_param
 from google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool import RestApiTool
 from google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool import snake_to_lower_camel
+from google.adk.tools.openapi_tool.openapi_spec_parser.tool_auth_handler import AuthPreparationResult
+from google.adk.tools.openapi_tool.openapi_spec_parser.tool_auth_handler import ToolAuthHandler
+from google.adk.tools.openapi_tool.openapi_spec_parser.tool_auth_handler import ToolContextCredentialStore
 from google.adk.tools.tool_context import ToolContext
+from google.adk.utils import _mtls_utils
 from google.genai.types import FunctionDeclaration
 from google.genai.types import Schema
 import httpx
 import pytest
 import requests
+
+
+@pytest.fixture(autouse=True)
+def mock_client_cert_ssl_context():
+  """Keeps the default client independent of the host's mTLS configuration."""
+  with patch.object(
+      _mtls_utils, "_client_cert_ssl_context", autospec=True, return_value=None
+  ) as mock_ctx:
+    yield mock_ctx
 
 
 @pytest.fixture
@@ -54,6 +81,29 @@ def mock_tool_context():
   mock_context.get_auth_response.return_value = {}
   mock_context.request_credential.return_value = {}
   return mock_context
+
+
+@pytest.fixture(autouse=True)
+def patch_dns(monkeypatch):
+  """Map example.com and other test hosts to safe public IPs."""
+  for env_var in list(os.environ):
+    if env_var.lower().endswith("_proxy"):
+      monkeypatch.delenv(env_var, raising=False)
+
+  original_getaddrinfo = socket.getaddrinfo
+
+  def fake_getaddrinfo(host, port, *args, **kwargs):
+    if host in (
+        "example.com",
+        "api.example.com",
+        "multi.example.com",
+        "two.example.com",
+        "localhost",
+    ):
+      return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 0))]
+    return original_getaddrinfo(host, port, *args, **kwargs)
+
+  monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
 
 
 @pytest.fixture
@@ -150,6 +200,53 @@ def sample_auth_credential():
       "apikey", "header", "", "sample_auth_credential_internal_test"
   )
   return credential
+
+
+@pytest.fixture
+def oauth2_scheme():
+  return OAuth2(
+      flows=OAuthFlows(
+          authorizationCode=OAuthFlowAuthorizationCode(
+              authorizationUrl="https://example.com/auth",
+              tokenUrl="https://example.com/token",
+              scopes={},
+          )
+      )
+  )
+
+
+@pytest.fixture
+def oauth2_credential():
+  return AuthCredential(
+      auth_type=AuthCredentialTypes.OAUTH2,
+      oauth2=OAuth2Auth(
+          client_id="test-client-id",
+          client_secret="test-client-secret",
+      ),
+  )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [".", "..", "../../admin/v1/tenants", "foo/../bar", r"..\admin", "./x"],
+)
+def test_encode_path_param_rejects_dot_segments(value):
+  with pytest.raises(InputValidationError, match="parent-directory"):
+    _encode_path_param(name="name", value=value)
+
+
+@pytest.mark.parametrize(
+    "value,encoded",
+    [
+        ("foo/bar", "foo%2Fbar"),
+        ("file..txt", "file..txt"),
+        (".gitignore", ".gitignore"),
+        ("ok.txt", "ok.txt"),
+        ("me?x#", "me%3Fx%23"),
+    ],
+)
+def test_encode_path_param_encodes_safe_values(value, encoded):
+  assert _encode_path_param(name="name", value=value) == encoded
 
 
 class TestRestApiToolLegacy:
@@ -311,6 +408,42 @@ class TestRestApiTool:
       "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
   )
   @pytest.mark.asyncio
+  async def test_call_does_not_add_auth_params_to_caller_args(
+      self,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+  ):
+    """The caller's args also feed after-tool callbacks and the tool span."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"result": "success"}
+    mock_request.return_value = mock_response
+    auth_scheme, auth_credential = token_to_scheme_credential(
+        "apikey", "header", "X-API-Key", "secret-api-key"
+    )
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=auth_scheme,
+        auth_credential=auth_credential,
+    )
+    args = {"testBodyParam": "value"}
+
+    await tool.call(args=args, tool_context=mock_tool_context)
+
+    assert args == {"testBodyParam": "value"}
+    assert (
+        mock_request.call_args.kwargs["headers"]["X-API-Key"]
+        == "secret-api-key"
+    )
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @pytest.mark.asyncio
   async def test_call_http_failure(
       self,
       mock_request,
@@ -322,7 +455,7 @@ class TestRestApiTool:
   ):
     mock_response = MagicMock()
     mock_response.status_code = 500
-    mock_response.content = b"Internal Server Error"
+    mock_response.text = "Internal Server Error"
 
     # Create a proper HTTPStatusError with request and response
     mock_http_request = MagicMock(spec=httpx.Request)
@@ -361,6 +494,37 @@ class TestRestApiTool:
       "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
   )
   @pytest.mark.asyncio
+  async def test_call_http_failure_decodes_body_with_declared_charset(
+      self,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+  ):
+    """A non-UTF-8 error body must reach the model, not abort the run."""
+    mock_request.return_value = httpx.Response(
+        status_code=404,
+        request=httpx.Request("GET", "https://example.com/test"),
+        content="Commande introuvable : échec".encode("latin-1"),
+        headers={"content-type": "text/plain; charset=iso-8859-1"},
+    )
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+
+    assert result["error"].endswith(
+        "Status Code: 404, Commande introuvable : échec"
+    )
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @pytest.mark.asyncio
   async def test_call_auth_pending(
       self,
       mock_request,
@@ -394,6 +558,926 @@ class TestRestApiTool:
           "pending": True,
           "message": "Needs your authorization to access your data.",
       }
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_reactive_refresh_retries_successfully(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """A 401 the handler can refresh away is retried once and succeeds.
+
+    This is the silent recovery: the caller sees only the successful result,
+    with no sign that the first attempt was rejected.
+    """
+    # First response: 401 Unauthorized
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Unauthorized"
+    mock_401_response.headers = httpx.Headers(
+        {"www-authenticate": 'Bearer error="invalid_token"'}
+    )
+    mock_http_request = MagicMock(spec=httpx.Request)
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=mock_http_request,
+            response=mock_401_response,
+        )
+    )
+
+    # Second response: 200 OK after token refresh
+    mock_200_response = MagicMock()
+    mock_200_response.status_code = 200
+    mock_200_response.json.return_value = {"data": "refreshed_success"}
+    mock_200_response.raise_for_status = MagicMock()
+
+    mock_request.side_effect = [mock_401_response, mock_200_response]
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_handler.handle_unauthorized_error.return_value = "refreshed"
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert result == {"data": "refreshed_success"}
+    assert mock_request.call_count == 2
+    mock_handler.claim_recovery.return_value.__exit__.assert_called_once()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_unrefreshable_triggers_reauth_pending(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """A 401 with no way to refresh asks the user to re-authorize.
+
+    The call is not retried: there is nothing new to send until the user
+    answers, so the tool reports pending rather than an error.
+    """
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Unauthorized"
+    mock_401_response.headers = httpx.Headers(
+        {"www-authenticate": 'Bearer error="invalid_token"'}
+    )
+    mock_http_request = MagicMock(spec=httpx.Request)
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=mock_http_request,
+            response=mock_401_response,
+        )
+    )
+    mock_request.return_value = mock_401_response
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_handler.handle_unauthorized_error.return_value = "reauth_requested"
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert result == {
+        "pending": True,
+        "message": "Needs your authorization to access your data.",
+    }
+    mock_handler.handle_unauthorized_error.assert_awaited_once()
+    mock_handler.claim_recovery.return_value.__exit__.assert_called_once()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_unrecoverable_returns_error(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """A 401 the handler cannot act on is reported as the plain API error.
+
+    This is the path for schemes where re-authorizing means nothing, such as a
+    static API key, and it has to look exactly as it did before 401 handling
+    existed.
+    """
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Unauthorized"
+    mock_401_response.headers = httpx.Headers(
+        {"www-authenticate": 'Bearer error="invalid_token"'}
+    )
+    mock_http_request = MagicMock(spec=httpx.Request)
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=mock_http_request,
+            response=mock_401_response,
+        )
+    )
+    mock_request.return_value = mock_401_response
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    # The handler could neither refresh nor request re-authorization.
+    mock_handler.handle_unauthorized_error.return_value = "failed"
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "error" in result
+    assert "Status Code: 401" in result["error"]
+    assert mock_request.call_count == 1
+    mock_handler.handle_unauthorized_error.assert_awaited_once()
+    mock_handler.claim_recovery.return_value.__exit__.assert_called_once()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_retry_failure_prevents_infinite_recursion(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """An endpoint that 401s after a successful refresh stops at one retry.
+
+    The retry re-enters call(), which builds its own handler, so only the lock
+    held across the retry keeps a refresh that never satisfies the server from
+    recursing until the stack runs out.
+    """
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Unauthorized"
+    mock_401_response.headers = httpx.Headers(
+        {"www-authenticate": 'Bearer error="invalid_token"'}
+    )
+    mock_http_request = MagicMock(spec=httpx.Request)
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=mock_http_request,
+            response=mock_401_response,
+        )
+    )
+    # Both initial call and retry call return 401
+    mock_request.side_effect = [mock_401_response, mock_401_response]
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_handler.handle_unauthorized_error.return_value = "refreshed"
+    # The real claim is credential-keyed and held across the retry, so the
+    # handler the retried call builds finds it taken. Without this the mock
+    # would hand out the claim again and the retry would recover forever.
+    mock_handler.claim_recovery.return_value.__enter__.side_effect = [
+        True,
+        False,
+    ]
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    # Recursion is halted on retry; error is returned
+    assert "error" in result
+    assert "Status Code: 401" in result["error"]
+    assert mock_request.call_count == 2
+    mock_handler.handle_unauthorized_error.assert_awaited_once()
+    # The retried call asked for the claim and was refused, which is what
+    # stops it recovering again and recursing.
+    assert mock_handler.claim_recovery.call_count == 2
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_reauth_limit_returns_non_retryable_error(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """A credential out of re-authorization budget gets a non-retryable error.
+
+    The message has to differ from the ordinary API error, which invites the
+    model to retry: re-authorizing has already been tried and did not help, so
+    the useful next step is to tell the user.
+    """
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Unauthorized"
+    mock_401_response.headers = httpx.Headers(
+        {"www-authenticate": 'Bearer error="invalid_token"'}
+    )
+    mock_http_request = MagicMock(spec=httpx.Request)
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=mock_http_request,
+            response=mock_401_response,
+        )
+    )
+    mock_request.return_value = mock_401_response
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_handler.handle_unauthorized_error.return_value = "reauth_limit_reached"
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "error" in result
+    assert not result.get("pending", False)
+    assert "retrying will not help" in result["error"]
+    assert "Status Code: 401" in result["error"]
+    # No retry: the call is not repeated after the budget is spent.
+    assert mock_request.call_count == 1
+    mock_handler.claim_recovery.return_value.__exit__.assert_called_once()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_success_refills_the_reauth_budget(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """A call the API accepts is what tells the handler recovery worked."""
+    mock_200_response = MagicMock()
+    mock_200_response.status_code = 200
+    mock_200_response.json.return_value = {"data": "ok"}
+    mock_200_response.raise_for_status = MagicMock()
+    mock_request.return_value = mock_200_response
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert result == {"data": "ok"}
+    mock_handler.note_successful_call.assert_called_once()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_400_refills_the_reauth_budget(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """An API error that is not a token rejection still counts as acceptance.
+
+    A 400 means the request got past authorization and was then judged on its
+    merits, so one bad argument from the model must not leave the credential
+    with its recovery budgets spent.
+    """
+    mock_400_response = MagicMock()
+    mock_400_response.status_code = 400
+    mock_400_response.text = "Bad Request"
+    mock_400_response.headers = httpx.Headers({})
+    mock_400_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "400 Bad Request",
+            request=MagicMock(spec=httpx.Request),
+            response=mock_400_response,
+        )
+    )
+    mock_request.return_value = mock_400_response
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "Status Code: 400" in result["error"]
+    mock_handler.note_successful_call.assert_called_once()
+
+  @pytest.mark.parametrize(
+      "www_authenticate",
+      [
+          'Bearer error="invalid_token"',
+          'Bearer error="insufficient_scope"',
+          'Basic realm="x"',
+      ],
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_does_not_refill_the_reauth_budget(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      www_authenticate,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """No 401 counts as acceptance, whatever challenge it carries.
+
+    A 401 says the request was not authenticated, so none of them are evidence
+    that the credential works. Refilling on one would undo the limit that stops
+    a hopeless endpoint from asking the user to re-authorize on every turn,
+    and a challenge naming neither the token nor Bearer is still a rejection.
+    """
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Unauthorized"
+    mock_401_response.headers = httpx.Headers(
+        {"www-authenticate": www_authenticate}
+    )
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=MagicMock(spec=httpx.Request),
+            response=mock_401_response,
+        )
+    )
+    mock_request.return_value = mock_401_response
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_handler.claim_recovery.return_value.__enter__.return_value = True
+    mock_handler.handle_unauthorized_error.return_value = "failed"
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "Status Code: 401" in result["error"]
+    mock_handler.note_successful_call.assert_not_called()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_does_not_recover_when_lock_is_held(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """Recovery already in progress for this credential must not be re-entered.
+
+    The lock is held by whichever call is recovering, including across its
+    retry, so a concurrent call or the retry itself reports the API error
+    rather than recovering a second time.
+    """
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Unauthorized"
+    mock_401_response.headers = httpx.Headers(
+        {"www-authenticate": 'Bearer error="invalid_token"'}
+    )
+    mock_http_request = MagicMock(spec=httpx.Request)
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=mock_http_request,
+            response=mock_401_response,
+        )
+    )
+    mock_request.return_value = mock_401_response
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    # Someone else is already recovering this credential.
+    mock_handler.claim_recovery.return_value.__enter__.return_value = False
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "error" in result
+    assert "Status Code: 401" in result["error"]
+    assert not result.get("pending", False)
+    mock_handler.handle_unauthorized_error.assert_not_called()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_insufficient_scope_is_not_recovered(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """A 401 whose challenge blames the scope must not touch the credential."""
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Insufficient scope"
+    mock_401_response.headers = httpx.Headers(
+        {"www-authenticate": 'Bearer error="insufficient_scope"'}
+    )
+    mock_http_request = MagicMock(spec=httpx.Request)
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=mock_http_request,
+            response=mock_401_response,
+        )
+    )
+    mock_request.return_value = mock_401_response
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_handler.handle_unauthorized_error.return_value = "reauth_requested"
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    # The token is fine, so the API error is reported as-is: no eviction, no
+    # retry, and no re-authorization request for scopes that just failed.
+    assert "error" in result
+    assert "Status Code: 401" in result["error"]
+    assert not result.get("pending", False)
+    assert mock_request.call_count == 1
+    mock_handler.handle_unauthorized_error.assert_not_called()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_without_challenge_is_recovered(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """A 401 with no challenge at all gets the benefit of the doubt."""
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Unauthorized"
+    mock_401_response.headers = httpx.Headers({})
+    mock_http_request = MagicMock(spec=httpx.Request)
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=mock_http_request,
+            response=mock_401_response,
+        )
+    )
+    mock_200_response = MagicMock()
+    mock_200_response.status_code = 200
+    mock_200_response.json.return_value = {"data": "refreshed_success"}
+    mock_200_response.raise_for_status = MagicMock()
+    mock_request.side_effect = [mock_401_response, mock_200_response]
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_handler.handle_unauthorized_error.return_value = "refreshed"
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert result == {"data": "refreshed_success"}
+    mock_handler.handle_unauthorized_error.assert_awaited_once()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_challenge_match_is_case_insensitive(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """Challenge parameters are matched without regard to case."""
+    mock_401_response = MagicMock()
+    mock_401_response.status_code = 401
+    mock_401_response.text = "Unauthorized"
+    mock_401_response.headers = httpx.Headers(
+        {"WWW-Authenticate": 'Bearer Error="Invalid_Token"'}
+    )
+    mock_http_request = MagicMock(spec=httpx.Request)
+    mock_401_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=mock_http_request,
+            response=mock_401_response,
+        )
+    )
+    mock_200_response = MagicMock()
+    mock_200_response.status_code = 200
+    mock_200_response.json.return_value = {"data": "refreshed_success"}
+    mock_200_response.raise_for_status = MagicMock()
+    mock_request.side_effect = [mock_401_response, mock_200_response]
+
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_prepare_result = MagicMock()
+    mock_prepare_result.state = "done"
+    mock_prepare_result.auth_scheme = sample_auth_scheme
+    mock_prepare_result.auth_credential = sample_auth_credential
+    mock_handler.prepare_auth_credentials.return_value = mock_prepare_result
+    mock_handler.handle_unauthorized_error.return_value = "refreshed"
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert result == {"data": "refreshed_success"}
+    mock_handler.handle_unauthorized_error.assert_awaited_once()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @pytest.mark.asyncio
+  async def test_call_403_does_not_start_recovery(
+      self,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      oauth2_scheme,
+      oauth2_credential,
+  ):
+    """Only a 401 starts recovery; a 403 leaves the stored credential alone."""
+    store = ToolContextCredentialStore(mock_tool_context)
+    key = store.get_credential_key(oauth2_scheme, oauth2_credential)
+    store.store_credential(
+        key,
+        AuthCredential(
+            auth_type=AuthCredentialTypes.OAUTH2,
+            oauth2=OAuth2Auth(
+                client_id="test-client-id",
+                client_secret="test-client-secret",
+                access_token="existing-token",
+            ),
+        ),
+    )
+    mock_request.return_value = httpx.Response(
+        status_code=403,
+        request=httpx.Request("GET", "https://example.com/test"),
+        content=b'{"error": "Forbidden"}',
+    )
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=oauth2_scheme,
+        auth_credential=oauth2_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "403" in result["error"]
+    assert "pending" not in result
+    assert mock_tool_context.state[key] is not None
+    mock_tool_context.request_credential.assert_not_called()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_on_an_unauthenticated_tool_returns_error(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+  ):
+    """A tool with no credential has nothing to recover, so the 401 is reported."""
+    mock_request.return_value = httpx.Response(
+        status_code=401,
+        request=httpx.Request("GET", "https://example.com/test"),
+        content=b'{"error": "Unauthorized"}',
+    )
+    # The handler is faked to tell "recovery was skipped" apart from "recovery
+    # ran and gave up", which the real handler renders as the same error dict.
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_handler.prepare_auth_credentials.return_value = AuthPreparationResult(
+        state="done"
+    )
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=None,
+        auth_credential=None,
+    )
+
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "401" in result["error"]
+    assert "pending" not in result
+    mock_handler.handle_unauthorized_error.assert_not_called()
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  )
+  @pytest.mark.asyncio
+  async def test_call_401_without_a_tool_context_returns_error(
+      self,
+      mock_from_tool_context,
+      mock_request,
+      sample_endpoint,
+      sample_operation,
+      oauth2_scheme,
+      oauth2_credential,
+  ):
+    """Recovery has no session state to evict from or to ask through."""
+    mock_request.return_value = httpx.Response(
+        status_code=401,
+        request=httpx.Request("GET", "https://example.com/test"),
+        content=b'{"error": "Unauthorized"}',
+    )
+    # The handler is faked because the real one reaches for the tool context
+    # while preparing credentials, well before the 401 path under test.
+    mock_handler = mock.create_autospec(
+        ToolAuthHandler, spec_set=True, instance=True
+    )
+    mock_handler.prepare_auth_credentials.return_value = AuthPreparationResult(
+        state="done",
+        auth_scheme=oauth2_scheme,
+        auth_credential=oauth2_credential,
+    )
+    mock_from_tool_context.return_value = mock_handler
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=oauth2_scheme,
+        auth_credential=oauth2_credential,
+    )
+
+    result = await tool.call(args={}, tool_context=None)
+    assert "401" in result["error"]
+    assert "pending" not in result
+    mock_handler.handle_unauthorized_error.assert_not_called()
 
   @patch(
       "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
@@ -446,6 +1530,93 @@ class TestRestApiTool:
     call_kwargs = mock_request.call_args[1]
     assert call_kwargs["url"] == "https://example.com/users/me/messages"
     assert result == {"result": "success"}
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @pytest.mark.asyncio
+  async def test_call_missing_required_path_param_returns_error(
+      self,
+      mock_request,
+      mock_tool_context,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """A required path param with no default and no value must not crash."""
+    mock_operation = Operation(
+        operationId="test_op",
+        parameters=[
+            OpenAPIParameter(**{
+                "name": "userId",
+                "in": "path",
+                "required": True,
+                "schema": OpenAPISchema(type="string"),
+            })
+        ],
+    )
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=OperationEndpoint(
+            base_url="https://example.com",
+            path="/users/{userId}/messages",
+            method="GET",
+        ),
+        operation=mock_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    # Call without providing userId and without a default to fall back on.
+    result = await tool.call(args={}, tool_context=mock_tool_context)
+
+    assert not mock_request.called
+    assert "error" in result
+    assert "user_id" in result["error"]
+    assert "userId" not in result["error"]
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @pytest.mark.asyncio
+  async def test_call_unmatched_path_placeholder_raises_key_error(
+      self,
+      mock_request,
+      mock_tool_context,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """An undeclared path placeholder must raise KeyError."""
+    mock_operation = Operation(
+        operationId="test_op",
+        parameters=[
+            OpenAPIParameter(**{
+                "name": "query",
+                "in": "query",
+                "required": True,
+                "schema": OpenAPISchema(type="string"),
+            })
+        ],
+    )
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=OperationEndpoint(
+            base_url="https://example.com",
+            path="/search?q={query}",
+            method="GET",
+        ),
+        operation=mock_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    with pytest.raises(KeyError, match="query"):
+      await tool.call(args={"query": "hello"}, tool_context=mock_tool_context)
+
+    assert not mock_request.called
 
   def test_prepare_request_params_query_body(
       self, sample_endpoint, sample_auth_credential, sample_auth_scheme
@@ -516,6 +1687,61 @@ class TestRestApiTool:
     assert request_params["json"] == {"param1": "value1", "param2": 123}
     assert request_params["params"] == {"testQueryParam": "query_value"}
 
+  def test_prepare_request_params_preserves_falsy_query_params(
+      self, sample_endpoint, sample_auth_credential, sample_auth_scheme
+  ):
+    mock_operation = Operation(operationId="test_op")
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="test",
+        endpoint=sample_endpoint,
+        operation=mock_operation,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+
+    params = [
+        ApiParameter(
+            original_name="flag",
+            py_name="flag",
+            param_location="query",
+            param_schema=OpenAPISchema(type="boolean"),
+        ),
+        ApiParameter(
+            original_name="offset",
+            py_name="offset",
+            param_location="query",
+            param_schema=OpenAPISchema(type="integer"),
+        ),
+        ApiParameter(
+            original_name="cursor",
+            py_name="cursor",
+            param_location="query",
+            param_schema=OpenAPISchema(type="string"),
+        ),
+        ApiParameter(
+            original_name="empty_param",
+            py_name="empty_param",
+            param_location="query",
+            param_schema=OpenAPISchema(type="string"),
+        ),
+    ]
+    kwargs = {
+        "flag": False,
+        "offset": 0,
+        "cursor": None,
+        "empty_param": "",
+    }
+
+    request_params = tool._prepare_request_params(params, kwargs)
+    # Explicit False/0/"" must be kept; None is omitted.
+    assert request_params["params"] == {
+        "flag": False,
+        "offset": 0,
+        "empty_param": "",
+    }
+
   def test_prepare_request_params_array(
       self, sample_endpoint, sample_auth_scheme, sample_auth_credential
   ):
@@ -542,7 +1768,7 @@ class TestRestApiTool:
     )
     params = [
         ApiParameter(
-            original_name="array",  # Match the parameter name
+            original_name="array",
             py_name="array",
             param_location="body",
             param_schema=OpenAPISchema(
@@ -551,6 +1777,44 @@ class TestRestApiTool:
         )
     ]
     kwargs = {"array": ["item1", "item2"]}
+
+    request_params = tool._prepare_request_params(params, kwargs)
+
+    assert request_params["json"] == ["item1", "item2"]
+
+  def test_prepare_request_params_array_with_param_conflict(
+      self, sample_endpoint, sample_auth_scheme, sample_auth_credential
+  ):
+    """Sends array body as JSON payload when parameter names conflict."""
+    mock_operation = Operation(
+        operationId="test_op",
+        parameters=[
+            OpenAPIParameter(
+                name="array",
+                **{"in": "query"},
+                schema=OpenAPISchema(type="string"),
+            )
+        ],
+        requestBody=RequestBody(
+            content={
+                "application/json": MediaType(
+                    schema=OpenAPISchema(
+                        type="array", items=OpenAPISchema(type="string")
+                    )
+                )
+            }
+        ),
+    )
+    tool = RestApiTool(
+        name="test_tool",
+        description="test",
+        endpoint=sample_endpoint,
+        operation=mock_operation,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+    params = OperationParser(mock_operation).get_parameters()
+    kwargs = {"array": "query_val", "array_0": ["item1", "item2"]}
 
     request_params = tool._prepare_request_params(params, kwargs)
 
@@ -589,6 +1853,45 @@ class TestRestApiTool:
 
     assert request_params["data"] == "test_value"
     assert request_params["headers"]["Content-Type"] == "text/plain"
+
+  def test_prepare_request_params_oneof_body(
+      self, sample_endpoint, sample_auth_credential, sample_auth_scheme
+  ):
+    """Sends the JSON payload for a oneOf/anyOf/allOf request body.
+
+    A oneOf/anyOf/allOf body is named 'body' by the parser and must
+    still be sent as the JSON payload, not silently dropped.
+    """
+    oneof_schema = OpenAPISchema(
+        oneOf=[
+            OpenAPISchema(
+                type="object", properties={"card": OpenAPISchema(type="string")}
+            ),
+            OpenAPISchema(
+                type="object", properties={"iban": OpenAPISchema(type="string")}
+            ),
+        ]
+    )
+    mock_operation = Operation(
+        operationId="test_op",
+        requestBody=RequestBody(
+            content={"application/json": MediaType(schema=oneof_schema)}
+        ),
+    )
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=mock_operation,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+    params = OperationParser(mock_operation).get_parameters()
+    kwargs = {"body": {"card": "4111-1111"}}
+
+    request_params = tool._prepare_request_params(params, kwargs)
+
+    assert request_params["json"] == {"card": "4111-1111"}
 
   def test_prepare_request_params_form_data(
       self, sample_endpoint, sample_auth_scheme, sample_auth_credential
@@ -673,7 +1976,59 @@ class TestRestApiTool:
     request_params = tool._prepare_request_params(params, kwargs)
 
     assert request_params["files"] == {"file1": b"file_content"}
-    assert request_params["headers"]["Content-Type"] == "multipart/form-data"
+    # For multipart/form-data the boundary-bearing Content-Type must be set by
+    # httpx (from the `files` payload), not forced here. Forcing a boundary-less
+    # "multipart/form-data" header would override the boundary httpx generates
+    # and make the request body unparsable.
+    assert "Content-Type" not in request_params["headers"]
+
+  def test_prepare_request_params_multipart_content_type_has_boundary(
+      self, sample_endpoint, sample_auth_credential, sample_auth_scheme
+  ):
+    mock_operation = Operation(
+        operationId="test_op",
+        requestBody=RequestBody(
+            content={
+                "multipart/form-data": MediaType(
+                    schema=OpenAPISchema(
+                        type="object",
+                        properties={
+                            "file1": OpenAPISchema(
+                                type="string", format="binary"
+                            )
+                        },
+                    )
+                )
+            }
+        ),
+    )
+    tool = RestApiTool(
+        name="test_tool",
+        description="test",
+        endpoint=sample_endpoint,
+        operation=mock_operation,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+    params = [
+        ApiParameter(
+            original_name="file1",
+            py_name="file1",
+            param_location="body",
+            param_schema=OpenAPISchema(type="string", format="binary"),
+        )
+    ]
+    kwargs = {"file1": b"file_content"}
+
+    request_params = tool._prepare_request_params(params, kwargs)
+
+    # Build the request httpx would actually send and assert the wire
+    # Content-Type carries the multipart boundary that matches the body.
+    request = httpx.Client().build_request(**request_params)
+    content_type = request.headers["Content-Type"]
+    assert content_type.startswith("multipart/form-data; boundary=")
+    boundary = content_type.split("boundary=", 1)[1]
+    assert request.read().startswith(f"--{boundary}".encode())
 
   def test_prepare_request_params_octet_stream(
       self, sample_endpoint, sample_auth_scheme, sample_auth_credential
@@ -745,6 +2100,156 @@ class TestRestApiTool:
         request_params["url"] == "https://example.com/test/123"
     )  # Path param replaced
 
+  def test_prepare_request_params_path_param_is_percent_encoded(
+      self, sample_endpoint, sample_auth_credential, sample_auth_scheme
+  ):
+    """A path parameter value must not introduce a query string or fragment,
+    and slash-containing IDs must stay a single encoded segment.
+
+    Path parameter values ultimately come from the model's tool-call
+    arguments. Reserved characters ('/', '?', '#') are percent-encoded.
+    RFC 3986 dot-segments ('.' / '..') are rejected separately: quote()
+    leaves '.' literal, so encoding alone cannot stop backends that
+    decode '%2F' and merge dot-segments from leaving the declared path.
+    """
+    mock_operation = Operation(operationId="test_op")
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=mock_operation,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+    params = [
+        ApiParameter(
+            original_name="user_id",
+            py_name="user_id",
+            param_location="path",
+            param_schema=OpenAPISchema(type="string"),
+        )
+    ]
+    endpoint_with_path = OperationEndpoint(
+        base_url="https://example.com",
+        path="/users/{user_id}/messages",
+        method="get",
+    )
+    tool.endpoint = endpoint_with_path
+
+    # Slash-containing IDs stay one segment after encoding.
+    request_params = tool._prepare_request_params(
+        params, {"user_id": "foo/bar"}
+    )
+    assert request_params["url"] == (
+        "https://example.com/users/foo%2Fbar/messages"
+    )
+
+    # Query/fragment smuggling attempt: '?' and '#' must be escaped so a
+    # path parameter value cannot introduce a query string or fragment.
+    request_params = tool._prepare_request_params(
+        params, {"user_id": "me?impersonate=other-user#"}
+    )
+    assert request_params["url"] == (
+        "https://example.com/users/me%3Fimpersonate%3Dother-user%23/messages"
+    )
+    assert request_params["params"] == {}  # nothing smuggled into query params
+
+    request_params = tool._prepare_request_params(
+        params, {"user_id": "file..txt"}
+    )
+    assert request_params["url"] == (
+        "https://example.com/users/file..txt/messages"
+    )
+
+    request_params = tool._prepare_request_params(
+        params, {"user_id": ".gitignore"}
+    )
+    assert request_params["url"] == (
+        "https://example.com/users/.gitignore/messages"
+    )
+
+    request_params = tool._prepare_request_params(params, {"user_id": "ok.txt"})
+    assert request_params["url"] == "https://example.com/users/ok.txt/messages"
+
+  @pytest.mark.parametrize(
+      "value",
+      [".", "..", "../../admin/v1/tenants", "foo/../bar", r"..\admin", "./x"],
+  )
+  def test_prepare_request_params_path_param_rejects_dot_segments(
+      self, sample_endpoint, sample_auth_credential, sample_auth_scheme, value
+  ):
+    """Dot-segments must be rejected: quote() leaves '.' literal on the wire."""
+    mock_operation = Operation(operationId="test_op")
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=mock_operation,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+    params = [
+        ApiParameter(
+            original_name="user_id",
+            py_name="user_id",
+            param_location="path",
+            param_schema=OpenAPISchema(type="string"),
+        )
+    ]
+    tool.endpoint = OperationEndpoint(
+        base_url="https://example.com",
+        path="/users/{user_id}/messages",
+        method="get",
+    )
+
+    with pytest.raises(InputValidationError, match="parent-directory"):
+      tool._prepare_request_params(params, {"user_id": value})
+
+  @patch(
+      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
+  )
+  @pytest.mark.asyncio
+  async def test_call_rejects_dot_segment_path_param(
+      self,
+      mock_request,
+      mock_tool_context,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """Traversal path args must fail closed without issuing an HTTP request."""
+    mock_operation = Operation(
+        operationId="test_op",
+        parameters=[
+            OpenAPIParameter(**{
+                "name": "name",
+                "in": "path",
+                "required": True,
+                "schema": OpenAPISchema(type="string"),
+            })
+        ],
+    )
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=OperationEndpoint(
+            base_url="https://example.com",
+            path="/files/{name}",
+            method="GET",
+        ),
+        operation=mock_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    result = await tool.call(
+        args={"name": "../../admin/secret"}, tool_context=mock_tool_context
+    )
+
+    assert "error" in result
+    assert "parent-directory" in result["error"]
+    assert not mock_request.called
+    assert tool._detect_error_in_response(result) == "HTTP_ERROR"
+
   def test_prepare_request_params_header_param(
       self,
       sample_endpoint,
@@ -802,6 +2307,201 @@ class TestRestApiTool:
     request_params = tool._prepare_request_params(params, kwargs)
 
     assert request_params["cookies"]["session_id"] == "cookie_value"
+
+  @pytest.mark.parametrize(
+      "value, expected, expected_path",
+      [
+          (50, "50", "50"),
+          (1.5, "1.5", "1.5"),
+          (True, "true", "true"),
+          (False, "false", "false"),
+          (["a", "b", 3], "a,b,3", "a%2Cb%2C3"),
+          (("a", "b", 3), "a,b,3", "a%2Cb%2C3"),
+          ([True, False], "true,false", "true%2Cfalse"),
+          ([1, None, True], "1,true", "1%2Ctrue"),
+          (
+              {"a": 1, "b": None, "c": True},
+              "a,1,c,true",
+              "a%2C1%2Cc%2Ctrue",
+          ),
+          ("already-a-string", "already-a-string", "already-a-string"),
+      ],
+  )
+  def test_prepare_request_params_serializes_header_and_cookie_values(
+      self,
+      sample_operation: Operation,
+      value: object,
+      expected: str,
+      expected_path: str,
+  ) -> None:
+    """httpx rejects non-string header and cookie values."""
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=OperationEndpoint(
+            base_url="https://example.com",
+            path="/items/{item_filter}",
+            method="GET",
+        ),
+        operation=sample_operation,
+    )
+    params = [
+        ApiParameter(
+            original_name="item_filter",
+            py_name="item_filter",
+            param_location="path",
+            param_schema=OpenAPISchema(type="string"),
+        ),
+        ApiParameter(
+            original_name="X-Page-Size",
+            py_name="x_page_size",
+            param_location="header",
+            param_schema=OpenAPISchema(type="integer"),
+        ),
+        ApiParameter(
+            original_name="page_size",
+            py_name="page_size",
+            param_location="cookie",
+            param_schema=OpenAPISchema(type="integer"),
+        ),
+    ]
+    kwargs = {
+        "item_filter": value,
+        "x_page_size": value,
+        "page_size": value,
+    }
+
+    request_params = tool._prepare_request_params(params, kwargs)
+
+    assert request_params["url"] == f"https://example.com/items/{expected_path}"
+    assert request_params["headers"]["X-Page-Size"] == expected
+    assert request_params["cookies"]["page_size"] == expected
+    # The values must be accepted by httpx when the request is built.
+    httpx.Request(
+        request_params["method"],
+        request_params["url"],
+        headers=request_params["headers"],
+        cookies=request_params["cookies"],
+    )
+
+  def test_prepare_request_params_omits_none_header_and_cookie_values(
+      self,
+      sample_endpoint: OperationEndpoint,
+      sample_operation: Operation,
+  ) -> None:
+    """Optional header and cookie parameters with None values are omitted."""
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+    )
+    params = [
+        ApiParameter(
+            original_name="X-Page-Size",
+            py_name="x_page_size",
+            param_location="header",
+            param_schema=OpenAPISchema(type="integer"),
+            required=False,
+        ),
+        ApiParameter(
+            original_name="page_size",
+            py_name="page_size",
+            param_location="cookie",
+            param_schema=OpenAPISchema(type="integer"),
+            required=False,
+        ),
+    ]
+    kwargs = {"x_page_size": None, "page_size": None}
+
+    request_params = tool._prepare_request_params(params, kwargs)
+
+    assert "X-Page-Size" not in request_params["headers"]
+    assert "page_size" not in request_params["cookies"]
+    httpx.Request(
+        request_params["method"],
+        request_params["url"],
+        headers=request_params["headers"],
+        cookies=request_params["cookies"],
+    )
+
+  async def test_call_serializes_non_string_parameters_and_omits_none(
+      self,
+      mock_tool_context: ToolContext,
+  ) -> None:
+    """RestApiTool.call serializes non-string defaults and omits None values."""
+    captured_requests: list[httpx.Request] = []
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+      captured_requests.append(request)
+      return httpx.Response(200, json={"result": "ok"})
+
+    operation = Operation(
+        operationId="listItems",
+        parameters=[
+            OpenAPIParameter(**{
+                "name": "include_archived",
+                "in": "path",
+                "required": True,
+                "schema": OpenAPISchema(type="boolean", default=False),
+            }),
+            OpenAPIParameter(**{
+                "name": "X-Page-Size",
+                "in": "header",
+                "required": True,
+                "schema": OpenAPISchema(type="integer", default=50),
+            }),
+            OpenAPIParameter(**{
+                "name": "flags",
+                "in": "cookie",
+                "required": True,
+                "schema": OpenAPISchema(
+                    type="array",
+                    items=OpenAPISchema(type="boolean"),
+                    default=[True, False],
+                ),
+            }),
+            OpenAPIParameter(**{
+                "name": "X-Optional-Header",
+                "in": "header",
+                "required": False,
+                "schema": OpenAPISchema(type="string"),
+            }),
+            OpenAPIParameter(**{
+                "name": "optional_cookie",
+                "in": "cookie",
+                "required": False,
+                "schema": OpenAPISchema(type="string"),
+            }),
+        ],
+    )
+    tool = RestApiTool(
+        name="list_items",
+        description="List items",
+        endpoint=OperationEndpoint(
+            base_url="https://example.com",
+            path="/items/{include_archived}",
+            method="GET",
+        ),
+        operation=operation,
+        httpx_client_factory=lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(handle_request)
+        ),
+    )
+
+    result = await tool.call(
+        args={"x_optional_header": None, "optional_cookie": None},
+        tool_context=mock_tool_context,
+    )
+
+    assert result == {"result": "ok"}
+    assert len(captured_requests) == 1
+    sent_request = captured_requests[0]
+    assert str(sent_request.url) == "https://8.8.8.8/items/false"
+    assert sent_request.headers["Host"] == "example.com"
+    assert sent_request.headers["X-Page-Size"] == "50"
+    assert "X-Optional-Header" not in sent_request.headers
+    assert sent_request.headers["cookie"] == "flags=true,false"
 
   def test_prepare_request_params_quota_project_id(
       self,
@@ -1117,7 +2817,7 @@ class TestRestApiTool:
       else:
         assert call_kwargs["verify"] == expected_verify_in_call
 
-  async def test_request_uses_no_default_timeout(
+  async def test_request_bounds_every_default_timeout_phase(
       self,
       mock_tool_context,
       sample_endpoint,
@@ -1125,12 +2825,12 @@ class TestRestApiTool:
       sample_auth_scheme,
       sample_auth_credential,
   ):
-    """Test that _request creates AsyncClient with timeout=None.
+    """Test that no phase of the default client's wait is unbounded.
 
-    httpx defaults to a 5-second timeout, which is too short for many
-    real-world API calls. Verify that we explicitly disable the timeout
-    to match the previous requests-library behavior (no timeout).
-    Regression test for https://github.com/google/adk-python/issues/4431.
+    A peer that accepts a connection but never answers must not occupy an
+    agent invocation forever. Connection setup fails fast; the read and write
+    budgets stay generous, because httpx's own 5-second default is far too
+    short for many real-world APIs.
     """
     mock_response = mock.create_autospec(requests.Response, instance=True)
     mock_response.json.return_value = {"result": "success"}
@@ -1157,7 +2857,46 @@ class TestRestApiTool:
 
       assert mock_async_client.called
       _, call_kwargs = mock_async_client.call_args
-      assert call_kwargs["timeout"] is None
+      timeout = call_kwargs["timeout"]
+      assert isinstance(timeout, httpx.Timeout)
+      assert timeout.connect is not None
+      assert timeout.read is not None
+      assert timeout.write is not None
+      assert timeout.pool is not None
+      assert timeout.connect <= 30.0
+      assert timeout.pool <= 30.0
+      assert timeout.read >= 600.0
+      assert timeout.write >= 600.0
+
+  async def test_request_timeout_returns_normalized_error(
+      self,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+  ):
+    """Test that a transport timeout becomes the tool's error response."""
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+    request = httpx.Request("GET", "https://example.com/test")
+
+    with patch.object(
+        httpx.AsyncClient,
+        "request",
+        AsyncMock(side_effect=httpx.ReadTimeout("timed out", request=request)),
+    ):
+      result = await tool.call(args={}, tool_context=mock_tool_context)
+
+    assert "timed out" in result["error"]
+    assert "retry more than 3 times" in result["error"]
+    assert tool._detect_error_in_response(result) == "HTTP_ERROR"
 
   async def test_call_with_configure_verify(
       self,
@@ -1446,6 +3185,141 @@ class TestRestApiTool:
       await tool.call(args={}, tool_context=mock_tool_context)
       assert mock_async_client.called
 
+  @pytest.mark.asyncio
+  @pytest.mark.parametrize(
+      "ssl_verify, expected_verify",
+      [(None, True), (False, False), ("/path/to/ca.pem", "/path/to/ca.pem")],
+  )
+  async def test_call_without_httpx_client_factory_presents_client_cert(
+      self,
+      mock_tool_context,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+      mock_client_cert_ssl_context,
+      ssl_verify,
+      expected_verify,
+  ):
+    """The default client presents the client certificate to Google APIs."""
+    mock_response = mock.create_autospec(requests.Response, instance=True)
+    mock_response.json.return_value = {"result": "success"}
+    mock_response.configure_mock(status_code=200)
+    mock_client = mock.create_autospec(
+        httpx.AsyncClient, instance=True, spec_set=True
+    )
+    mock_client.request = AsyncMock(return_value=mock_response)
+    client_cert_ctx = ssl.create_default_context()
+    mock_client_cert_ssl_context.return_value = client_cert_ctx
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=OperationEndpoint(
+            base_url="https://aiplatform.googleapis.com",
+            path="/test",
+            method="GET",
+        ),
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+        ssl_verify=ssl_verify,
+    )
+
+    with patch.object(
+        httpx, "AsyncClient", return_value=mock_client, autospec=True
+    ) as mock_async_client:
+      await tool.call(args={}, tool_context=mock_tool_context)
+
+    mock_client_cert_ssl_context.assert_called_once_with(expected_verify)
+    _, call_kwargs = mock_async_client.call_args
+    assert call_kwargs["verify"] is client_cert_ctx
+    assert call_kwargs["event_hooks"] == {
+        "request": [_mtls_utils._route_googleapis_request_to_mtls]
+    }
+
+  @pytest.mark.asyncio
+  async def test_call_to_other_host_skips_client_cert(
+      self,
+      mock_tool_context,
+      sample_endpoint,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+      mock_client_cert_ssl_context,
+  ):
+    """The client certificate is not sent to hosts other than Google APIs."""
+    mock_response = mock.create_autospec(requests.Response, instance=True)
+    mock_response.json.return_value = {"result": "success"}
+    mock_response.configure_mock(status_code=200)
+    mock_client = mock.create_autospec(
+        httpx.AsyncClient, instance=True, spec_set=True
+    )
+    mock_client.request = AsyncMock(return_value=mock_response)
+    mock_client_cert_ssl_context.return_value = ssl.create_default_context()
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    with patch.object(
+        httpx, "AsyncClient", return_value=mock_client, autospec=True
+    ) as mock_async_client:
+      await tool.call(args={}, tool_context=mock_tool_context)
+
+    mock_client_cert_ssl_context.assert_not_called()
+    _, call_kwargs = mock_async_client.call_args
+    assert call_kwargs["verify"] is True
+    assert "event_hooks" not in call_kwargs
+
+  @pytest.mark.asyncio
+  async def test_call_with_ssl_context_skips_client_cert(
+      self,
+      mock_tool_context,
+      sample_operation,
+      sample_auth_scheme,
+      sample_auth_credential,
+      mock_ssl_context,
+      mock_client_cert_ssl_context,
+  ):
+    """A caller-supplied SSLContext is used as given."""
+    mock_response = mock.create_autospec(requests.Response, instance=True)
+    mock_response.json.return_value = {"result": "success"}
+    mock_response.configure_mock(status_code=200)
+    mock_client = mock.create_autospec(
+        httpx.AsyncClient, instance=True, spec_set=True
+    )
+    mock_client.request = AsyncMock(return_value=mock_response)
+    mock_client_cert_ssl_context.return_value = ssl.create_default_context()
+
+    tool = RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=OperationEndpoint(
+            base_url="https://aiplatform.googleapis.com",
+            path="/test",
+            method="GET",
+        ),
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+        ssl_verify=mock_ssl_context,
+    )
+
+    with patch.object(
+        httpx, "AsyncClient", return_value=mock_client, autospec=True
+    ) as mock_async_client:
+      await tool.call(args={}, tool_context=mock_tool_context)
+
+    mock_client_cert_ssl_context.assert_not_called()
+    _, call_kwargs = mock_async_client.call_args
+    assert call_kwargs["verify"] is mock_ssl_context
+    assert "event_hooks" not in call_kwargs
+
   def test_prepare_request_params_extracts_embedded_query_params(
       self, sample_auth_credential, sample_auth_scheme
   ):
@@ -1455,7 +3329,6 @@ class TestRestApiTool:
     in the OpenAPI path (e.g. '...execute?triggerId=api_trigger/Name#action').
     These must be moved into the explicit query_params dict so httpx does not
     strip them when it replaces the URL query string with the `params` arg.
-    Regression test for https://github.com/google/adk-python/issues/4555.
     """
     integration_path = (
         "/v2/projects/my-proj/locations/us-central1"
@@ -1602,6 +3475,73 @@ class TestRestApiTool:
 
     assert request_params["url"] == "https://example.com/test"
 
+  def test_rest_api_tool_repr_and_str(
+      self, sample_endpoint, sample_operation, sample_auth_scheme
+  ):
+    """The attached credential is not rendered into repr or str."""
+    secret_cred = AuthCredential(
+        auth_type=AuthCredentialTypes.API_KEY,
+        api_key="sk-live-secret-api-key-12345",
+    )
+    tool = RestApiTool(
+        name="test_tool",
+        description="test description",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+        auth_scheme=sample_auth_scheme,
+        auth_credential=secret_cred,
+    )
+    repr_str = repr(tool)
+    str_str = str(tool)
+    assert 'name="test_tool"' in repr_str
+    assert 'description="test description"' in repr_str
+    assert "auth_scheme=" in repr_str
+    assert "auth_credential=" not in repr_str
+    assert "sk-live-secret-api-key-12345" not in repr_str
+    assert "sk-live-secret-api-key-12345" not in str_str
+
+  def test_prepare_request_params_fragment_params_become_query_params(
+      self, sample_auth_credential, sample_auth_scheme
+  ):
+    # When the ApplicationIntegrationToolset builds an endpoint URL, it sometimes
+    # puts params in the fragment (e.g. #triggerId=my_trigger). Without this fix
+    # those params were silently dropped and the API returned a 400 error.
+    # See: https://github.com/google/adk-python/issues/4598
+    integration_endpoint = OperationEndpoint(
+        base_url="https://integrations.googleapis.com",
+        path=(
+            "/v2/projects/demo/locations/us-central1"
+            "/integrations/MyFlow:execute"
+            "?triggerId=api_trigger/MyFlow"
+            "#httpMethod=POST"
+        ),
+        method="POST",
+    )
+    op = Operation(operationId="run_integration")
+    tool = RestApiTool(
+        name="run_integration",
+        description="Runs a Google Cloud integration flow",
+        endpoint=integration_endpoint,
+        operation=op,
+        auth_credential=sample_auth_credential,
+        auth_scheme=sample_auth_scheme,
+    )
+
+    result = tool._prepare_request_params([], {})
+
+    # Both the query string and fragment params should land in query params
+    assert result["params"]["triggerId"] == "api_trigger/MyFlow"
+    assert result["params"]["httpMethod"] == "POST"
+
+    # The final URL should be clean — no leftover ? or #
+    assert "?" not in result["url"]
+    assert "#" not in result["url"]
+    assert result["url"] == (
+        "https://integrations.googleapis.com"
+        "/v2/projects/demo/locations/us-central1"
+        "/integrations/MyFlow:execute"
+    )
+
 
 def test_snake_to_lower_camel():
   assert snake_to_lower_camel("single") == "single"
@@ -1609,3 +3549,1017 @@ def test_snake_to_lower_camel():
   assert snake_to_lower_camel("three_word_example") == "threeWordExample"
   assert not snake_to_lower_camel("")
   assert snake_to_lower_camel("alreadyCamelCase") == "alreadyCamelCase"
+
+
+def _build_parsed_operation(
+    operation: Operation,
+    parameters=None,
+    auth_scheme=None,
+    auth_credential=None,
+) -> ParsedOperation:
+  """A ParsedOperation whose own name/description differ from the operation's.
+
+  ``from_parsed_operation`` is documented to build the tool out of the OpenAPI
+  operation, so these two fields exist as decoys: a tool that picks them up is
+  reading the wrong source.
+  """
+  return ParsedOperation(
+      name="parsed_name_that_is_not_the_tool_name",
+      description="Parsed description that is not the tool description.",
+      endpoint=OperationEndpoint(
+          base_url="https://example.com", path="/pets", method="GET"
+      ),
+      operation=operation,
+      parameters=parameters if parameters is not None else [],
+      return_value=ApiParameter(
+          original_name="",
+          py_name="",
+          param_location="",
+          param_schema=OpenAPISchema(type="string"),
+      ),
+      auth_scheme=auth_scheme,
+      auth_credential=auth_credential,
+  )
+
+
+class TestRestApiToolFromParsedOperation:
+  """Tests for RestApiTool.from_parsed_operation."""
+
+  def test_from_parsed_operation_names_tool_after_operation_id(self):
+    parsed = _build_parsed_operation(
+        Operation(operationId="ListPetsByStatus", description="List pets.")
+    )
+
+    tool = RestApiTool.from_parsed_operation(parsed)
+
+    assert tool.name == "list_pets_by_status"
+
+  def test_from_parsed_operation_truncates_long_name_to_60_chars(self):
+    # Gemini rejects function names of 64 characters or more.
+    operation_id = "get" + "Extremely" * 10 + "LongOperationName"
+    parsed = _build_parsed_operation(
+        Operation(operationId=operation_id, description="Long one.")
+    )
+
+    tool = RestApiTool.from_parsed_operation(parsed)
+
+    assert len(tool.name) == 60
+    assert tool.name.startswith("get_extremely_extremely_")
+
+  @pytest.mark.parametrize(
+      "description, summary, expected",
+      [
+          (
+              "Operation description.",
+              "Operation summary.",
+              "Operation description.",
+          ),
+          (None, "Operation summary.", "Operation summary."),
+          (None, None, ""),
+      ],
+  )
+  def test_from_parsed_operation_description_precedence(
+      self, description, summary, expected
+  ):
+    parsed = _build_parsed_operation(
+        Operation(
+            operationId="listPets", description=description, summary=summary
+        )
+    )
+
+    tool = RestApiTool.from_parsed_operation(parsed)
+
+    assert tool.description == expected
+
+  def test_from_parsed_operation_uses_parsed_parameters_over_operation_ones(
+      self,
+  ):
+    # The operation declares one query parameter, but the caller has already
+    # parsed a different one; the pre-parsed list is what the tool must expose.
+    operation = Operation(
+        operationId="listPets",
+        description="List pets.",
+        parameters=[
+            OpenAPIParameter(**{
+                "name": "fromOperation",
+                "in": "query",
+                "schema": OpenAPISchema(type="string"),
+            })
+        ],
+    )
+    parsed = _build_parsed_operation(
+        operation,
+        parameters=[
+            ApiParameter(
+                original_name="fromParsed",
+                py_name="from_parsed",
+                param_location="query",
+                param_schema=OpenAPISchema(type="string"),
+            )
+        ],
+    )
+
+    tool = RestApiTool.from_parsed_operation(parsed)
+
+    with temporary_feature_override(
+        FeatureName.JSON_SCHEMA_FOR_FUNC_DECL, False
+    ):
+      declaration = tool._get_declaration()
+
+    assert set(declaration.parameters.properties) == {"from_parsed"}
+
+  def test_from_parsed_operation_forwards_transport_options(
+      self, mock_ssl_context
+  ):
+    parsed = _build_parsed_operation(
+        Operation(operationId="listPets", description="List pets.")
+    )
+
+    def header_provider(_):
+      return {"X-Correlation-Id": "abc"}
+
+    def client_factory():
+      return httpx.AsyncClient()
+
+    tool = RestApiTool.from_parsed_operation(
+        parsed,
+        ssl_verify=mock_ssl_context,
+        header_provider=header_provider,
+        httpx_client_factory=client_factory,
+    )
+
+    assert tool._ssl_verify is mock_ssl_context
+    assert tool._header_provider is header_provider
+    assert tool._httpx_client_factory is client_factory
+
+  def test_from_parsed_operation_carries_over_auth(
+      self, sample_auth_scheme, sample_auth_credential
+  ):
+    parsed = _build_parsed_operation(
+        Operation(operationId="listPets", description="List pets."),
+        auth_scheme=sample_auth_scheme,
+        auth_credential=sample_auth_credential,
+    )
+
+    tool = RestApiTool.from_parsed_operation(parsed)
+
+    assert tool.auth_scheme == sample_auth_scheme
+    assert tool.auth_credential == sample_auth_credential
+
+
+class TestRestApiToolAuthConfiguration:
+  """Tests for configure_auth_scheme / configure_auth_credential."""
+
+  @pytest.fixture
+  def tool(self, sample_endpoint, sample_operation):
+    return RestApiTool(
+        name="test_tool",
+        description="Test Tool",
+        endpoint=sample_endpoint,
+        operation=sample_operation,
+    )
+
+  def test_configure_auth_scheme_converts_dict_to_auth_scheme(self, tool):
+    tool.configure_auth_scheme({
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+    })
+
+    assert isinstance(tool.auth_scheme, APIKey)
+    assert tool.auth_scheme.name == "X-API-Key"
+    assert tool.auth_scheme.in_.value == "header"
+
+  def test_configure_auth_credential_parses_json_string(self, tool):
+    credential = AuthCredential(
+        auth_type=AuthCredentialTypes.HTTP,
+        http=HttpAuth(
+            scheme="bearer",
+            credentials=HttpCredentials(token="token-from-json"),
+        ),
+    )
+
+    tool.configure_auth_credential(credential.model_dump_json())
+
+    assert isinstance(tool.auth_credential, AuthCredential)
+    assert tool.auth_credential == credential
+
+  def test_configure_auth_credential_none_clears_existing_credential(
+      self, tool, sample_auth_credential
+  ):
+    tool.configure_auth_credential(sample_auth_credential)
+
+    tool.configure_auth_credential(None)
+
+    assert tool.auth_credential is None
+
+
+class TestRequestSsrfProtection:
+  """Tests for SSRF protection in RestApiTool."""
+
+  @staticmethod
+  def _make_tool(
+      base_url: str,
+      path: str = "/api",
+      *,
+      header_provider=None,
+      httpx_client_factory=None,
+      allow_private_network_access: bool = False,
+  ) -> RestApiTool:
+    parsed = ParsedOperation(
+        name="test_op",
+        description="Test operation",
+        endpoint=OperationEndpoint(
+            base_url=base_url,
+            path=path,
+            method="get",
+        ),
+        operation=Operation(operationId="testOp", responses={}),
+        parameters=[],
+        return_value=ApiParameter(
+            original_name="",
+            py_name="",
+            param_location="body",
+            param_schema=OpenAPISchema(type="object"),
+        ),
+    )
+    return RestApiTool.from_parsed_operation(
+        parsed,
+        header_provider=header_provider,
+        httpx_client_factory=httpx_client_factory,
+        allow_private_network_access=allow_private_network_access,
+    )
+
+  @pytest.mark.asyncio
+  async def test_request_blocks_localhost(self, mock_tool_context):
+    tool = self._make_tool("http://localhost:8080", "/internal")
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "Blocked host" in response["error"]
+    assert tool._detect_error_in_response(response) == "HTTP_ERROR"
+
+  @pytest.mark.asyncio
+  async def test_request_blocks_loopback(self, mock_tool_context):
+    tool = self._make_tool("http://127.0.0.1", "/internal")
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "Blocked host" in response["error"]
+    assert tool._detect_error_in_response(response) == "HTTP_ERROR"
+
+  @pytest.mark.asyncio
+  async def test_request_blocks_metadata_endpoint(self, mock_tool_context):
+    tool = self._make_tool("http://169.254.169.254", "/latest/meta-data/")
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "Blocked host" in response["error"]
+    assert tool._detect_error_in_response(response) == "HTTP_ERROR"
+
+  @pytest.mark.asyncio
+  async def test_request_blocks_private_ip(self, mock_tool_context):
+    tool = self._make_tool("http://10.0.0.1", "/admin")
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "Blocked host" in response["error"]
+    assert tool._detect_error_in_response(response) == "HTTP_ERROR"
+
+  @pytest.mark.asyncio
+  async def test_request_blocks_file_scheme(self, mock_tool_context):
+    tool = self._make_tool("file://", "/etc/passwd")
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "Unsupported url scheme" in response["error"]
+    assert tool._detect_error_in_response(response) == "HTTP_ERROR"
+
+  @pytest.mark.asyncio
+  async def test_request_blocks_ftp_scheme(self, mock_tool_context):
+    tool = self._make_tool("ftp://example.com", "/file")
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "Unsupported url scheme" in response["error"]
+    assert tool._detect_error_in_response(response) == "HTTP_ERROR"
+
+  @pytest.mark.asyncio
+  async def test_request_blocks_missing_hostname(self, mock_tool_context):
+    tool = self._make_tool("http:///", "/path")
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "missing a hostname" in response["error"]
+    assert tool._detect_error_in_response(response) == "HTTP_ERROR"
+
+  @pytest.mark.asyncio
+  async def test_request_returns_error_on_unresolvable_host(
+      self, mock_tool_context, monkeypatch
+  ):
+    def fail_getaddrinfo(*args, **kwargs):
+      raise socket.gaierror(8, "nodename nor servname provided")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fail_getaddrinfo)
+    tool = self._make_tool("https://nonexistent.example.com", "/api")
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "Unable to resolve host" in response["error"]
+    assert tool._detect_error_in_response(response) == "HTTP_ERROR"
+
+  @pytest.mark.asyncio
+  async def test_request_blocks_rebinder_when_any_record_is_private(
+      self, mock_tool_context, monkeypatch
+  ):
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+      if host == "rebinder.example.com":
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.4.4", 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0)),
+        ]
+      raise socket.gaierror(8, "no")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    tool = self._make_tool("https://rebinder.example.com", "/x")
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "Blocked host" in response["error"]
+    assert tool._detect_error_in_response(response) == "HTTP_ERROR"
+
+  @pytest.mark.asyncio
+  async def test_request_blocks_internal_hostname(
+      self, mock_tool_context, monkeypatch
+  ):
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+      if host == "internal.example.com":
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 0))]
+      raise socket.gaierror(8, "no")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    tool = self._make_tool("https://internal.example.com", "/admin")
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "Blocked host" in response["error"]
+    assert tool._detect_error_in_response(response) == "HTTP_ERROR"
+
+  @pytest.mark.asyncio
+  async def test_request_allows_public_url_and_pins_ip_host_and_sni(
+      self, mock_tool_context
+  ):
+    captured_request: list[httpx.Request] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+      captured_request.append(request)
+      return httpx.Response(200, json={"success": True})
+
+    transport = httpx.MockTransport(mock_handler)
+
+    def client_factory():
+      return httpx.AsyncClient(transport=transport)
+
+    tool = self._make_tool(
+        "https://api.example.com:8443",
+        "/api",
+        httpx_client_factory=client_factory,
+    )
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+
+    assert response == {"success": True}
+    assert len(captured_request) == 1
+    sent = captured_request[0]
+    assert sent.url.host == "8.8.8.8"
+    assert sent.url.port == 8443
+    assert sent.headers["Host"] == "api.example.com:8443"
+    assert sent.extensions.get("sni_hostname") == "api.example.com"
+
+  @pytest.mark.asyncio
+  async def test_request_pins_ipv6_and_preserves_userinfo(
+      self, mock_tool_context, monkeypatch
+  ):
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+      if host == "ipv6.example.com":
+        return [(
+            socket.AF_INET6,
+            socket.SOCK_STREAM,
+            6,
+            "",
+            ("2001:4860:4860::8888", 0),
+        )]
+      raise socket.gaierror(8, "no")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    captured_request: list[httpx.Request] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+      captured_request.append(request)
+      return httpx.Response(200, json={"success": True})
+
+    transport = httpx.MockTransport(mock_handler)
+
+    def client_factory():
+      return httpx.AsyncClient(transport=transport)
+
+    tool = self._make_tool(
+        "https://user:pass@ipv6.example.com",
+        "/api",
+        httpx_client_factory=client_factory,
+    )
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+
+    assert response == {"success": True}
+    assert len(captured_request) == 1
+    sent = captured_request[0]
+    assert sent.url.host == "2001:4860:4860::8888"
+    assert sent.url.username == "user"
+    assert sent.url.password == "pass"
+    assert sent.headers["Host"] == "ipv6.example.com"
+
+  @pytest.mark.asyncio
+  async def test_request_overwrites_case_insensitive_host_header(
+      self, mock_tool_context
+  ):
+    captured_request: list[httpx.Request] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+      captured_request.append(request)
+      return httpx.Response(200, json={"success": True})
+
+    transport = httpx.MockTransport(mock_handler)
+
+    def client_factory():
+      return httpx.AsyncClient(transport=transport)
+
+    tool = self._make_tool(
+        "https://api.example.com",
+        "/api",
+        header_provider=lambda _ctx: {"host": "custom-host.com"},
+        httpx_client_factory=client_factory,
+    )
+    await tool.call(args={}, tool_context=mock_tool_context)
+
+    assert len(captured_request) == 1
+    sent = captured_request[0]
+    assert sent.headers.get("host") == "api.example.com"
+    host_keys = [k for k in sent.headers.keys() if k.lower() == "host"]
+    assert len(host_keys) == 1
+
+  @pytest.mark.asyncio
+  async def test_request_tries_next_address_on_connect_failure(
+      self, mock_tool_context, monkeypatch
+  ):
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+      if host == "two.example.com":
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.4.4", 0)),
+        ]
+      raise socket.gaierror(8, "no")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    seen_hosts: list[str] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+      seen_hosts.append(request.url.host)
+      if request.url.host == "8.8.8.8":
+        raise httpx.ConnectError("simulated connect failure")
+      return httpx.Response(200, json={"ok": True})
+
+    transport = httpx.MockTransport(mock_handler)
+
+    def client_factory():
+      return httpx.AsyncClient(transport=transport)
+
+    tool = self._make_tool(
+        "https://two.example.com",
+        "/path",
+        httpx_client_factory=client_factory,
+    )
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+
+    assert response == {"ok": True}
+    assert seen_hosts == ["8.8.8.8", "8.8.4.4"]
+
+  @pytest.mark.asyncio
+  async def test_request_does_not_retry_on_read_timeout(
+      self, mock_tool_context, monkeypatch
+  ):
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+      if host == "two.example.com":
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.4.4", 0)),
+        ]
+      raise socket.gaierror(8, "no")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    seen_hosts: list[str] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+      seen_hosts.append(request.url.host)
+      raise httpx.ReadTimeout("simulated read timeout")
+
+    transport = httpx.MockTransport(mock_handler)
+
+    def client_factory():
+      return httpx.AsyncClient(transport=transport)
+
+    tool = self._make_tool(
+        "https://two.example.com",
+        "/path",
+        httpx_client_factory=client_factory,
+    )
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+
+    assert "ReadTimeout" in response["error"]
+    assert seen_hosts == ["8.8.8.8"]
+
+  @pytest.mark.asyncio
+  async def test_request_does_not_follow_redirects_when_client_enables_them(
+      self, mock_tool_context
+  ):
+    captured_request: list[httpx.Request] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+      captured_request.append(request)
+      return httpx.Response(
+          302,
+          headers={"Location": "http://127.0.0.1/internal"},
+          json={"redirected": False},
+      )
+
+    transport = httpx.MockTransport(mock_handler)
+
+    def client_factory():
+      return httpx.AsyncClient(transport=transport, follow_redirects=True)
+
+    tool = self._make_tool(
+        "https://api.example.com",
+        "/v1/resource",
+        httpx_client_factory=client_factory,
+    )
+    await tool.call(args={}, tool_context=mock_tool_context)
+
+    assert len(captured_request) == 1
+
+  @pytest.mark.asyncio
+  async def test_request_with_proxy_skips_local_pinning(
+      self, mock_tool_context, monkeypatch
+  ):
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example.com:8080")
+    monkeypatch.setenv("NO_PROXY", "")
+
+    def fail_getaddrinfo(*args, **kwargs):
+      raise socket.gaierror(8, "nodename nor servname provided")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fail_getaddrinfo)
+    captured_request: list[httpx.Request] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+      captured_request.append(request)
+      return httpx.Response(200, json={"proxied": True})
+
+    transport = httpx.MockTransport(mock_handler)
+
+    def client_factory():
+      return httpx.AsyncClient(transport=transport)
+
+    tool = self._make_tool(
+        "http://example.com",
+        "/path",
+        httpx_client_factory=client_factory,
+    )
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+
+    assert response == {"proxied": True}
+    assert len(captured_request) == 1
+    assert captured_request[0].url.host == "example.com"
+
+  @pytest.mark.asyncio
+  async def test_request_with_proxy_blocks_hostname_resolving_to_blocked_ip(
+      self, mock_tool_context, monkeypatch
+  ):
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example.com:8080")
+    monkeypatch.setenv("NO_PROXY", "")
+
+    def fake_getaddrinfo(*args, **kwargs):
+      return [
+          (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", 0))
+      ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    tool = self._make_tool(
+        "http://metadata.example.com",
+        "/latest/meta-data/",
+    )
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+    assert "Blocked host" in response["error"]
+    assert tool._detect_error_in_response(response) == "HTTP_ERROR"
+
+  @pytest.mark.asyncio
+  async def test_request_with_client_factory_proxy_skips_local_pinning(
+      self, mock_tool_context, monkeypatch
+  ):
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    monkeypatch.delenv("http_proxy", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("https_proxy", raising=False)
+    monkeypatch.delenv("ALL_PROXY", raising=False)
+    monkeypatch.delenv("all_proxy", raising=False)
+
+    def fail_getaddrinfo(*args, **kwargs):
+      raise socket.gaierror(8, "nodename nor servname provided")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fail_getaddrinfo)
+    captured_request: list[httpx.Request] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+      captured_request.append(request)
+      return httpx.Response(200, json={"proxied": True})
+
+    transport = httpx.MockTransport(mock_handler)
+
+    def client_factory():
+      return httpx.AsyncClient(
+          proxy="http://proxy.example.com:8080",
+          mounts={"all://": transport},
+          trust_env=False,
+      )
+
+    tool = self._make_tool(
+        "https://example.com",
+        "/path",
+        httpx_client_factory=client_factory,
+    )
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+
+    assert response == {"proxied": True}
+    assert len(captured_request) == 1
+    assert captured_request[0].url.host == "example.com"
+
+  @pytest.mark.asyncio
+  async def test_request_with_trust_env_false_pins_ip_despite_http_proxy_env(
+      self, mock_tool_context, monkeypatch
+  ):
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example.com:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com:8080")
+    monkeypatch.setenv("NO_PROXY", "")
+    captured_request: list[httpx.Request] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+      captured_request.append(request)
+      return httpx.Response(200, json={"success": True})
+
+    transport = httpx.MockTransport(mock_handler)
+
+    def client_factory():
+      return httpx.AsyncClient(transport=transport, trust_env=False)
+
+    tool = self._make_tool(
+        "https://api.example.com:8443",
+        "/api",
+        httpx_client_factory=client_factory,
+    )
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+
+    assert response == {"success": True}
+    assert len(captured_request) == 1
+    sent = captured_request[0]
+    assert sent.url.host == "8.8.8.8"
+    assert sent.url.port == 8443
+    assert sent.headers["Host"] == "api.example.com:8443"
+    assert sent.extensions.get("sni_hostname") == "api.example.com"
+
+  @pytest.mark.asyncio
+  async def test_request_allows_private_network_when_enabled(
+      self, mock_tool_context, monkeypatch
+  ):
+    captured_request = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+      captured_request.append(request)
+      return httpx.Response(200, json={"success": True})
+
+    transport = httpx.MockTransport(mock_handler)
+
+    def client_factory():
+      return httpx.AsyncClient(transport=transport)
+
+    # Localhost should be allowed and not rewritten to IP when
+    # allow_private_network_access=True.
+    tool = self._make_tool(
+        "http://localhost:8080",
+        "/internal",
+        httpx_client_factory=client_factory,
+        allow_private_network_access=True,
+    )
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+    assert response == {"success": True}
+    assert len(captured_request) == 1
+    assert captured_request[0].url.host == "localhost"
+
+    captured_request.clear()
+    # Private IP literal should be allowed when
+    # allow_private_network_access=True.
+    tool = self._make_tool(
+        "http://10.0.0.1",
+        "/admin",
+        httpx_client_factory=client_factory,
+        allow_private_network_access=True,
+    )
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+    assert response == {"success": True}
+    assert len(captured_request) == 1
+    assert captured_request[0].url.host == "10.0.0.1"
+
+    captured_request.clear()
+
+    # Unresolvable / DNS-less host (e.g. httpx.ASGITransport on
+    # http://testserver) should bypass DNS resolution and IP pinning when
+    # allow_private_network_access=True.
+    def fail_getaddrinfo(*args, **kwargs):
+      raise socket.gaierror(8, "nodename nor servname provided")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fail_getaddrinfo)
+    tool = self._make_tool(
+        "http://testserver",
+        "/internal",
+        httpx_client_factory=client_factory,
+        allow_private_network_access=True,
+    )
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+    assert response == {"success": True}
+    assert len(captured_request) == 1
+    assert captured_request[0].url.host == "testserver"
+
+    captured_request.clear()
+
+    def redirect_handler(request: httpx.Request) -> httpx.Response:
+      captured_request.append(request)
+      if request.url.path == "/redirect":
+        return httpx.Response(
+            302,
+            headers={"Location": "http://localhost:8080/final"},
+        )
+      return httpx.Response(200, json={"redirected": True})
+
+    redirect_transport = httpx.MockTransport(redirect_handler)
+    redirect_tool = self._make_tool(
+        "http://localhost:8080",
+        "/redirect",
+        httpx_client_factory=lambda: httpx.AsyncClient(
+            transport=redirect_transport,
+            follow_redirects=True,
+        ),
+        allow_private_network_access=True,
+    )
+    response = await redirect_tool.call(args={}, tool_context=mock_tool_context)
+    assert response == {"redirected": True}
+    assert [r.url.path for r in captured_request] == ["/redirect", "/final"]
+
+  @pytest.mark.asyncio
+  async def test_openapi_toolset_forwards_allow_private_network_access(
+      self, mock_tool_context
+  ):
+    captured_request = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+      captured_request.append(request)
+      return httpx.Response(200, json={"ok": True})
+
+    transport = httpx.MockTransport(mock_handler)
+
+    def client_factory():
+      return httpx.AsyncClient(transport=transport)
+
+    spec_dict = {
+        "openapi": "3.0.0",
+        "info": {"title": "Local API", "version": "1.0.0"},
+        "servers": [{"url": "http://127.0.0.1:8081"}],
+        "paths": {
+            "/items": {
+                "get": {
+                    "operationId": "listItems",
+                    "responses": {"200": {"description": "OK"}},
+                }
+            }
+        },
+    }
+
+    default_toolset = OpenAPIToolset(
+        spec_dict=spec_dict,
+        httpx_client_factory=client_factory,
+    )
+    default_tool = default_toolset.get_tool("list_items")
+    assert default_tool is not None
+    default_response = await default_tool.call(
+        args={}, tool_context=mock_tool_context
+    )
+    assert "Blocked host" in default_response["error"]
+
+    private_toolset = OpenAPIToolset(
+        spec_dict=spec_dict,
+        httpx_client_factory=client_factory,
+        allow_private_network_access=True,
+    )
+    private_tool = private_toolset.get_tool("list_items")
+    assert private_tool is not None
+    response = await private_tool.call(args={}, tool_context=mock_tool_context)
+    assert response == {"ok": True}
+    assert len(captured_request) == 1
+    assert captured_request[0].url.host == "127.0.0.1"
+
+  @pytest.mark.asyncio
+  async def test_request_pins_idn_hostname_with_punycode_host_header(
+      self, mock_tool_context, monkeypatch
+  ):
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+      if host == "xn--strae-oqa.example":
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 0))]
+      raise socket.gaierror(8, "no")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    captured_request: list[httpx.Request] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+      captured_request.append(request)
+      return httpx.Response(200, json={"success": True})
+
+    transport = httpx.MockTransport(mock_handler)
+
+    def client_factory():
+      return httpx.AsyncClient(transport=transport)
+
+    tool = self._make_tool(
+        "https://straße.example:8443",
+        "/api",
+        httpx_client_factory=client_factory,
+    )
+    response = await tool.call(args={}, tool_context=mock_tool_context)
+
+    assert response == {"success": True}
+    assert len(captured_request) == 1
+    sent = captured_request[0]
+    assert sent.url.host == "8.8.8.8"
+    assert sent.url.port == 8443
+    assert sent.headers["Host"] == "xn--strae-oqa.example:8443"
+    assert sent.extensions.get("sni_hostname") == "xn--strae-oqa.example"
+
+  @pytest.mark.asyncio
+  async def test_request_with_client_cert_pins_mtls_googleapis_host(
+      self, mock_tool_context, mock_client_cert_ssl_context, monkeypatch
+  ):
+    """Validation, pinning, Host and SNI all use the mTLS host."""
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+      if host == "aiplatform.mtls.googleapis.com":
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 0))]
+      raise socket.gaierror(8, "no")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    client_cert_ctx = ssl.create_default_context()
+    mock_client_cert_ssl_context.return_value = client_cert_ctx
+    captured_request: list[httpx.Request] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+      captured_request.append(request)
+      return httpx.Response(200, json={"success": True})
+
+    transport = httpx.MockTransport(mock_handler)
+    real_async_client = httpx.AsyncClient
+    tool = self._make_tool("https://aiplatform.googleapis.com", "/v1/models")
+
+    with patch.object(
+        httpx,
+        "AsyncClient",
+        side_effect=lambda **kwargs: real_async_client(
+            transport=transport, **kwargs
+        ),
+    ) as mock_async_client:
+      response = await tool.call(args={}, tool_context=mock_tool_context)
+
+    assert response == {"success": True}
+    assert mock_async_client.call_args.kwargs["verify"] is client_cert_ctx
+    assert len(captured_request) == 1
+    sent = captured_request[0]
+    assert sent.url.host == "8.8.8.8"
+    assert sent.url.path == "/v1/models"
+    assert sent.headers["Host"] == "aiplatform.mtls.googleapis.com"
+    assert (
+        sent.extensions.get("sni_hostname") == "aiplatform.mtls.googleapis.com"
+    )
+
+  @pytest.mark.asyncio
+  async def test_apihub_toolset_forwards_allow_private_network_access(
+      self, mock_tool_context
+  ):
+    spec_str = json.dumps({
+        "openapi": "3.0.0",
+        "info": {"title": "Local API", "version": "1.0.0"},
+        "servers": [{"url": "http://127.0.0.1:8081"}],
+        "paths": {
+            "/items": {
+                "get": {
+                    "operationId": "listItems",
+                    "responses": {"200": {"description": "OK"}},
+                }
+            }
+        },
+    })
+
+    class _LocalAPIHubClient(BaseAPIHubClient):
+
+      def get_spec_content(self, _apihub_resource_name: str) -> str:
+        return spec_str
+
+    default_toolset = APIHubToolset(
+        apihub_resource_name="test_resource",
+        apihub_client=_LocalAPIHubClient(),
+    )
+    default_tools = await default_toolset.get_tools()
+    assert len(default_tools) == 1
+    assert default_tools[0]._allow_private_network_access is False
+    default_response = await default_tools[0].call(
+        args={}, tool_context=mock_tool_context
+    )
+    assert "Blocked host" in default_response["error"]
+
+    private_toolset = APIHubToolset(
+        apihub_resource_name="test_resource",
+        apihub_client=_LocalAPIHubClient(),
+        allow_private_network_access=True,
+    )
+    private_tools = await private_toolset.get_tools()
+    assert len(private_tools) == 1
+    assert private_tools[0]._allow_private_network_access is True
+
+  @pytest.mark.asyncio
+  async def test_app_integration_toolset_forwards_allow_private_network_access(
+      self,
+  ):
+    spec_dict = {
+        "openapi": "3.0.0",
+        "info": {"title": "Local API", "version": "1.0.0"},
+        "servers": [{"url": "http://127.0.0.1:8081"}],
+        "paths": {
+            "/items": {
+                "get": {
+                    "operationId": "listItems",
+                    "x-entity": "Items",
+                    "x-operation": "LIST_ENTITIES",
+                    "responses": {"200": {"description": "OK"}},
+                }
+            }
+        },
+    }
+
+    target_module = application_integration_tool.application_integration_toolset
+    toolset_cls = application_integration_tool.ApplicationIntegrationToolset
+    with (
+        patch.object(target_module, "IntegrationClient") as mock_integration,
+        patch.object(target_module, "ConnectionsClient") as mock_connections,
+    ):
+      integration_client = mock_integration.return_value
+      integration_client.get_openapi_spec_for_integration.return_value = (
+          spec_dict
+      )
+      integration_client.get_openapi_spec_for_connection.return_value = (
+          spec_dict
+      )
+      mock_connections.return_value.get_connection_details.return_value = {
+          "serviceName": "test-service",
+          "host": "127.0.0.1",
+          "name": "test-connection",
+      }
+
+      default_integration = toolset_cls(
+          "test-project",
+          "us-central1",
+          integration="test-integration",
+      )
+      default_integration_tools = await default_integration.get_tools()
+      assert len(default_integration_tools) == 1
+      assert default_integration_tools[0]._allow_private_network_access is False
+
+      private_integration = toolset_cls(
+          "test-project",
+          "us-central1",
+          integration="test-integration",
+          allow_private_network_access=True,
+      )
+      private_integration_tools = await private_integration.get_tools()
+      assert len(private_integration_tools) == 1
+      assert private_integration_tools[0]._allow_private_network_access is True
+
+      default_connection = toolset_cls(
+          "test-project",
+          "us-central1",
+          connection="test-connection",
+          entity_operations=["list"],
+      )
+      default_connection_tools = await default_connection.get_tools()
+      assert len(default_connection_tools) == 1
+      assert (
+          default_connection_tools[
+              0
+          ]._rest_api_tool._allow_private_network_access
+          is False
+      )
+
+      private_connection = toolset_cls(
+          "test-project",
+          "us-central1",
+          connection="test-connection",
+          entity_operations=["list"],
+          allow_private_network_access=True,
+      )
+      private_connection_tools = await private_connection.get_tools()
+      assert len(private_connection_tools) == 1
+      assert (
+          private_connection_tools[
+              0
+          ]._rest_api_tool._allow_private_network_access
+          is True
+      )

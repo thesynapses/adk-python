@@ -15,13 +15,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import contextlib
 import copy
 from functools import cached_property
 import logging
+import os
 import re
 from typing import Any
 from typing import AsyncGenerator
+from typing import AsyncIterator
 from typing import cast
 from typing import Optional
 from typing import TYPE_CHECKING
@@ -31,13 +34,21 @@ from urllib.parse import urlunparse
 
 from google.genai import types
 from google.genai.errors import ClientError
+from pydantic import ConfigDict
+from pydantic import Field
 from typing_extensions import override
 
+from google import genai
+
+from ..utils._event_loop_cache import PerLoopCachedProperty
+from ..utils._gcp_metadata import get_gcp_client_defaults
 from ..utils._google_client_headers import get_tracking_headers
 from ..utils._google_client_headers import merge_tracking_headers
 from ..utils.context_utils import Aclosing
 from ..utils.streaming_utils import StreamingResponseAggregator
 from ..utils.variant_utils import GoogleLLMVariant
+from ._capabilities import gemini_output_schema_and_tools
+from ._capabilities import LlmCapabilities
 from .base_llm import BaseLlm
 from .base_llm_connection import BaseLlmConnection
 from .gemini_llm_connection import GeminiLlmConnection
@@ -53,6 +64,7 @@ logger = logging.getLogger('google_adk.' + __name__)
 _NEW_LINE = '\n'
 _EXCLUDED_PART_FIELD = {'inline_data': {'data'}}
 _GOOGLE_API_VERSION_SUFFIX_PATTERN = re.compile(r'/?(v[0-9][a-z0-9.-]*)/?')
+_API_VERSION_ENV_VARIABLE_NAME = 'GOOGLE_GENAI_API_VERSION'
 
 
 _RESOURCE_EXHAUSTED_POSSIBLE_FIX_MESSAGE = """
@@ -75,7 +87,7 @@ class _ResourceExhaustedError(ClientError):
         response=client_error.response,
     )
 
-  def __str__(self):
+  def __str__(self) -> str:
     # We don't get override the actual message on ClientError, so we override
     # this method instead. This will ensure that when the exception is
     # stringified (for either publishing the exception on console or to logs)
@@ -94,28 +106,66 @@ class Gemini(BaseLlm):
 
   Customizing the underlying Client:
     To set ``google.genai.Client`` options ADK doesn't expose as fields
-    directly (location, project, credentials, http_options, etc.),
-    subclass ``Gemini`` and override the ``api_client`` property::
+    directly (location, project, credentials, http_options, etc.), pass them
+    in ``client_kwargs``::
 
-        from functools import cached_property
         from google.adk.models import Gemini
-        from google.genai import Client
 
-        class GlobalGemini(Gemini):
-          @cached_property
-          def api_client(self) -> Client:
-            return Client(enterprise=True, location="global")
+        agent = Agent(
+            model=Gemini(
+                model="gemini-3-pro-preview",
+                client_kwargs={"enterprise": True, "location": "global"},
+            )
+        )
 
-        agent = Agent(model=GlobalGemini(model="gemini-3-pro-preview"))
-
-    Use ``@property`` instead of ``@cached_property`` if you hit asyncio
-    lock contention in multithreaded code.
+    They are applied to every client this model builds, so the client stays
+    one per event loop. Overriding the ``api_client`` property instead pins a
+    single client to the model for its lifetime, which reaches into a closed
+    loop as soon as a second loop uses the model.
   """
+
+  # Pydantic exempts functools.cached_property by module name rather than by
+  # type, so the descriptor behind the per-loop clients has to be named here to
+  # be read as a descriptor rather than as an undeclared field.
+  model_config = ConfigDict(ignored_types=(PerLoopCachedProperty,))
 
   model: str = 'gemini-2.5-flash'
 
+  client: Optional[genai.Client] = Field(default=None, exclude=True)
+  """An optional pre-configured google-genai Client.
+
+  When provided, this client will be used for all API calls instead of
+  constructing a new one from environment variables or other attributes.
+  """
+
+  client_kwargs: Optional[dict[str, Any]] = Field(
+      default=None, exclude=True, repr=False
+  )
+  """Extra arguments to pass to the google.genai.Client constructor."""
+
   base_url: Optional[str] = None
   """The base URL for the AI platform service endpoint."""
+
+  api_version: Optional[str] = None
+  """The API version to use for the AI platform service endpoint.
+
+  For the Vertex AI backend the google-genai SDK defaults to ``v1beta1``, which
+  exposes the latest preview features. Production deployments that require a
+  stable, SLA-eligible endpoint can set this to ``v1`` to use the GA Vertex AI
+  API. When unset, the ``GOOGLE_GENAI_API_VERSION`` environment variable is
+  consulted, and finally the SDK's own default is used so existing behavior is
+  unchanged.
+
+  An API version embedded in the ``base_url`` path (e.g. a trailing ``/v1``)
+  takes precedence over this field.
+
+  Sample:
+  ```python
+  from google.adk.models import Gemini
+
+  agent = Agent(model=Gemini(model="gemini-2.5-pro", api_version="v1"))
+  ```
+  """
 
   speech_config: Optional[types.SpeechConfig] = None
 
@@ -189,11 +239,14 @@ class Gemini(BaseLlm):
     """
     await self._preprocess_request(llm_request)
     self._maybe_append_user_content(llm_request)
+    model = llm_request.model
+    if model is None:
+      raise ValueError('Gemini requests require a model name.')
 
     # Handle context caching if configured
     cache_metadata = None
     cache_manager = None
-    if llm_request.cache_config:
+    if llm_request.cache_config and not self.use_interactions_api:
       from ..telemetry.tracing import tracer
       from .gemini_context_cache_manager import GeminiContextCacheManager
 
@@ -220,11 +273,13 @@ class Gemini(BaseLlm):
     if llm_request.config:
       if not llm_request.config.http_options:
         llm_request.config.http_options = types.HttpOptions()
-      llm_request.config.http_options.headers = self._merge_tracking_headers(
-          llm_request.config.http_options.headers
+      llm_request.config.http_options.headers = merge_tracking_headers(
+          llm_request.config.http_options.headers or {}
       )
       _, api_version = self._base_url_and_api_version
-      if api_version:
+      if api_version is None:
+        api_version = self.api_version
+      if api_version and not llm_request.config.http_options.api_version:
         llm_request.config.http_options.api_version = api_version
 
     try:
@@ -236,12 +291,19 @@ class Gemini(BaseLlm):
           yield llm_response
         return
 
-      logger.debug(_build_request_log(llm_request))
+      if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(_build_request_log(llm_request))
+
+      from ..telemetry._genai_instrumentor import maybe_without_genai_instrumentation
+
+      api_models = self.api_client.aio.models
 
       if stream:
-        responses = await self.api_client.aio.models.generate_content_stream(
-            model=llm_request.model,
-            contents=llm_request.contents,
+        responses = await maybe_without_genai_instrumentation(
+            api_models.generate_content_stream
+        )(
+            model=model,
+            contents=cast(list[types.ContentUnion], llm_request.contents),
             config=llm_request.config,
         )
 
@@ -252,36 +314,73 @@ class Gemini(BaseLlm):
         # only difference is bidi rely on complete_turn flag to detect end while
         # sse depends on finish_reason.
         aggregator = StreamingResponseAggregator()
-        async with Aclosing(responses) as agen:
+        multiple_candidates_logged = False
+        last_usage_metadata = None
+        # genai implements generate_content_stream as an async generator.
+        response_stream = cast(
+            AsyncGenerator[types.GenerateContentResponse, None], responses
+        )
+        async with Aclosing(response_stream) as agen:
           async for response in agen:
             if logger.isEnabledFor(logging.DEBUG):
               logger.debug(_build_response_log(response))
+            if response.usage_metadata:
+              last_usage_metadata = response.usage_metadata
+            if (
+                not multiple_candidates_logged
+                and response.candidates
+                and (
+                    len(response.candidates) > 1
+                    or any(c.index for c in response.candidates)
+                )
+            ):
+              multiple_candidates_logged = True
+              logger.error(
+                  'Multiple candidates found in streaming response but only the'
+                  ' first one will be used.'
+              )
+            if response.candidates:
+              response.candidates = [
+                  c for c in response.candidates if not c.index
+              ]
+              if not response.candidates:
+                continue
             async with Aclosing(
                 aggregator.process_response(response)
             ) as aggregator_gen:
               async for llm_response in aggregator_gen:
                 yield llm_response
         if (close_result := aggregator.close()) is not None:
+          if last_usage_metadata:
+            close_result.usage_metadata = last_usage_metadata
           # Populate cache metadata in the final aggregated response for
           # streaming
-          if cache_metadata:
+          if cache_metadata and cache_manager is not None:
             cache_manager.populate_cache_metadata_in_response(
                 close_result, cache_metadata
             )
           yield close_result
 
       else:
-        response = await self.api_client.aio.models.generate_content(
-            model=llm_request.model,
-            contents=llm_request.contents,
+        response = await maybe_without_genai_instrumentation(
+            api_models.generate_content
+        )(
+            model=model,
+            contents=cast(list[types.ContentUnion], llm_request.contents),
             config=llm_request.config,
         )
         logger.info('Response received from the model.')
         if logger.isEnabledFor(logging.DEBUG):
           logger.debug(_build_response_log(response))
 
+        if response.candidates and len(response.candidates) > 1:
+          logger.error(
+              'Multiple candidates found in response but only the first one'
+              ' will be used.'
+          )
+
         llm_response = LlmResponse.create(response)
-        if cache_metadata:
+        if cache_metadata and cache_manager is not None:
           cache_manager.populate_cache_metadata_in_response(
               llm_response, cache_metadata
           )
@@ -322,19 +421,35 @@ class Gemini(BaseLlm):
         api_client=self.api_client,
         llm_request=llm_request,
         stream=stream,
+        service_tier=llm_request.service_tier,
     ):
       yield llm_response
 
-  @cached_property
+  @property
+  @override
+  def capabilities(self) -> LlmCapabilities:
+    # Declared here rather than inherited from BaseLlm: the base implementation
+    # is a deprecated fallback that warns and will be removed, whereas this is
+    # Gemini's permanent self-report.
+    return LlmCapabilities(
+        output_schema_and_tools=gemini_output_schema_and_tools(self.model),
+    )
+
+  @PerLoopCachedProperty
   def api_client(self) -> Client:
     """Provides the api client.
 
     Returns:
       The api client.
     """
+    if self.client:
+      return self.client
+
     from google.genai import Client
 
     base_url, api_version = self._base_url_and_api_version
+    if api_version is None:
+      api_version = self._configured_api_version()
     kwargs_for_http_options: dict[str, Any] = {
         'headers': self._tracking_headers(),
         'retry_options': self.retry_options,
@@ -342,12 +457,20 @@ class Gemini(BaseLlm):
     }
     if api_version:
       kwargs_for_http_options['api_version'] = api_version
+    adk_http_options = types.HttpOptions(**kwargs_for_http_options)
 
-    kwargs: dict[str, Any] = {
-        'http_options': types.HttpOptions(**kwargs_for_http_options),
-    }
+    kwargs: dict[str, Any] = {'http_options': adk_http_options}
     if self.model.startswith('projects/'):
       kwargs['enterprise'] = True
+
+    client_kwargs = getattr(self, 'client_kwargs', None)
+    if not self.model.startswith('projects/'):
+      kwargs.update(get_gcp_client_defaults(client_kwargs))
+    if client_kwargs:
+      kwargs.update(client_kwargs)
+    kwargs['http_options'] = self._with_adk_http_options(
+        kwargs['http_options'], adk_http_options
+    )
 
     return Client(**kwargs)
 
@@ -361,6 +484,21 @@ class Gemini(BaseLlm):
 
   def _tracking_headers(self) -> dict[str, str]:
     return get_tracking_headers()
+
+  def _configured_api_version(self) -> Optional[str]:
+    """Returns the explicitly configured API version, if any.
+
+    Resolution order:
+      1. The ``api_version`` field set on this instance.
+      2. The ``GOOGLE_GENAI_API_VERSION`` environment variable.
+
+    Returns ``None`` when neither is set, in which case the google-genai SDK's
+    own default (``v1beta1`` for Vertex AI) applies, preserving existing
+    behavior.
+    """
+    if self.api_version:
+      return self.api_version
+    return os.environ.get(_API_VERSION_ENV_VARIABLE_NAME) or None
 
   @cached_property
   def _base_url_and_api_version(self) -> tuple[Optional[str], Optional[str]]:
@@ -378,26 +516,70 @@ class Gemini(BaseLlm):
       # use v1alpha for using API KEY from Google AI Studio
       return 'v1alpha'
 
-  @cached_property
+  @PerLoopCachedProperty
   def _live_api_client(self) -> Client:
+    if self.client:
+      return self.client
+
     from google.genai import Client
 
     base_url, _ = self._base_url_and_api_version
 
-    kwargs: dict[str, Any] = {
-        'http_options': types.HttpOptions(
-            headers=self._tracking_headers(),
-            api_version=self._live_api_version,
-            base_url=base_url,
-        )
-    }
+    adk_http_options = types.HttpOptions(
+        headers=self._tracking_headers(),
+        api_version=self._live_api_version,
+        base_url=base_url,
+    )
+    kwargs: dict[str, Any] = {'http_options': adk_http_options}
     if self.model.startswith('projects/'):
       kwargs['enterprise'] = True
 
+    client_kwargs = getattr(self, 'client_kwargs', None)
+    if not self.model.startswith('projects/'):
+      kwargs.update(get_gcp_client_defaults(client_kwargs))
+    if client_kwargs:
+      kwargs.update(client_kwargs)
+    kwargs['http_options'] = self._with_adk_http_options(
+        kwargs['http_options'], adk_http_options
+    )
+
     return Client(**kwargs)
 
+  def _with_adk_http_options(
+      self,
+      http_options: Optional[types.HttpOptionsOrDict],
+      adk_http_options: types.HttpOptions,
+  ) -> types.HttpOptions:
+    """Returns a copy of http_options with ADK's options merged in.
+
+    ``client_kwargs['http_options']`` replaces the http_options ADK builds as a
+    whole, so ADK's tracking headers are merged back in afterwards, and ADK's
+    ``api_version``, ``base_url`` and ``retry_options`` fill the fields the
+    caller left unset. Fields the caller set win.
+
+    Args:
+      http_options: The http_options the client is about to be built with.
+      adk_http_options: The http_options ADK built for the client.
+
+    Returns:
+      A copy of http_options with ADK's options merged in.
+    """
+    if http_options is None:
+      http_options = types.HttpOptions()
+    elif isinstance(http_options, dict):
+      http_options = types.HttpOptions.model_validate(http_options)
+    else:
+      http_options = http_options.model_copy()
+    for field in ('api_version', 'base_url', 'retry_options'):
+      if getattr(http_options, field) is None:
+        setattr(http_options, field, getattr(adk_http_options, field))
+    http_options.headers = merge_tracking_headers(http_options.headers or {})
+    return http_options
+
   @contextlib.asynccontextmanager
-  async def connect(self, llm_request: LlmRequest) -> BaseLlmConnection:
+  async def connect(
+      self, llm_request: LlmRequest
+  ) -> AsyncIterator[BaseLlmConnection]:
     """Connects to the Gemini model and returns an llm connection.
 
     Args:
@@ -405,32 +587,33 @@ class Gemini(BaseLlm):
 
     Yields:
       BaseLlmConnection, the connection to the Gemini model.
+
+    Raises:
+      ValueError: If ``live_connect_config`` sets ``http_options``, which
+        google-genai only accepts on the client for the Live API.
     """
-    # add tracking headers to custom headers and set api_version given
-    # the customized http options will override the one set in the api client
-    # constructor
     if (
         llm_request.live_connect_config
         and llm_request.live_connect_config.http_options
     ):
-      if not llm_request.live_connect_config.http_options.headers:
-        llm_request.live_connect_config.http_options.headers = {}
-      llm_request.live_connect_config.http_options.headers = (
-          self._merge_tracking_headers(
-              llm_request.live_connect_config.http_options.headers
-          )
-      )
-      llm_request.live_connect_config.http_options.api_version = (
-          self._live_api_version
+      raise ValueError(
+          'The Live API does not support request-level http_options in'
+          ' live_connect_config. Set them on the client instead, e.g.'
+          " Gemini(client_kwargs={'http_options': ...})."
       )
 
     if self.speech_config is not None:
       llm_request.live_connect_config.speech_config = self.speech_config
 
+    # Assigned unconditionally. With no system instruction the previous
+    # behavior still sent Content(role='system', parts=[Part()]); skipping the
+    # assignment changes what goes on the wire for every live connect.
     llm_request.live_connect_config.system_instruction = types.Content(
         role='system',
         parts=[
-            types.Part.from_text(text=llm_request.config.system_instruction)
+            types.Part.from_text(
+                text=cast(str, llm_request.config.system_instruction)
+            )
         ],
     )
 
@@ -455,15 +638,39 @@ class Gemini(BaseLlm):
             ' backend. Please use Vertex AI backend.'
         )
     llm_request.live_connect_config.tools = llm_request.config.tools
-    logger.debug('Connecting to live with llm_request:%s', llm_request)
+    if llm_request.config.thinking_config is not None:
+      llm_request.live_connect_config.thinking_config = (
+          llm_request.config.thinking_config
+      )
+    # Safety settings are configured via LlmAgent.generate_content_config, which
+    # only populates llm_request.config. Forward them so live runs honor the
+    # same safety configuration as non-live runs. An explicitly provided
+    # live_connect_config value takes precedence.
+    if (
+        llm_request.config.safety_settings is not None
+        and llm_request.live_connect_config.safety_settings is None
+    ):
+      llm_request.live_connect_config.safety_settings = (
+          llm_request.config.safety_settings
+      )
+    logger.debug(
+        'Connecting to live with model: %s, contents: %d, response modalities:'
+        ' %s',
+        llm_request.model,
+        len(llm_request.contents or []),
+        llm_request.live_connect_config.response_modalities,
+    )
     logger.debug('Live connect config: %s', llm_request.live_connect_config)
+    model = llm_request.model
+    if model is None:
+      raise ValueError('Live Gemini requests require a model name.')
     async with self._live_api_client.aio.live.connect(
-        model=llm_request.model, config=llm_request.live_connect_config
+        model=model, config=llm_request.live_connect_config
     ) as live_session:
       yield GeminiLlmConnection(
           live_session,
           api_backend=self._api_backend,
-          model_version=llm_request.model,
+          model_version=model,
       )
 
   async def _adapt_computer_use_tool(self, llm_request: LlmRequest) -> None:
@@ -471,17 +678,25 @@ class Gemini(BaseLlm):
 
     from ..tools.computer_use.computer_use_toolset import ComputerUseToolset
 
-    async def convert_wait_to_wait_5_seconds(wait_func):
-      async def wait_5_seconds(tool_context=None):
+    async def convert_wait_to_wait_5_seconds(
+        wait_func: Callable[..., Any],
+    ) -> Callable[..., Any]:
+      async def wait_5_seconds(tool_context: Any = None) -> Any:
         return await wait_func(5, tool_context=tool_context)
 
       return wait_5_seconds
 
+    wait_tool = llm_request.tools_dict.get('wait')
     await ComputerUseToolset.adapt_computer_use_tool(
-        'wait', convert_wait_to_wait_5_seconds, llm_request
+        'wait',
+        convert_wait_to_wait_5_seconds,
+        llm_request,
     )
+    if wait_tool is not None and 'wait_5_seconds' in llm_request.tools_dict:
+      llm_request.tools_dict['wait'] = wait_tool
 
   async def _preprocess_request(self, llm_request: LlmRequest) -> None:
+    from ..tools import load_artifacts_tool  # pylint: disable=import-outside-toplevel
 
     if self._api_backend == GoogleLLMVariant.GEMINI_API:
       # Using API key from Google AI Studio to call model doesn't support labels.
@@ -509,9 +724,23 @@ class Gemini(BaseLlm):
           llm_request.config.system_instruction = None
           await self._adapt_computer_use_tool(llm_request)
 
-  def _merge_tracking_headers(self, headers: dict[str, str]) -> dict[str, str]:
-    """Merge tracking headers to the given headers."""
-    return merge_tracking_headers(headers)
+    # Sanitize inputs by ensuring unsupported inline types (e.g. DOCX from UI)
+    # are converted to plain text using load_artifacts_tool.as_safe_part_for_llm.
+    if llm_request.contents:
+      for content in llm_request.contents:
+        if not content.parts:
+          continue
+        new_parts = []
+        for part in content.parts:
+          if part.inline_data:
+            # GE inline_data does not preserve filenames, so we pass a dummy
+            # 'inline-file' name as a placeholder for
+            # as_safe_part_for_llm's required artifact_name argument.
+            part = load_artifacts_tool.as_safe_part_for_llm(  # pylint: disable=protected-access
+                part, 'inline-file'
+            )
+          new_parts.append(part)
+        content.parts = new_parts
 
 
 def _build_function_declaration_log(
@@ -542,10 +771,10 @@ def _build_request_log(req: LlmRequest) -> str:
 
   if req.config.tools:
     for idx, tool in enumerate(req.config.tools):
+      if not isinstance(tool, types.Tool):
+        continue
       if tool.function_declarations:
-        function_decls = cast(
-            list[types.FunctionDeclaration], tool.function_declarations
-        )
+        function_decls = tool.function_declarations
         function_decl_tool_index = idx
         break
 
@@ -562,7 +791,8 @@ def _build_request_log(req: LlmRequest) -> str:
           exclude_none=True,
           exclude={
               'parts': {
-                  i: _EXCLUDED_PART_FIELD for i in range(len(content.parts))
+                  i: _EXCLUDED_PART_FIELD
+                  for i in range(len(content.parts or []))
               }
           },
       )
@@ -583,11 +813,24 @@ def _build_request_log(req: LlmRequest) -> str:
             exclude={
                 'system_instruction': True,
                 'tools': tools_exclusion if req.config.tools else True,
+                # `http_options` is excluded whole, not field by field.
+                # `headers` commonly holds an Authorization bearer token,
+                # `extra_body` and the `*client_args` passthroughs can hold
+                # auth material, and `base_url` carries the credential
+                # itself when the caller points at a signed endpoint or an
+                # authenticating proxy. Naming the sensitive fields instead
+                # would also start logging every field the genai SDK adds
+                # later. The live path excludes it the same way; the trace
+                # spans built in telemetry/tracing.py still name the fields
+                # one by one.
+                'http_options': True,
             },
         )
     )
   except Exception:
-    config_log = repr(req.config)
+    # Do not fall back to repr(req.config) here: an unredacted repr would
+    # reintroduce the same credential leak this function exists to avoid.
+    config_log = '<error building config log>'
 
   return f"""
 LLM Request:
@@ -650,7 +893,7 @@ Raw response:
 
 def _remove_display_name_if_present(
     data_obj: Union[types.Blob, types.FileData, None],
-):
+) -> None:
   """Sets display_name to None for the Gemini API (non-Vertex) backend.
 
   This backend does not support the display_name parameter for file uploads,

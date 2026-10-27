@@ -22,7 +22,6 @@ from google.genai import types
 from typing_extensions import override
 
 from ..agents.readonly_context import ReadonlyContext
-from ..utils.model_name_utils import is_gemini_1_model
 from ..utils.model_name_utils import is_gemini_model
 from ..utils.model_name_utils import is_gemini_model_id_check_disabled
 from .base_tool import BaseTool
@@ -31,7 +30,8 @@ from .tool_context import ToolContext
 logger = logging.getLogger('google_adk.' + __name__)
 
 if TYPE_CHECKING:
-  from ..models import LlmRequest
+  from ..models.llm_request import LlmRequest
+  from .discovery_engine_search_tool import DiscoveryEngineSearchTool
 
 
 class VertexAiSearchTool(BaseTool):
@@ -72,6 +72,8 @@ class VertexAiSearchTool(BaseTool):
       filter: Optional[str] = None,
       max_results: Optional[int] = None,
       bypass_multi_tools_limit: bool = False,
+      name: Optional[str] = None,
+      description: Optional[str] = None,
   ):
     """Initializes the Vertex AI Search tool.
 
@@ -87,13 +89,29 @@ class VertexAiSearchTool(BaseTool):
       max_results: The maximum number of results to return.
       bypass_multi_tools_limit: Whether to bypass the multi tools limitation,
         so that the tool can be used with other tools in the same agent.
+      name: Optional name for the tool. Defaults to "vertex_ai_search", or
+        "discovery_engine_search" when substituted with
+        DiscoveryEngineSearchTool via bypass_multi_tools_limit=True. When the
+        tool is not substituted with DiscoveryEngineSearchTool, this only labels
+        the BaseTool instance and is not sent to the model or exposed as a
+        declaration.
+      description: Optional description for the tool. Defaults to
+        "vertex_ai_search", or the DiscoveryEngineSearchTool function docstring
+        when substituted with DiscoveryEngineSearchTool via
+        bypass_multi_tools_limit=True. When the tool is not substituted with
+        DiscoveryEngineSearchTool, this only labels the BaseTool instance and is
+        not sent to the model or exposed as a declaration.
 
     Raises:
       ValueError: If both data_store_id and search_engine_id are not specified
       or both are specified.
     """
-    # Name and description are not used because this is a model built-in tool.
-    super().__init__(name='vertex_ai_search', description='vertex_ai_search')
+    super().__init__(
+        name=name or 'vertex_ai_search',
+        description=description or 'vertex_ai_search',
+    )
+    self._custom_name = name
+    self._custom_description = description
     if (data_store_id is None and search_engine_id is None) or (
         data_store_id is not None and search_engine_id is not None
     ):
@@ -110,6 +128,25 @@ class VertexAiSearchTool(BaseTool):
     self.filter = filter
     self.max_results = max_results
     self.bypass_multi_tools_limit = bypass_multi_tools_limit
+
+  def _to_discovery_engine_search_tool(self) -> DiscoveryEngineSearchTool:
+    try:
+      from .discovery_engine_search_tool import DiscoveryEngineSearchTool
+    except ImportError as e:
+      raise ImportError(
+          'VertexAiSearchTool with bypass_multi_tools_limit=True requires'
+          ' the google-cloud-discoveryengine package. Install it with'
+          ' `pip install google-adk[gcp]`.'
+      ) from e
+    return DiscoveryEngineSearchTool(
+        data_store_id=self.data_store_id,
+        data_store_specs=self.data_store_specs,
+        search_engine_id=self.search_engine_id,
+        filter=self.filter,
+        max_results=self.max_results,
+        name=self._custom_name,
+        description=self._custom_description,
+    )
 
   def _build_vertex_ai_search_config(
       self, readonly_context: ReadonlyContext
@@ -147,12 +184,6 @@ class VertexAiSearchTool(BaseTool):
     llm_request.config.tools = llm_request.config.tools or []
 
     if is_gemini_model(llm_request.model) or model_check_disabled:
-      if is_gemini_1_model(llm_request.model) and llm_request.config.tools:
-        raise ValueError(
-            'Vertex AI search tool cannot be used with other tools in Gemini'
-            ' 1.x.'
-        )
-
       # Build the search config (can be overridden by subclasses)
       vertex_ai_search_config = self._build_vertex_ai_search_config(
           tool_context

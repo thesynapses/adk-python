@@ -14,78 +14,82 @@
 
 from __future__ import annotations
 
-import dataclasses
-from typing import Sequence
+from typing import Any
+from typing import AsyncGenerator
 
-from google.adk.agents.llm_agent import Agent
-from google.adk.telemetry import _metrics
+from google.adk.models.llm_response import LlmResponse
+from google.adk.telemetry import _genai_instrumentor
 from google.adk.telemetry import tracing
-from google.adk.tools import FunctionTool
-from google.adk.tools.base_tool import BaseTool
-from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
-from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
-from google.adk.tools.tool_context import ToolContext
-from google.genai import types
-from google.genai.types import Part
-from mcp import ClientSession as McpClientSession
-from mcp import StdioServerParameters
-from mcp.types import ListToolsResult
-from mcp.types import PaginatedRequestParams
-from mcp.types import Tool as McpTool
-from opentelemetry import trace
 from opentelemetry.instrumentation.google_genai import GoogleGenAiSdkInstrumentor
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
-from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
-from opentelemetry.sdk.metrics.export import Metric
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 import pytest
-from typing_extensions import override
 
-from ..testing_utils import InMemoryRunner
-from ..testing_utils import MockModel
-from ..testing_utils import TestInMemoryRunner
+from .functional._aclosing import aclosing_wrapping_assertions
+from .functional._recording import check_case
+from .functional._recording import FunctionalTestCase
+from .functional.scenarios.agent import build_test_runner
+from .functional.scenarios.agent import run_agent_scenario
+from .functional.scenarios.conversation import TOOL_ERROR
+from .functional.scenarios.inference import mock_test_model
+from .functional.scenarios.mcp import build_mcp_test_runner
+from .functional.scenarios.mcp import FakeMcpSession
+from .functional.scenarios.telemetry_setup import _PATCHED_COUNTERS
+from .functional.scenarios.telemetry_setup import _PATCHED_HISTOGRAMS
+from .functional.scenarios.telemetry_setup import ADK_TELEMETRY_SCHEMA_VERSION_OPT_IN
+from .functional.scenarios.telemetry_setup import CAPTURE_CONTENT
+from .functional.scenarios.telemetry_setup import CounterSpec
+from .functional.scenarios.telemetry_setup import EXPERIMENTAL_OPT_IN
+from .functional.scenarios.telemetry_setup import HistogramSpec
+from .functional.scenarios.telemetry_setup import install_telemetry
+from .functional.scenarios.telemetry_setup import OTEL_OPT_IN
 from .functional_test_cases import ALL_CASES
-from .functional_test_cases import EXPECTED_EXPERIMENTAL_SPAN_AND_EVENT_WITH_MCP
-from .functional_test_helpers import aclosing_wrapping_assertions
-from .functional_test_helpers import AGENT_NAME
-from .functional_test_helpers import build_test_agent
-from .functional_test_helpers import build_test_runner
-from .functional_test_helpers import CAPTURE_CONTENT
-from .functional_test_helpers import EXPERIMENTAL_OPT_IN
-from .functional_test_helpers import FunctionalTestCase
-from .functional_test_helpers import install_telemetry
-from .functional_test_helpers import OTEL_OPT_IN
-from .functional_test_helpers import run_agent_scenario
-from .functional_test_helpers import SpanDigest
-from .functional_test_helpers import TOOL_NAME
+from .functional_test_cases import GROUNDING_CASE
+from .functional_test_cases import MCP_CASE
+from .functional_test_cases import MCP_HTTP_CASE
+
+CASES = [*ALL_CASES, GROUNDING_CASE, MCP_CASE, MCP_HTTP_CASE]
 
 
-@pytest.mark.parametrize("case", ALL_CASES, ids=lambda c: c.test_id)
-@pytest.mark.asyncio
-async def test_telemetry_schema(
-    case: FunctionalTestCase,
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "spec",
+    [*_PATCHED_HISTOGRAMS, *_PATCHED_COUNTERS],
+    ids=lambda spec: spec.attr,
+)
+def test_patched_instrument_keeps_its_production_name(
+    spec: HistogramSpec | CounterSpec,
 ) -> None:
-  """Tests creation of spans/logs in an E2E runner invocation.
+  """The harness re-creates each instrument under the name ADK ships it as.
 
-  Asserts the entire telemetry schema (spans + attributes + per-span logs)
-  matches the hand-written expected shape for the given semconv +
-  content-capture configuration.
+  ``install_telemetry`` swaps the instruments out by attribute and names the
+  replacements itself, so a metric renamed in ``_metrics`` would otherwise go
+  on being recorded -- and asserted -- under its old name, in the goldens and
+  in every test that reads a point by name.
   """
-  case.apply_env(monkeypatch)
+  instrument = getattr(spec.module, spec.attr)
+  # ADK builds its instruments before a meter provider is set, so they are
+  # proxies, which keep the name privately rather than as a property.
+  name = getattr(instrument, "name", None) or instrument._name
 
-  span_exporter = InMemorySpanExporter()
-  log_exporter = InMemoryLogRecordExporter()
-  install_telemetry(monkeypatch, span_exporter, log_exporter)
+  assert name == spec.metric_name
 
-  await run_agent_scenario(build_test_runner())
 
-  digest = SpanDigest.build(
-      span_exporter.get_finished_spans(),
-      log_exporter.get_finished_logs(),
-  )
-  assert digest == case.expected_root
+@pytest.mark.parametrize(
+    "case", CASES, ids=lambda c: f"{c.scenario}-{c.test_id}"
+)
+@pytest.mark.asyncio
+async def test_telemetry_schema(case: FunctionalTestCase) -> None:
+  """Tests creation of spans/logs/metrics in an E2E runner invocation.
+
+  Asserts the entire telemetry schema (spans + attributes + per-span logs +
+  recorded metric points) ADK's own instrumentation records matches the
+  golden, under the case's semconv + content-capture configuration, and that
+  the OTel instrumentor diverges from it only where it already did.
+  """
+  await check_case(case)
 
 
 @pytest.mark.asyncio
@@ -102,11 +106,72 @@ async def test_async_generators_wrapped_in_aclosing(
   ``gc.get_referrers`` walk is expensive (~5 seconds per scenario).
   """
   install_telemetry(
-      monkeypatch, InMemorySpanExporter(), InMemoryLogRecordExporter()
+      monkeypatch,
+      InMemorySpanExporter(),
+      InMemoryLogRecordExporter(),
+      InMemoryMetricReader(),
   )
 
   with aclosing_wrapping_assertions():
-    await run_agent_scenario(build_test_runner())
+    await run_agent_scenario(build_test_runner(mock_test_model()))
+
+
+@pytest.mark.asyncio
+async def test_span_opened_by_the_model_does_not_parent_the_tool_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """A span the model opens must not adopt the tool call that follows it.
+
+  The goldens pin that ``execute_tool`` hangs off ``invoke_agent`` rather
+  than off ADK's own model-call spans. This pins the same for a span a
+  caller's model wrapper opens around its request: it is only current while
+  the model is answering, so it cannot become an ancestor of work the flow
+  starts once the answer is in.
+  """
+  span_exporter = InMemorySpanExporter()
+  install_telemetry(
+      monkeypatch,
+      span_exporter,
+      InMemoryLogRecordExporter(),
+      InMemoryMetricReader(),
+  )
+  wrapper_provider = TracerProvider()
+  wrapper_provider.add_span_processor(SimpleSpanProcessor(span_exporter))
+  wrapper_tracer = wrapper_provider.get_tracer(__name__)
+
+  runner = build_test_runner(mock_test_model())
+  model_type = type(runner.agent.canonical_model)
+  respond = model_type.generate_content_async
+
+  async def _respond_within_a_span(
+      self, *args: Any, **kwargs: Any
+  ) -> AsyncGenerator[LlmResponse, None]:
+    with wrapper_tracer.start_as_current_span("model_wrapper"):
+      async for response in respond(self, *args, **kwargs):
+        yield response
+
+  monkeypatch.setattr(
+      model_type, "generate_content_async", _respond_within_a_span
+  )
+
+  await run_agent_scenario(runner)
+
+  spans = {
+      span.context.span_id: span for span in span_exporter.get_finished_spans()
+  }
+  wrapper_span_ids = {
+      span_id for span_id, span in spans.items() if span.name == "model_wrapper"
+  }
+  tool_spans = [
+      span for span in spans.values() if span.name.startswith("execute_tool")
+  ]
+
+  assert wrapper_span_ids
+  assert tool_spans
+  for span in tool_spans:
+    assert span.parent is not None
+    assert span.parent.span_id not in wrapper_span_ids
+    assert spans[span.parent.span_id].name.startswith("invoke_agent")
 
 
 @pytest.mark.asyncio
@@ -116,10 +181,17 @@ async def test_exception_preserves_attributes(
   """Test when an exception occurs during tool execution, span attributes are still present on spans where they are expected."""
 
   span_exporter = InMemorySpanExporter()
-  install_telemetry(monkeypatch, span_exporter, InMemoryLogRecordExporter())
+  install_telemetry(
+      monkeypatch,
+      span_exporter,
+      InMemoryLogRecordExporter(),
+      InMemoryMetricReader(),
+  )
 
   with pytest.raises(ValueError, match="This tool always fails"):
-    _ = await run_agent_scenario(build_test_runner(failing=True))
+    _ = await run_agent_scenario(
+        build_test_runner(mock_test_model(), tool_exception=TOOL_ERROR)
+    )
 
   spans = span_exporter.get_finished_spans()
 
@@ -131,18 +203,36 @@ async def test_exception_preserves_attributes(
   )
 
 
+@pytest.mark.parametrize(
+    "semconv_opt_in,adk_records",
+    [
+        (EXPERIMENTAL_OPT_IN, False),
+        (None, True),
+    ],
+    ids=["experimental_defers_to_instrumentor", "stable_is_recorded_by_adk"],
+)
 @pytest.mark.asyncio
-async def test_no_generate_content_for_gemini_model_when_already_instrumented(
+async def test_who_records_the_inference_when_already_instrumented(
     monkeypatch: pytest.MonkeyPatch,
+    semconv_opt_in: str | None,
+    adk_records: bool,
 ) -> None:
-  """Tests that generate_content span is not created if already instrumented."""
+  """Which of ADK and the instrumentor records the inference."""
   span_exporter = InMemorySpanExporter()
-  install_telemetry(monkeypatch, span_exporter, InMemoryLogRecordExporter())
+  install_telemetry(
+      monkeypatch,
+      span_exporter,
+      InMemoryLogRecordExporter(),
+      InMemoryMetricReader(),
+  )
+  if semconv_opt_in is None:
+    monkeypatch.delenv(OTEL_OPT_IN, raising=False)
+    monkeypatch.setenv(ADK_TELEMETRY_SCHEMA_VERSION_OPT_IN, "1")
+  else:
+    monkeypatch.setenv(OTEL_OPT_IN, semconv_opt_in)
 
   monkeypatch.setattr(
-      tracing,
-      "_instrumented_with_opentelemetry_instrumentation_google_genai",
-      lambda: True,
+      "google.adk.telemetry._genai_instrumentor.is_instrumented", lambda: True
   )
   monkeypatch.setattr(
       tracing,
@@ -150,295 +240,46 @@ async def test_no_generate_content_for_gemini_model_when_already_instrumented(
       lambda _: True,
   )
 
-  _ = await run_agent_scenario(build_test_runner())
+  _ = await run_agent_scenario(build_test_runner(mock_test_model()))
 
+  # `MockModel` never reaches the wrapped SDK, so these spans are ADK's.
   spans = span_exporter.get_finished_spans()
-  assert not any(span.name.startswith("generate_content") for span in spans)
+  recorded_natively = any(
+      span.name.startswith("generate_content") for span in spans
+  )
+  assert recorded_natively == adk_records
 
 
-def test_instrumented_with_opentelemetry_instrumentation_google_genai():
+def test_is_instrumented():
   instrumentor = GoogleGenAiSdkInstrumentor()
 
-  assert (
-      not tracing._instrumented_with_opentelemetry_instrumentation_google_genai()
-  )
+  assert not _genai_instrumentor.is_instrumented()
   try:
     instrumentor.instrument()
-    assert (
-        tracing._instrumented_with_opentelemetry_instrumentation_google_genai()
-    )
+    assert _genai_instrumentor.is_instrumented()
   finally:
     instrumentor.uninstrument()
-  assert (
-      not tracing._instrumented_with_opentelemetry_instrumentation_google_genai()
-  )
+  assert not _genai_instrumentor.is_instrumented()
 
 
-@dataclasses.dataclass
-class MetricPoint:
-  attributes: dict[str, object]
-  value: object = None
+def test_instrumented_detection_normalizes_windows_path_separators(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  """Backslash-separated instrumentation paths are matched on Windows."""
+  windows_path = r"C:\pkg\opentelemetry\instrumentation\google_genai\patch.py"
 
+  class _FakeCode:
+    co_filename = windows_path
 
-def _extract_metrics(
-    metrics_list: Sequence[Metric], name: str, agent_name: str | None = None
-) -> list[MetricPoint]:
-  m = next((m for m in metrics_list if m.name == name), None)
-  if not m:
-    return []
-  points = []
-  for dp in m.data.data_points:
-    if (
-        agent_name is not None
-        and dp.attributes.get("gen_ai.agent.name") != agent_name
-    ):
-      continue
-    value = None
-    if hasattr(dp, "sum"):
-      value = dp.sum
-    elif hasattr(dp, "value"):
-      value = dp.value
-    points.append(MetricPoint(attributes=dp.attributes, value=value))
-  return points
-
-
-def _setup_test_metrics(monkeypatch):
-  reader = InMemoryMetricReader()
-  provider = MeterProvider(metric_readers=[reader])
-  meter = provider.get_meter("test_meter")
-  agent_duration_hist = meter.create_histogram(
-      "gen_ai.agent.invocation.duration"
-  )
-  tool_duration_hist = meter.create_histogram("gen_ai.tool.execution.duration")
-  request_size_hist = meter.create_histogram("gen_ai.agent.request.size")
-  response_size_hist = meter.create_histogram("gen_ai.agent.response.size")
-  workflow_steps_hist = meter.create_histogram("gen_ai.agent.workflow.steps")
-  client_duration_hist = meter.create_histogram(
-      "gen_ai.client.operation.duration"
-  )
-  client_token_usage_hist = meter.create_histogram("gen_ai.client.token.usage")
+  class _FakeInstrumentedFunction:
+    __code__ = _FakeCode
+    __wrapped__ = object()
 
   monkeypatch.setattr(
-      _metrics, "_agent_invocation_duration", agent_duration_hist
-  )
-  monkeypatch.setattr(_metrics, "_tool_execution_duration", tool_duration_hist)
-  monkeypatch.setattr(_metrics, "_agent_request_size", request_size_hist)
-  monkeypatch.setattr(_metrics, "_agent_response_size", response_size_hist)
-  monkeypatch.setattr(_metrics, "_agent_workflow_steps", workflow_steps_hist)
-  monkeypatch.setattr(
-      _metrics, "_client_operation_duration", client_duration_hist
-  )
-  monkeypatch.setattr(_metrics, "_client_token_usage", client_token_usage_hist)
-  return reader
-
-
-@pytest.mark.asyncio
-async def test_metrics(monkeypatch):
-  reader = _setup_test_metrics(monkeypatch)
-
-  async def get_current_time():
-    return "2026-04-15T14:26:03Z"
-
-  async def generate_random_number():
-    return 42
-
-  mock_model = MockModel.create(
-      responses=[
-          Part.from_function_call(name="get_current_time", args={}),
-          Part.from_function_call(name="generate_random_number", args={}),
-          Part.from_text(text="Both tools executed."),
-      ],
-      usage_metadata=types.GenerateContentResponseUsageMetadata(
-          prompt_token_count=10,
-          candidates_token_count=20,
-          tool_use_prompt_token_count=5,
-          thoughts_token_count=10,
-          total_token_count=45,
-      ),
-  )
-  test_agent = Agent(
-      name="complex_agent",
-      model=mock_model,
-      tools=[
-          FunctionTool(get_current_time),
-          FunctionTool(generate_random_number),
-      ],
+      _genai_instrumentor.Models, "generate_content", _FakeInstrumentedFunction
   )
 
-  runner = InMemoryRunner(root_agent=test_agent)
-  await runner.run_async("Run both tools")
-
-  metrics_data = reader.get_metrics_data()
-  assert len(metrics_data.resource_metrics) > 0
-  scope_metrics = metrics_data.resource_metrics[0].scope_metrics
-  assert len(scope_metrics) > 0
-  metrics_list = scope_metrics[0].metrics
-  got_invocation = _extract_metrics(
-      metrics_list, "gen_ai.agent.invocation.duration", "complex_agent"
-  )
-  assert len(got_invocation) == 1
-  for p in got_invocation:
-    p.value = None
-  want_invocation = [
-      MetricPoint(
-          attributes={
-              "gen_ai.agent.name": "complex_agent",
-          },
-          value=None,
-      )
-  ]
-  assert got_invocation == want_invocation
-  got_tool_exec = _extract_metrics(
-      metrics_list, "gen_ai.tool.execution.duration", "complex_agent"
-  )
-  assert len(got_tool_exec) == 2
-  for p in got_tool_exec:
-    p.value = None
-  want_tool_exec = [
-      MetricPoint(
-          attributes={
-              "gen_ai.agent.name": "complex_agent",
-              "gen_ai.tool.name": "generate_random_number",
-          },
-          value=None,
-      ),
-      MetricPoint(
-          attributes={
-              "gen_ai.agent.name": "complex_agent",
-              "gen_ai.tool.name": "get_current_time",
-          },
-          value=None,
-      ),
-  ]
-  got_tool_exec.sort(key=lambda p: p.attributes.get("gen_ai.tool.name", ""))
-  want_tool_exec.sort(key=lambda p: p.attributes.get("gen_ai.tool.name", ""))
-  assert got_tool_exec == want_tool_exec
-  got_steps = _extract_metrics(
-      metrics_list, "gen_ai.agent.workflow.steps", "complex_agent"
-  )
-  assert len(got_steps) == 1
-  want_steps = [
-      # (tool call + result) x 2 + text response = 5 steps
-      MetricPoint(attributes={"gen_ai.agent.name": "complex_agent"}, value=5)
-  ]
-  assert got_steps == want_steps
-
-  got_client_duration = _extract_metrics(
-      metrics_list, "gen_ai.client.operation.duration", "complex_agent"
-  )
-  assert len(got_client_duration) == 1
-  for p in got_client_duration:
-    p.value = None
-  want_client_duration = [
-      MetricPoint(
-          attributes={
-              "gen_ai.agent.name": "complex_agent",
-              "gen_ai.operation.name": "generate_content",
-              "gen_ai.provider.name": "gemini",
-              "gen_ai.request.model": "mock",
-              "gen_ai.response.model": "mock",
-          },
-          value=None,
-      )
-  ]
-  assert got_client_duration == want_client_duration
-
-  got_client_tokens = _extract_metrics(
-      metrics_list, "gen_ai.client.token.usage", "complex_agent"
-  )
-  assert len(got_client_tokens) == 2
-  want_client_tokens = [
-      MetricPoint(
-          attributes={
-              "gen_ai.agent.name": "complex_agent",
-              "gen_ai.operation.name": "generate_content",
-              "gen_ai.provider.name": "gemini",
-              "gen_ai.request.model": "mock",
-              "gen_ai.response.model": "mock",
-              "gen_ai.token.type": "input",
-          },
-          value=45,  # 15 tokens * 3 turns
-      ),
-      MetricPoint(
-          attributes={
-              "gen_ai.agent.name": "complex_agent",
-              "gen_ai.operation.name": "generate_content",
-              "gen_ai.provider.name": "gemini",
-              "gen_ai.request.model": "mock",
-              "gen_ai.response.model": "mock",
-              "gen_ai.token.type": "output",
-          },
-          value=90,  # 30 tokens * 3 turns
-      ),
-  ]
-  got_client_tokens.sort(
-      key=lambda p: p.attributes.get("gen_ai.token.type", "")
-  )
-  want_client_tokens.sort(
-      key=lambda p: p.attributes.get("gen_ai.token.type", "")
-  )
-  assert got_client_tokens == want_client_tokens
-
-
-@pytest.mark.asyncio
-async def test_metrics_tool_error(monkeypatch):
-  reader = _setup_test_metrics(monkeypatch)
-
-  async def get_current_time():
-    return "2026-04-15T14:26:03Z"
-
-  async def failing_tool():
-    raise ValueError("Tool failed")
-
-  mock_model = MockModel.create(
-      responses=[
-          Part.from_function_call(name="get_current_time", args={}),
-          Part.from_function_call(name="failing_tool", args={}),
-          Part.from_text(text="Should not reach here"),
-      ]
-  )
-  test_agent = Agent(
-      name="error_agent",
-      model=mock_model,
-      tools=[FunctionTool(get_current_time), FunctionTool(failing_tool)],
-  )
-
-  runner = InMemoryRunner(root_agent=test_agent)
-  with pytest.raises(ValueError, match="Tool failed"):
-    await runner.run_async("Run tools")
-
-  metrics_data = reader.get_metrics_data()
-  metrics_list = metrics_data.resource_metrics[0].scope_metrics[0].metrics
-
-  # Verify Tool Execution Duration
-  got = _extract_metrics(
-      metrics_list, "gen_ai.tool.execution.duration", "error_agent"
-  )
-  assert len(got) == 2
-  for p in got:
-    p.value = None
-
-  want = [
-      MetricPoint(
-          attributes={
-              "gen_ai.agent.name": "error_agent",
-              "gen_ai.tool.name": "failing_tool",
-              "error.type": "ValueError",
-          },
-          value=None,
-      ),
-      MetricPoint(
-          attributes={
-              "gen_ai.agent.name": "error_agent",
-              "gen_ai.tool.name": "get_current_time",
-          },
-          value=None,
-      ),
-  ]
-
-  got.sort(key=lambda p: str(p.attributes.get("gen_ai.tool.name", "")))
-  want.sort(key=lambda p: str(p.attributes.get("gen_ai.tool.name", "")))
-  assert got == want
+  assert _genai_instrumentor.is_instrumented()
 
 
 # ---------------------------------------------------------------------------
@@ -457,94 +298,10 @@ async def test_metrics_tool_error(monkeypatch):
 # entries with ``function_declarations``. Because the builder is fully
 # synchronous (it never calls ``list_tools()`` itself), the MCP server is
 # queried EXACTLY ONCE per agent invocation regardless of which semconv
-# (or capture mode) is active. These tests pin that contract AND verify
-# the resolved tool definitions surface intact in the experimental
-# telemetry.
-#
-# A ``_FakeMcpSession`` substitutes the live ``McpClientSession`` so the
-# test doesn't need a running MCP server. ``McpToolset.create_session``
-# is patched to hand it out instead of dialing ``StdioServerParameters``.
+# (or capture mode) is active. This test pins that contract; the recorded
+# ``mcp`` golden pins that the resolved tool definitions surface intact in
+# the experimental telemetry.
 # ---------------------------------------------------------------------------
-
-
-class _FakeMcpSession(McpClientSession):
-  """Minimal ``McpClientSession`` stand-in with a counted ``list_tools()``.
-
-  Subclasses ``McpClientSession`` (and skips its real ``__init__``) so that
-  every ``isinstance(x, McpClientSession)`` check in ADK and in the MCP
-  Python client passes, without needing to wire up the underlying anyio
-  memory streams + peer process.
-  """
-
-  def __init__(  # pyright: ignore[reportMissingSuperCall]
-      self, *, tools: list[McpTool]
-  ) -> None:
-    # Deliberately skip ``McpClientSession.__init__``: the real one wants
-    # live anyio streams + a peer process. ``isinstance`` checks still
-    # succeed, which is all ADK's MCP plumbing requires.
-    self._tools: list[McpTool] = tools
-    self.list_tools_call_count: int = 0
-
-  @override
-  async def list_tools(
-      self,
-      cursor: str | None = None,
-      *,
-      params: PaginatedRequestParams | None = None,
-  ) -> ListToolsResult:
-    self.list_tools_call_count += 1
-    return ListToolsResult(tools=list(self._tools))
-
-
-def _make_fake_mcp_toolset(
-    monkeypatch: pytest.MonkeyPatch, fake_session: _FakeMcpSession
-) -> McpToolset:
-  """Returns an ``McpToolset`` whose session manager hands out ``fake_session``.
-
-  Patches the toolset's ``MCPSessionManager`` so:
-    * ``create_session`` returns the fake (no socket / subprocess).
-    * ``close`` is a no-op (the fake holds no resources).
-
-  Connection params are nominally a stdio command but never actually
-  invoked because ``create_session`` is overridden.
-  """
-  toolset = McpToolset(
-      connection_params=StdioConnectionParams(
-          server_params=StdioServerParameters(command="unused-by-test"),
-      )
-  )
-
-  async def _create_session(*_args, **_kwargs):  # pyright: ignore[reportUnknownParameterType, reportMissingParameterType]
-    return fake_session
-
-  async def _close(*_args, **_kwargs):  # pyright: ignore[reportUnknownParameterType, reportMissingParameterType]
-    return None
-
-  monkeypatch.setattr(
-      toolset._mcp_session_manager, "create_session", _create_session  # pyright: ignore[reportPrivateUsage, reportUnknownArgumentType]
-  )
-  monkeypatch.setattr(toolset._mcp_session_manager, "close", _close)  # pyright: ignore[reportPrivateUsage, reportUnknownArgumentType]
-  return toolset
-
-
-def _build_mcp_test_runner(toolset: McpToolset) -> TestInMemoryRunner:
-  """Builds a single-turn agent runner whose only tool source is ``toolset``.
-
-  Single-turn (one ``Part.from_text`` response) so the assertion on
-  ``list_tools_call_count`` is unambiguous: exactly one agent invocation
-  is performed.
-  """
-  mock_model = MockModel.create(
-      responses=[Part.from_text(text="text response")]
-  )
-  test_agent = Agent(
-      name="some_root_agent",
-      description="A sample root agent.",
-      instruction="you are helpful",
-      model=mock_model,
-      tools=[toolset],
-  )
-  return TestInMemoryRunner(node=test_agent)
 
 
 @pytest.mark.asyncio
@@ -565,31 +322,17 @@ async def test_mcp_list_tools_called_once_under_experimental_semconv(
   monkeypatch.setenv(CAPTURE_CONTENT, "span_and_event")
   monkeypatch.setenv("ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS", "false")
 
-  span_exporter = InMemorySpanExporter()
-  log_exporter = InMemoryLogRecordExporter()
-  install_telemetry(monkeypatch, span_exporter, log_exporter)
-
-  fake_session = _FakeMcpSession(
-      tools=[
-          McpTool(
-              name="mcp_echo",
-              description="Echoes back its input.",
-              inputSchema={
-                  "type": "object",
-                  "properties": {"text": {"type": "string"}},
-                  "required": ["text"],
-              },
-          )
-      ]
+  install_telemetry(
+      monkeypatch,
+      InMemorySpanExporter(),
+      InMemoryLogRecordExporter(),
+      InMemoryMetricReader(),
   )
-  toolset = _make_fake_mcp_toolset(monkeypatch, fake_session)
 
-  await run_agent_scenario(_build_mcp_test_runner(toolset))
+  fake_session = FakeMcpSession()
+
+  await run_agent_scenario(
+      build_mcp_test_runner(mock_test_model(), monkeypatch, fake_session)
+  )
 
   assert fake_session.list_tools_call_count == 1
-
-  digest = SpanDigest.build(
-      span_exporter.get_finished_spans(),
-      log_exporter.get_finished_logs(),
-  )
-  assert digest == EXPECTED_EXPERIMENTAL_SPAN_AND_EVENT_WITH_MCP

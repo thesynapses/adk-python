@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from google.adk.runners import Runner
@@ -31,6 +32,13 @@ except ImportError as e:
 
 logger = logging.getLogger("google_adk." + __name__)
 
+_SESSION_ID_UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _sanitize_session_id(value: str) -> str:
+  """Converts Slack identifiers into ADK session-id-safe strings."""
+  return _SESSION_ID_UNSAFE_CHARS.sub("_", value)
+
 
 class SlackRunner:
   """Runner for ADK agents on Slack."""
@@ -44,15 +52,15 @@ class SlackRunner:
     self.slack_app = slack_app
     self._setup_handlers()
 
-  def _setup_handlers(self):
+  def _setup_handlers(self) -> None:
     """Sets up event handlers for Slack."""
 
     @self.slack_app.event("app_mention")
-    async def handle_app_mentions(event, say):
+    async def handle_app_mentions(event: dict[str, Any], say: Any) -> None:
       await self._handle_message(event, say)
 
     @self.slack_app.event("message")
-    async def handle_message_events(event, say):
+    async def handle_message_events(event: dict[str, Any], say: Any) -> None:
       # Skip bot messages to avoid loops
       if event.get("bot_id") or event.get("bot_profile"):
         return
@@ -63,7 +71,7 @@ class SlackRunner:
       if is_im or in_thread:
         await self._handle_message(event, say)
 
-  async def _handle_message(self, event: dict[str, Any], say: Any):
+  async def _handle_message(self, event: dict[str, Any], say: Any) -> None:
     """Handles a message or app_mention event."""
     text = event.get("text", "")
     user_id = event.get("user")
@@ -73,8 +81,12 @@ class SlackRunner:
     if not text or not user_id or not channel_id:
       return
 
-    # In Slack, we can use the channel_id (and optionally thread_ts) as a session ID.
-    session_id = f"{channel_id}-{thread_ts}" if thread_ts else channel_id
+    # In Slack, we can use the channel_id (and optionally thread_ts) as a
+    # session ID. Slack timestamps contain "." but managed session services only
+    # accept letters, numbers, "_" and "-".
+    session_id = _sanitize_session_id(
+        f"{channel_id}-{thread_ts}" if thread_ts else channel_id
+    )
 
     new_message = types.Content(role="user", parts=[types.Part(text=text)])
 
@@ -83,13 +95,13 @@ class SlackRunner:
       thinking_response = await say(text="_Thinking..._", thread_ts=thread_ts)
       thinking_ts = thinking_response.get("ts")
 
-      async for event in self.runner.run_async(
+      async for run_event in self.runner.run_async(
           user_id=user_id,
           session_id=session_id,
           new_message=new_message,
       ):
-        if event.content and event.content.parts:
-          for part in event.content.parts:
+        if run_event.content and run_event.content.parts:
+          for part in run_event.content.parts:
             if part.text:
               if thinking_ts:
                 await self.slack_app.client.chat_update(
@@ -117,7 +129,7 @@ class SlackRunner:
       else:
         await say(text=error_message, thread_ts=thread_ts)
 
-  async def start(self, app_token: str):
+  async def start(self, app_token: str) -> None:
     """Starts the Slack app using Socket Mode."""
     handler = AsyncSocketModeHandler(self.slack_app, app_token)
     await handler.start_async()

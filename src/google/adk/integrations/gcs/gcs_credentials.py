@@ -14,8 +14,6 @@
 
 from __future__ import annotations
 
-from ...features import experimental
-from ...features import FeatureName
 from ...tools._google_credentials import BaseGoogleCredentialsConfig
 
 GCS_TOKEN_CACHE_KEY = "gcs_token_cache"
@@ -24,9 +22,8 @@ GCS_DEFAULT_SCOPE = [
 ]
 
 
-@experimental(FeatureName.GOOGLE_CREDENTIALS_CONFIG)
 class GCSCredentialsConfig(BaseGoogleCredentialsConfig):
-  """GCS Credentials Configuration for Google API tools (Experimental)."""
+  """GCS Credentials Configuration for Google API tools."""
 
   def __post_init__(self) -> GCSCredentialsConfig:
     """Populate default scope if scopes is None."""

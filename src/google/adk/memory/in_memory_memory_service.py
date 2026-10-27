@@ -15,9 +15,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from collections.abc import Sequence
+import itertools
 import re
 import threading
 from typing import TYPE_CHECKING
+import unicodedata
 
 from typing_extensions import override
 
@@ -31,32 +33,66 @@ if TYPE_CHECKING:
   from ..sessions.session import Session
 
 _UNKNOWN_SESSION_ID = '__unknown_session_id__'
+_MAX_SEARCH_RESULTS = 10
 
 
-def _user_key(app_name: str, user_id: str) -> str:
-  return f'{app_name}/{user_id}'
+def _user_key(app_name: str, user_id: str) -> tuple[str, str]:
+  return (app_name, user_id)
+
+
+def _is_latin(c: str) -> bool:
+  if c.isascii():
+    return c.isalnum() or c == '_'
+  return unicodedata.name(c, '').startswith('LATIN')
 
 
 def _extract_words_lower(text: str) -> set[str]:
-  """Extracts words from a string and converts them to lowercase."""
-  return set([word.lower() for word in re.findall(r'\w+', text, re.UNICODE)])
+  """Extracts Unicode-aware tokens from a string in lowercase."""
+  text = unicodedata.normalize('NFC', text)
+  return set(word.lower() for word in re.findall(r'\w+', text))
+
+
+def _extract_searchable_words(text: str) -> set[str]:
+  r"""Extracts the words an event can be matched on, in lowercase.
+
+  The tokens of _extract_words_lower, plus, for a token that mixes Latin and
+  non-Latin scripts, each of its single-script runs. Japanese and Chinese are
+  written without spaces, so 私はPythonを使う is a single \w+ token and a query
+  for Python matches nothing. Splitting on the boundary between Latin and
+  non-Latin scripts makes the embedded Latin word a token of its own, while
+  still keeping a partial word such as thon from matching.
+
+  Args:
+    text: The text of an event.
+  """
+  words = _extract_words_lower(text)
+  for word in list(words):
+    if not word.isascii():
+      for _, group in itertools.groupby(word, _is_latin):
+        words.add(''.join(group))
+  return words
 
 
 class InMemoryMemoryService(BaseMemoryService):
   """An in-memory memory service for prototyping purpose only.
 
-  Uses keyword matching instead of semantic search.
+  Uses keyword matching instead of semantic search. A search returns at most
+  ten memories, the ones sharing the most words with the query.
 
   This class is thread-safe, however, it should be used for testing and
   development only.
   """
 
-  def __init__(self):
+  def __init__(self) -> None:
     self._lock = threading.Lock()
 
-    self._session_events: dict[str, dict[str, list[Event]]] = {}
-    """Keys are "{app_name}/{user_id}". Values are dicts of session_id to
+    self._session_events: dict[tuple[str, str], dict[str, list[Event]]] = {}
+    """Keys are (app_name, user_id). Values are dicts of session_id to
     session event lists.
+    """
+    self._deleted_memory_ids: dict[tuple[str, str], set[str]] = {}
+    """Keys are (app_name, user_id). Values are sets of deleted memory_ids
+    (event IDs) to prevent re-ingestion from subsequent session additions.
     """
 
   @override
@@ -64,11 +100,14 @@ class InMemoryMemoryService(BaseMemoryService):
     user_key = _user_key(session.app_name, session.user_id)
 
     with self._lock:
+      deleted_ids = self._deleted_memory_ids.get(user_key, set())
       self._session_events[user_key] = self._session_events.get(user_key, {})
       self._session_events[user_key][session.id] = [
-          event
+          event.model_copy(deep=True)
           for event in session.events
-          if event.content and event.content.parts
+          if event.content
+          and event.content.parts
+          and event.id not in deleted_ids
       ]
 
   @override
@@ -89,14 +128,15 @@ class InMemoryMemoryService(BaseMemoryService):
     ]
 
     with self._lock:
+      deleted_ids = self._deleted_memory_ids.get(user_key, set())
       self._session_events[user_key] = self._session_events.get(user_key, {})
       existing_events = self._session_events[user_key].get(
           scoped_session_id, []
       )
       existing_ids = {event.id for event in existing_events}
       for event in events_to_add:
-        if event.id not in existing_ids:
-          existing_events.append(event)
+        if event.id not in existing_ids and event.id not in deleted_ids:
+          existing_events.append(event.model_copy(deep=True))
           existing_ids.add(event.id)
       self._session_events[user_key][scoped_session_id] = existing_events
 
@@ -107,28 +147,71 @@ class InMemoryMemoryService(BaseMemoryService):
     user_key = _user_key(app_name, user_id)
 
     with self._lock:
-      session_event_lists = self._session_events.get(user_key, {})
+      # Copy the events into a stable snapshot while holding the lock. Iterating
+      # a live reference outside the lock would race with concurrent writers
+      # (add_session_to_memory / add_events_to_memory) mutating the same dict
+      # and lists, raising "dictionary changed size during iteration".
+      session_event_lists = [
+          list(events)
+          for events in self._session_events.get(user_key, {}).values()
+      ]
 
     words_in_query = _extract_words_lower(query)
-    response = SearchMemoryResponse()
+    scored_memories: list[tuple[int, MemoryEntry]] = []
 
-    for session_events in session_event_lists.values():
+    for session_events in session_event_lists:
       for event in session_events:
         if not event.content or not event.content.parts:
           continue
-        words_in_event = _extract_words_lower(
-            ' '.join([part.text for part in event.content.parts if part.text])
+        event_text = ' '.join(
+            [part.text for part in event.content.parts if part.text]
         )
+        words_in_event = _extract_searchable_words(event_text)
         if not words_in_event:
           continue
 
-        if any(query_word in words_in_event for query_word in words_in_query):
-          response.memories.append(
+        event_text_lower = unicodedata.normalize('NFC', event_text).lower()
+        matched_words = sum(
+            1
+            for query_word in words_in_query
+            if query_word in words_in_event
+            or (not query_word.isascii() and query_word in event_text_lower)
+        )
+        if matched_words:
+          scored_memories.append((
+              matched_words,
               MemoryEntry(
-                  content=event.content,
+                  id=event.id,
+                  content=event.content.model_copy(deep=True),
                   author=event.author,
                   timestamp=_utils.format_timestamp(event.timestamp),
-              )
-          )
+              ),
+          ))
 
-    return response
+    # Almost any two sentences share a word, so returning every event that
+    # matches at least one query word returns most of the store, and callers
+    # such as the preload_memory tool put all of it in the prompt. Keep the
+    # events matching the most query words. The sort key reads only the count,
+    # so it is stable and events matching equally stay in insertion order.
+    scored_memories.sort(key=lambda scored_memory: -scored_memory[0])
+    return SearchMemoryResponse(
+        memories=[memory for _, memory in scored_memories[:_MAX_SEARCH_RESULTS]]
+    )
+
+  @override
+  async def delete_memory(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      memory_id: str | None = None,
+  ) -> None:
+    if not memory_id:
+      return
+    user_key = _user_key(app_name, user_id)
+    with self._lock:
+      for session_id, events in self._session_events.get(user_key, {}).items():
+        kept = [event for event in events if event.id != memory_id]
+        if len(kept) != len(events):
+          self._session_events[user_key][session_id] = kept
+          self._deleted_memory_ids.setdefault(user_key, set()).add(memory_id)

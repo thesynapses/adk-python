@@ -14,15 +14,20 @@
 
 """Unit tests for canonical_xxx fields in LlmAgent."""
 
+import asyncio
 import logging
 from typing import Any
 from typing import Optional
 from unittest import mock
+import warnings
 
+from google.adk.agents.base_agent import BaseAgent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.agents.llm_agent import LlmAgent
 from google.adk.agents.readonly_context import ReadonlyContext
+from google.adk.code_executors.agent_engine_sandbox_code_executor import AgentEngineSandboxCodeExecutor
+from google.adk.code_executors.built_in_code_executor import BuiltInCodeExecutor
 from google.adk.models.anthropic_llm import Claude
 from google.adk.models.google_llm import Gemini
 from google.adk.models.lite_llm import LiteLlm
@@ -30,12 +35,58 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.registry import LLMRegistry
 from google.adk.planners.built_in_planner import BuiltInPlanner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from google.adk.tools import discovery_engine_search_tool
+from google.adk.tools.base_toolset import BaseToolset
+from google.adk.tools.enterprise_search_tool import EnterpriseWebSearchTool
+from google.adk.tools.function_tool import FunctionTool
 from google.adk.tools.google_search_tool import google_search
 from google.adk.tools.google_search_tool import GoogleSearchTool
 from google.adk.tools.vertex_ai_search_tool import VertexAiSearchTool
+from google.adk.workflow._function_node import FunctionNode
 from google.genai import types
 from pydantic import BaseModel
 import pytest
+
+
+@pytest.mark.parametrize(
+    ('tool_count', 'bypass', 'configured', 'replaced'),
+    [
+        (2, True, True, True),
+        (1, True, True, False),
+        (2, False, True, False),
+        (2, True, False, False),
+    ],
+)
+def test_builtin_executor_sandbox_substitution(
+    monkeypatch, tool_count, bypass, configured, replaced
+):
+  resource_name = 'projects/test/locations/us-central1/reasoningEngines/123'
+  if configured:
+    monkeypatch.setenv('AGENT_ENGINE_RESOURCE_NAME', resource_name)
+  else:
+    monkeypatch.delenv('AGENT_ENGINE_RESOURCE_NAME', raising=False)
+  executor = BuiltInCodeExecutor(
+      bypass_multi_tools_limit=bypass,
+      optimize_data_file=True,
+      stateful=True,
+      error_retry_attempts=3,
+  )
+  agent = LlmAgent(
+      name='test_agent',
+      tools=[google_search] * tool_count,
+      code_executor=executor,
+  )
+  if replaced:
+    assert isinstance(agent.code_executor, AgentEngineSandboxCodeExecutor)
+    assert agent.code_executor.agent_engine_resource_name == resource_name
+    assert agent.code_executor.optimize_data_file == executor.optimize_data_file
+    assert agent.code_executor.stateful == executor.stateful
+    assert (
+        agent.code_executor.error_retry_attempts
+        == executor.error_retry_attempts
+    )
+  else:
+    assert agent.code_executor is executor
 
 
 async def _create_readonly_context(
@@ -80,6 +131,62 @@ def test_canonical_model_str():
   assert agent.canonical_model.model == 'gemini-pro'
 
 
+def test_canonical_callbacks_preserve_list_identity_without_warnings():
+  def callback(*args, **kwargs):
+    return None
+
+  before_model_callbacks = [callback]
+  after_model_callbacks = [callback]
+  on_model_error_callbacks = [callback]
+  before_tool_callbacks = [callback]
+  after_tool_callbacks = [callback]
+  on_tool_error_callbacks = [callback]
+  agent = LlmAgent(
+      name='test_agent',
+      before_model_callback=before_model_callbacks,
+      after_model_callback=after_model_callbacks,
+      on_model_error_callback=on_model_error_callbacks,
+      before_tool_callback=before_tool_callbacks,
+      after_tool_callback=after_tool_callbacks,
+      on_tool_error_callback=on_tool_error_callbacks,
+  )
+
+  with warnings.catch_warnings(record=True) as caught_warnings:
+    warnings.simplefilter('always')
+    canonical_callbacks = (
+        agent.canonical_before_model_callbacks,
+        agent.canonical_after_model_callbacks,
+        agent.canonical_on_model_error_callbacks,
+        agent.canonical_before_tool_callbacks,
+        agent.canonical_after_tool_callbacks,
+        agent.canonical_on_tool_error_callbacks,
+    )
+
+  assert canonical_callbacks == (
+      before_model_callbacks,
+      after_model_callbacks,
+      on_model_error_callbacks,
+      before_tool_callbacks,
+      after_tool_callbacks,
+      on_tool_error_callbacks,
+  )
+  assert all(
+      canonical is callback_field
+      for canonical, callback_field in zip(
+          canonical_callbacks,
+          (
+              agent.before_model_callback,
+              agent.after_model_callback,
+              agent.on_model_error_callback,
+              agent.before_tool_callback,
+              agent.after_tool_callback,
+              agent.on_tool_error_callback,
+          ),
+      )
+  )
+  assert caught_warnings == []
+
+
 def test_canonical_model_llm():
   llm = LLMRegistry.new_llm('gemini-pro')
   agent = LlmAgent(name='test_agent', model=llm)
@@ -94,6 +201,82 @@ def test_canonical_model_inherit():
   )
 
   assert sub_agent.canonical_model == parent_agent.canonical_model
+
+
+def test_canonical_model_str_resolved_once():
+  agent = LlmAgent(name='test_agent', model='gemini-pro')
+
+  with mock.patch.object(
+      LLMRegistry, 'new_llm', wraps=LLMRegistry.new_llm
+  ) as new_llm:
+    first = agent.canonical_model
+    second = agent.canonical_model
+    third = agent.canonical_model
+
+  assert new_llm.call_count == 1
+  assert first is second is third
+
+
+def test_canonical_model_str_resolved_again_after_reassignment():
+  agent = LlmAgent(name='test_agent', model='gemini-pro')
+  first = agent.canonical_model
+
+  agent.model = 'gemini-2.5-flash'
+  second = agent.canonical_model
+
+  assert second is not first
+  assert second.model == 'gemini-2.5-flash'
+
+
+def test_canonical_model_str_not_stale_after_model_copy():
+  agent = LlmAgent(name='test_agent', model='gemini-pro')
+  assert agent.canonical_model.model == 'gemini-pro'
+
+  copied = agent.model_copy(update={'model': 'gemini-2.5-flash'})
+
+  assert copied.canonical_model.model == 'gemini-2.5-flash'
+  assert agent.canonical_model.model == 'gemini-pro'
+
+
+def test_copies_share_one_model_per_event_loop():
+  agent = LlmAgent(name='test_agent', model='gemini-pro')
+
+  async def models_in_one_loop():
+    return [
+        agent.canonical_model,
+        agent.clone().canonical_model,
+        agent.clone().canonical_model,
+    ]
+
+  first_loop = asyncio.run(models_in_one_loop())
+  second_loop = asyncio.run(models_in_one_loop())
+
+  assert all(m is first_loop[0] for m in first_loop)
+  assert all(m is second_loop[0] for m in second_loop)
+  assert first_loop[0] is not second_loop[0]
+
+
+def test_resolving_a_model_keeps_agents_built_alike_equal():
+  first = LlmAgent(name='test_agent', model='gemini-pro')
+  second = LlmAgent(name='test_agent', model='gemini-pro')
+  assert first == second
+
+  _ = first.canonical_model
+
+  assert first == second
+
+
+def test_canonical_live_model_str_resolved_once():
+  agent = LlmAgent(name='test_agent', model='gemini-pro')
+
+  with mock.patch.object(
+      LLMRegistry, 'new_llm', wraps=LLMRegistry.new_llm
+  ) as new_llm:
+    first = agent.canonical_live_model
+    second = agent.canonical_live_model
+
+  assert new_llm.call_count == 1
+  assert first is second
 
 
 def test_canonical_live_model_default_fallback():
@@ -172,9 +355,12 @@ async def test_canonical_global_instruction_str():
   agent = LlmAgent(name='test_agent', global_instruction='global instruction')
   ctx = await _create_readonly_context(agent)
 
-  canonical_instruction, bypass_state_injection = (
-      await agent.canonical_global_instruction(ctx)
-  )
+  with pytest.warns(
+      DeprecationWarning, match='global_instruction field is deprecated'
+  ):
+    canonical_instruction, bypass_state_injection = (
+        await agent.canonical_global_instruction(ctx)
+    )
   assert canonical_instruction == 'global instruction'
   assert not bypass_state_injection
 
@@ -190,9 +376,12 @@ async def test_canonical_global_instruction():
       agent, state={'state_var': 'state_value'}
   )
 
-  canonical_global_instruction, bypass_state_injection = (
-      await agent.canonical_global_instruction(ctx)
-  )
+  with pytest.warns(
+      DeprecationWarning, match='global_instruction field is deprecated'
+  ):
+    canonical_global_instruction, bypass_state_injection = (
+        await agent.canonical_global_instruction(ctx)
+    )
   assert canonical_global_instruction == 'global instruction: state_value'
   assert bypass_state_injection
 
@@ -207,9 +396,12 @@ async def test_async_canonical_global_instruction():
   ctx = await _create_readonly_context(
       agent, state={'state_var': 'state_value'}
   )
-  canonical_global_instruction, bypass_state_injection = (
-      await agent.canonical_global_instruction(ctx)
-  )
+  with pytest.warns(
+      DeprecationWarning, match='global_instruction field is deprecated'
+  ):
+    canonical_global_instruction, bypass_state_injection = (
+        await agent.canonical_global_instruction(ctx)
+    )
   assert canonical_global_instruction == 'global instruction: state_value'
   assert bypass_state_injection
 
@@ -329,6 +521,49 @@ def test_validate_generate_content_config_response_schema_throw():
     )
 
 
+def test_validate_generate_content_config_http_options_base_url_throw():
+  """Tests that a transport base URL cannot be set directly in config."""
+  with pytest.raises(ValueError):
+    _ = LlmAgent(
+        name='test_agent',
+        generate_content_config=types.GenerateContentConfig(
+            http_options=types.HttpOptions(base_url='http://example.invalid')
+        ),
+    )
+
+
+def test_validate_generate_content_config_candidate_count_one_allowed():
+  """candidate_count=1 remains settable on generate_content_config."""
+  agent = LlmAgent(
+      name='test_agent',
+      generate_content_config=types.GenerateContentConfig(candidate_count=1),
+  )
+  assert agent.generate_content_config.candidate_count == 1
+
+
+def test_validate_generate_content_config_candidate_count_greater_than_one_allowed():
+  """candidate_count greater than 1 remains settable on generate_content_config."""
+  agent = LlmAgent(
+      name='test_agent',
+      generate_content_config=types.GenerateContentConfig(candidate_count=8),
+  )
+  assert agent.generate_content_config.candidate_count == 8
+
+
+def test_validate_generate_content_config_http_options_allowed():
+  """Tests that request-time http options remain settable in config."""
+  extra_body = {'tool_config': {'function_calling_config': {'mode': 'AUTO'}}}
+  agent = LlmAgent(
+      name='test_agent',
+      generate_content_config=types.GenerateContentConfig(
+          http_options=types.HttpOptions(timeout=1000, extra_body=extra_body)
+      ),
+  )
+
+  assert agent.generate_content_config.http_options.timeout == 1000
+  assert agent.generate_content_config.http_options.extra_body == extra_body
+
+
 def test_allow_transfer_by_default():
   sub_agent = LlmAgent(name='sub_agent')
   agent = LlmAgent(name='test_agent', sub_agents=[sub_agent])
@@ -337,7 +572,7 @@ def test_allow_transfer_by_default():
   assert not agent.disallow_transfer_to_peers
 
 
-# TODO(b/448114567): Remove TestCanonicalTools once the workaround
+# Pending cleanup: remove TestCanonicalTools once the workaround
 # is no longer needed.
 class TestCanonicalTools:
   """Unit tests for canonical_tools in LlmAgent."""
@@ -442,6 +677,203 @@ class TestCanonicalTools:
     assert tools[1].name == 'discovery_engine_search'
     assert tools[1].__class__.__name__ == 'DiscoveryEngineSearchTool'
 
+  async def test_handle_vais_with_other_tools_missing_gcp_extra(self):
+    """Missing google-cloud-discoveryengine raises an actionable error."""
+    agent = LlmAgent(
+        name='test_agent',
+        model='gemini-pro',
+        tools=[
+            self._my_tool,
+            VertexAiSearchTool(
+                data_store_id='test_data_store_id',
+                bypass_multi_tools_limit=True,
+            ),
+        ],
+    )
+    ctx = await _create_readonly_context(agent)
+
+    with mock.patch.dict(
+        'sys.modules',
+        {'google.adk.tools.discovery_engine_search_tool': None},
+    ):
+      with pytest.raises(ImportError, match='google-adk\\[gcp\\]'):
+        await agent.canonical_tools(ctx)
+
+  @mock.patch(
+      'google.auth.default',
+      mock.MagicMock(return_value=('credentials', 'project')),
+  )
+  async def test_handle_vais_with_other_tools_custom_name_description(
+      self,
+  ) -> None:
+    """Test VertexAiSearchTool forwards custom name and description."""
+    agent = LlmAgent(
+        name='test_agent',
+        model='gemini-pro',
+        tools=[
+            self._my_tool,
+            VertexAiSearchTool(
+                data_store_id='test_data_store_id',
+                bypass_multi_tools_limit=True,
+                name='custom_search',
+                description='Custom search description.',
+            ),
+        ],
+    )
+    ctx = await _create_readonly_context(agent)
+    tools = await agent.canonical_tools(ctx)
+
+    assert len(tools) == 2
+    assert tools[0].name == '_my_tool'
+    assert tools[0].__class__.__name__ == 'FunctionTool'
+    assert tools[1].name == 'custom_search'
+    assert tools[1].description == 'Custom search description.'
+    assert tools[1].__class__.__name__ == 'DiscoveryEngineSearchTool'
+    llm_request = LlmRequest()
+    llm_request.append_tools(tools)
+    assert 'custom_search' in llm_request.tools_dict
+    assert llm_request.tools_dict['custom_search'] is tools[1]
+    assert llm_request.config.tools is not None
+    tool_cfg = llm_request.config.tools[0]
+    assert isinstance(tool_cfg, types.Tool)
+    assert tool_cfg.function_declarations is not None
+    declarations = {
+        d.name: d.description for d in tool_cfg.function_declarations
+    }
+    assert declarations.get('custom_search') == 'Custom search description.'
+
+  @mock.patch(
+      'google.auth.default',
+      mock.MagicMock(return_value=('credentials', 'project')),
+  )
+  async def test_handle_vais_with_other_tools_explicit_default_name(
+      self,
+  ) -> None:
+    """Explicit name='vertex_ai_search' is preserved when swapped."""
+    agent = LlmAgent(
+        name='test_agent',
+        model='gemini-pro',
+        tools=[
+            self._my_tool,
+            VertexAiSearchTool(
+                data_store_id='test_data_store_id',
+                bypass_multi_tools_limit=True,
+                name='vertex_ai_search',
+            ),
+        ],
+    )
+    ctx = await _create_readonly_context(agent)
+    tools = await agent.canonical_tools(ctx)
+
+    assert len(tools) == 2
+    assert tools[1].name == 'vertex_ai_search'
+    assert tools[1].__class__.__name__ == 'DiscoveryEngineSearchTool'
+
+  @mock.patch(
+      'google.auth.default',
+      mock.MagicMock(return_value=('credentials', 'project')),
+  )
+  async def test_handle_vais_with_other_tools_custom_description_only(
+      self,
+  ) -> None:
+    """Test that custom description is forwarded when name is not provided."""
+    custom_desc = 'Search the internal knowledge base for product information.'
+    agent = LlmAgent(
+        name='test_agent',
+        model='gemini-pro',
+        tools=[
+            self._my_tool,
+            VertexAiSearchTool(
+                data_store_id='test_data_store_id',
+                bypass_multi_tools_limit=True,
+                description=custom_desc,
+            ),
+        ],
+    )
+    ctx = await _create_readonly_context(agent)
+    tools = await agent.canonical_tools(ctx)
+
+    assert len(tools) == 2
+    assert tools[0].name == '_my_tool'
+    assert tools[1].name == 'discovery_engine_search'
+    assert tools[1].description == custom_desc
+    assert tools[1].__class__.__name__ == 'DiscoveryEngineSearchTool'
+    llm_request = LlmRequest()
+    llm_request.append_tools(tools)
+    assert 'discovery_engine_search' in llm_request.tools_dict
+    assert llm_request.tools_dict['discovery_engine_search'] is tools[1]
+    assert llm_request.config.tools is not None
+    tool_cfg = llm_request.config.tools[0]
+    assert isinstance(tool_cfg, types.Tool)
+    assert tool_cfg.function_declarations is not None
+    declarations = {
+        d.name: d.description for d in tool_cfg.function_declarations
+    }
+    assert declarations.get('discovery_engine_search') == custom_desc
+
+  @mock.patch(
+      'google.auth.default',
+      mock.MagicMock(return_value=('credentials', 'project')),
+  )
+  async def test_handle_vais_with_other_tools_preserves_optional_fields(
+      self,
+  ) -> None:
+    """Test optional VertexAiSearchTool fields are forwarded on swap."""
+    data_store_specs = [
+        types.VertexAISearchDataStoreSpec(data_store='test_data_store')
+    ]
+    agent = LlmAgent(
+        name='test_agent',
+        model='gemini-pro',
+        tools=[
+            self._my_tool,
+            VertexAiSearchTool(
+                search_engine_id='test_search_engine_id',
+                data_store_specs=data_store_specs,
+                filter='test_filter',
+                max_results=5,
+                bypass_multi_tools_limit=True,
+            ),
+        ],
+    )
+    ctx = await _create_readonly_context(agent)
+    tools = await agent.canonical_tools(ctx)
+
+    assert len(tools) == 2
+    assert isinstance(
+        tools[1], discovery_engine_search_tool.DiscoveryEngineSearchTool
+    )
+    assert (
+        tools[1]._serving_config
+        == 'test_search_engine_id/servingConfigs/default_config'
+    )
+    assert tools[1]._search_engine_id == 'test_search_engine_id'
+    assert tools[1]._data_store_specs == data_store_specs
+    assert tools[1]._filter == 'test_filter'
+    assert tools[1]._max_results == 5
+
+  async def test_handle_vais_no_bypass_custom_name_description(self) -> None:
+    """Custom name and description set BaseTool fields when bypass=False."""
+    agent = LlmAgent(
+        name='test_agent',
+        model='gemini-pro',
+        tools=[
+            VertexAiSearchTool(
+                data_store_id='test_data_store_id',
+                bypass_multi_tools_limit=False,
+                name='custom_search',
+                description='Custom search description.',
+            ),
+        ],
+    )
+    ctx = await _create_readonly_context(agent)
+    tools = await agent.canonical_tools(ctx)
+
+    assert len(tools) == 1
+    assert tools[0].name == 'custom_search'
+    assert tools[0].description == 'Custom search description.'
+    assert tools[0].__class__.__name__ == 'VertexAiSearchTool'
+
   async def test_handle_vais_with_other_tools_no_bypass(self):
     """Test that VertexAiSearchTool is not replaced."""
     agent = LlmAgent(
@@ -479,6 +911,115 @@ class TestCanonicalTools:
     assert len(tools) == 1
     assert tools[0].name == 'vertex_ai_search'
     assert tools[0].__class__.__name__ == 'VertexAiSearchTool'
+
+  async def test_handle_google_search_in_hierarchy_with_bypass(self):
+    """Test that google_search with bypass is wrapped when in an agent hierarchy."""
+    search_agent = LlmAgent(
+        name='search_agent',
+        model='gemini-pro',
+        tools=[GoogleSearchTool(bypass_multi_tools_limit=True)],
+    )
+    _ = LlmAgent(
+        name='root_agent',
+        model='gemini-pro',
+        sub_agents=[search_agent],
+    )
+    ctx = await _create_readonly_context(search_agent)
+    tools = await search_agent.canonical_tools(ctx)
+
+    assert len(tools) == 1
+    assert tools[0].name == 'google_search_agent'
+    assert tools[0].__class__.__name__ == 'GoogleSearchAgentTool'
+
+  async def test_handle_google_search_in_hierarchy_no_bypass(self):
+    """Test that google_search without bypass is not wrapped even in a hierarchy."""
+    search_agent = LlmAgent(
+        name='search_agent',
+        model='gemini-pro',
+        tools=[google_search],
+    )
+    _ = LlmAgent(
+        name='root_agent',
+        model='gemini-pro',
+        sub_agents=[search_agent],
+    )
+    ctx = await _create_readonly_context(search_agent)
+    tools = await search_agent.canonical_tools(ctx)
+
+    assert len(tools) == 1
+    assert tools[0].name == 'google_search'
+    assert tools[0].__class__.__name__ == 'GoogleSearchTool'
+
+  @mock.patch(
+      'google.auth.default',
+      mock.MagicMock(return_value=('credentials', 'project')),
+  )
+  async def test_handle_vais_in_hierarchy_with_bypass(self):
+    """Test that VertexAiSearchTool with bypass is replaced when in an agent hierarchy."""
+    search_agent = LlmAgent(
+        name='search_agent',
+        model='gemini-pro',
+        tools=[
+            VertexAiSearchTool(
+                data_store_id='test_data_store_id',
+                bypass_multi_tools_limit=True,
+            ),
+        ],
+    )
+    _ = LlmAgent(
+        name='root_agent',
+        model='gemini-pro',
+        sub_agents=[search_agent],
+    )
+    ctx = await _create_readonly_context(search_agent)
+    tools = await search_agent.canonical_tools(ctx)
+
+    assert len(tools) == 1
+    assert tools[0].name == 'discovery_engine_search'
+    assert tools[0].__class__.__name__ == 'DiscoveryEngineSearchTool'
+
+  async def test_handle_vais_in_hierarchy_no_bypass(self):
+    """Test that VertexAiSearchTool without bypass is not replaced even in a hierarchy."""
+    search_agent = LlmAgent(
+        name='search_agent',
+        model='gemini-pro',
+        tools=[
+            VertexAiSearchTool(
+                data_store_id='test_data_store_id',
+                bypass_multi_tools_limit=False,
+            ),
+        ],
+    )
+    _ = LlmAgent(
+        name='root_agent',
+        model='gemini-pro',
+        sub_agents=[search_agent],
+    )
+    ctx = await _create_readonly_context(search_agent)
+    tools = await search_agent.canonical_tools(ctx)
+
+    assert len(tools) == 1
+    assert tools[0].name == 'vertex_ai_search'
+    assert tools[0].__class__.__name__ == 'VertexAiSearchTool'
+
+  async def test_handle_enterprise_web_search_in_hierarchy(self):
+    """Enterprise web search without bypass remains a built-in search tool in a hierarchy."""
+    search_agent = LlmAgent(
+        name='search_agent',
+        model='gemini-pro',
+        tools=[EnterpriseWebSearchTool()],
+    )
+    _ = LlmAgent(
+        name='root_agent',
+        model='gemini-pro',
+        sub_agents=[search_agent],
+    )
+    ctx = await _create_readonly_context(search_agent)
+    tools = await search_agent.canonical_tools(ctx)
+
+    assert len(tools) == 1
+    assert tools[0].name == 'enterprise_web_search'
+    assert tools[0].__class__.__name__ == 'EnterpriseWebSearchTool'
 
   async def test_multiple_tools_resolution(self):
     """Test that multiple tools are resolved correctly."""
@@ -534,6 +1075,66 @@ class TestCanonicalTools:
     assert len(tools) == 2
     assert tools[0].name == '_regular_tool'
     assert tools[1].name == 'working_tool'
+
+  async def test_canonical_tools_reports_the_toolset_it_dropped(self, caplog):
+    """A toolset that fails to load is reported at error level, with context."""
+    from google.adk.tools.base_toolset import BaseToolset
+
+    class FailingToolset(BaseToolset):
+
+      async def get_tools(self, readonly_context=None):
+        raise ConnectionError('MCP server unavailable')
+
+    agent = LlmAgent(
+        name='test_agent',
+        model='gemini-pro',
+        tools=[FailingToolset(tool_name_prefix='books')],
+    )
+    ctx = await _create_readonly_context(agent)
+
+    with caplog.at_level(logging.ERROR, logger='google_adk'):
+      tools = await agent.canonical_tools(ctx)
+
+    assert tools == []
+    record = next(
+        r for r in caplog.records if 'failed to load' in r.getMessage()
+    )
+    message = record.getMessage()
+    assert 'test_agent' in message
+    assert 'FailingToolset' in message
+    assert 'books' in message
+    assert 'MCP server unavailable' in message
+    # The traceback is what identifies where inside the toolset it broke.
+    assert record.exc_info is not None
+
+  @pytest.mark.parametrize(
+      'docstring, expected_desc',
+      [
+          (None, 'Executes the node: compute'),
+          ('Doubles the input value.', 'Doubles the input value.'),
+      ],
+  )
+  async def test_handle_base_node_in_tools(self, docstring, expected_desc):
+    """Test that BaseNode in agent.tools is adapted into a NodeTool with fallback description."""
+
+    def compute(x: int) -> int:
+      return x * 2
+
+    compute.__doc__ = docstring
+    compute_node = FunctionNode(func=compute)
+    agent = LlmAgent(name='test_agent', tools=[compute_node])
+
+    assert len(agent.tools) == 1
+    assert agent.tools[0].__class__.__name__ == 'NodeTool'
+    assert agent.tools[0].node.name == compute_node.name
+
+    ctx = await _create_readonly_context(agent)
+    tools = await agent.canonical_tools(ctx)
+    assert len(tools) == 1
+    decl = tools[0]._get_declaration()
+    assert decl is not None
+    assert decl.name == 'compute'
+    assert decl.description == expected_desc
 
 
 # Tests for multi-provider model support via string model names
@@ -603,3 +1204,293 @@ def test_builtin_planner_overwrite_logging(caplog):
       'Overwriting `thinking_config` from `generate_content_config`'
       in caplog.text
   )
+
+
+def _callback_a(**kwargs) -> None:
+  return None
+
+
+def _callback_b(**kwargs) -> None:
+  return None
+
+
+_OMITTED = object()
+
+# (field name, name of the canonical property that resolves it)
+_CANONICAL_CALLBACK_PROPERTIES = [
+    ('before_model_callback', 'canonical_before_model_callbacks'),
+    ('after_model_callback', 'canonical_after_model_callbacks'),
+    ('on_model_error_callback', 'canonical_on_model_error_callbacks'),
+    ('before_tool_callback', 'canonical_before_tool_callbacks'),
+    ('after_tool_callback', 'canonical_after_tool_callbacks'),
+    ('on_tool_error_callback', 'canonical_on_tool_error_callbacks'),
+]
+
+
+@pytest.mark.parametrize(
+    'field_name, property_name', _CANONICAL_CALLBACK_PROPERTIES
+)
+@pytest.mark.parametrize('value', [_OMITTED, None], ids=['omitted', 'none'])
+def test_canonical_callbacks_unset_resolves_to_empty_list(
+    field_name, property_name, value
+):
+  """Callers iterate the canonical list directly, so it is never None."""
+  kwargs = {} if value is _OMITTED else {field_name: value}
+  agent = LlmAgent(name='test_agent', **kwargs)
+
+  assert getattr(agent, property_name) == []
+
+
+@pytest.mark.parametrize(
+    'field_name, property_name', _CANONICAL_CALLBACK_PROPERTIES
+)
+def test_canonical_callbacks_single_callable_resolves_to_one_element_list(
+    field_name, property_name
+):
+  """A bare callable is wrapped so callers only ever handle the list form."""
+  agent = LlmAgent(name='test_agent', **{field_name: _callback_a})
+
+  assert getattr(agent, property_name) == [_callback_a]
+
+
+@pytest.mark.parametrize(
+    'field_name, property_name', _CANONICAL_CALLBACK_PROPERTIES
+)
+def test_canonical_callbacks_list_keeps_declaration_order(
+    field_name, property_name
+):
+  """Order matters: the chain stops at the first callback that answers."""
+  agent = LlmAgent(
+      name='test_agent', **{field_name: [_callback_a, _callback_b]}
+  )
+
+  assert getattr(agent, property_name) == [_callback_a, _callback_b]
+
+
+def test_canonical_model_skips_non_llm_agent_ancestor():
+  """A non-LLM ancestor in the tree does not stop model inheritance."""
+  leaf = LlmAgent(name='leaf_agent')
+  non_llm_agent = BaseAgent(name='non_llm_agent', sub_agents=[leaf])
+  _ = LlmAgent(
+      name='root_agent', model='gemini-2.5-flash', sub_agents=[non_llm_agent]
+  )
+
+  assert leaf.canonical_model.model == 'gemini-2.5-flash'
+
+
+def test_canonical_model_uses_nearest_ancestor_with_a_model():
+  leaf = LlmAgent(name='leaf_agent')
+  middle = LlmAgent(
+      name='middle_agent', model='gemini-2.0-flash', sub_agents=[leaf]
+  )
+  _ = LlmAgent(name='root_agent', model='gemini-2.5-flash', sub_agents=[middle])
+
+  assert leaf.canonical_model.model == 'gemini-2.0-flash'
+
+
+def test_canonical_live_model_falls_back_to_live_default_through_ancestors():
+  """Walking up model-less ancestors in live mode ends at the live default."""
+  original_model = LlmAgent._default_model
+  original_live_model = LlmAgent._default_live_model
+  LlmAgent.set_default_model('gemini-2.5-flash')
+  LlmAgent.set_default_live_model('gemini-2.0-flash-live-001')
+  try:
+    leaf = LlmAgent(name='leaf_agent')
+    _ = LlmAgent(name='root_agent', sub_agents=[leaf])
+
+    assert leaf.canonical_live_model.model == 'gemini-2.0-flash-live-001'
+    assert leaf.canonical_model.model == 'gemini-2.5-flash'
+  finally:
+    LlmAgent.set_default_model(original_model)
+    LlmAgent.set_default_live_model(original_live_model)
+
+
+async def test_canonical_global_instruction_str_warns_deprecated():
+  agent = LlmAgent(name='test_agent', global_instruction='global instruction')
+  ctx = await _create_readonly_context(agent)
+
+  with pytest.warns(
+      DeprecationWarning, match='global_instruction field is deprecated'
+  ):
+    instruction, bypass_state_injection = (
+        await agent.canonical_global_instruction(ctx)
+    )
+
+  assert instruction == 'global instruction'
+  assert not bypass_state_injection
+
+
+async def test_canonical_global_instruction_unset_does_not_warn():
+  """Agents that never opted into the deprecated field must stay quiet."""
+  agent = LlmAgent(name='test_agent')
+  ctx = await _create_readonly_context(agent)
+
+  with warnings.catch_warnings():
+    warnings.simplefilter('error', DeprecationWarning)
+    instruction, bypass_state_injection = (
+        await agent.canonical_global_instruction(ctx)
+    )
+
+  assert instruction == ''
+  assert not bypass_state_injection
+
+
+def test_validate_generate_content_config_none_becomes_empty_config():
+  agent = LlmAgent(name='test_agent', generate_content_config=None)
+  other_agent = LlmAgent(name='other_agent', generate_content_config=None)
+
+  assert agent.generate_content_config == types.GenerateContentConfig()
+  # Each agent must own its config, otherwise one agent's later edits would
+  # silently apply to every other agent.
+  assert (
+      agent.generate_content_config is not other_agent.generate_content_config
+  )
+
+
+def _plain_tool_1():
+  pass
+
+
+def _plain_tool_2():
+  pass
+
+
+def _toolset_tool_1():
+  pass
+
+
+def _toolset_tool_2():
+  pass
+
+
+class _TwoToolToolset(BaseToolset):
+  """A toolset that expands into two tools and records the context it saw."""
+
+  def __init__(self):
+    super().__init__()
+    self.received_context = 'get_tools was never called'
+
+  async def get_tools(self, readonly_context=None):
+    self.received_context = readonly_context
+    return [
+        FunctionTool(func=_toolset_tool_1),
+        FunctionTool(func=_toolset_tool_2),
+    ]
+
+
+async def test_canonical_tools_flattens_toolsets_in_declared_order():
+  """Toolsets resolve concurrently but must land in the declared position."""
+  agent = LlmAgent(
+      name='test_agent',
+      model='gemini-pro',
+      tools=[_plain_tool_1, _TwoToolToolset(), _plain_tool_2],
+  )
+  ctx = await _create_readonly_context(agent)
+
+  tools = await agent.canonical_tools(ctx)
+
+  assert [tool.name for tool in tools] == [
+      '_plain_tool_1',
+      '_toolset_tool_1',
+      '_toolset_tool_2',
+      '_plain_tool_2',
+  ]
+
+
+async def test_canonical_tools_without_context_passes_none_to_toolset():
+  """Callers outside an invocation (e.g. agent cards) pass no context."""
+  toolset = _TwoToolToolset()
+  agent = LlmAgent(
+      name='test_agent', model='gemini-pro', tools=[_plain_tool_1, toolset]
+  )
+
+  tools = await agent.canonical_tools()
+
+  assert [tool.name for tool in tools] == [
+      '_plain_tool_1',
+      '_toolset_tool_1',
+      '_toolset_tool_2',
+  ]
+  assert toolset.received_context is None
+
+
+@pytest.mark.asyncio
+async def test_canonical_model_async_matches_the_property():
+  # A model name rather than an instance, so that canonical_model and
+  # canonical_live_model resolve to distinct objects and the assertion can
+  # tell which one came back.
+  agent = LlmAgent(name='test_agent', model='gemini-pro')
+  ctx = await _create_readonly_context(agent)
+
+  assert await agent.canonical_model_async(ctx) is agent.canonical_model
+
+
+@pytest.mark.asyncio
+async def test_canonical_model_async_inherits_from_an_ancestor():
+  sub_agent = LlmAgent(name='sub_agent')
+  parent_agent = LlmAgent(
+      name='parent_agent', model='gemini-pro', sub_agents=[sub_agent]
+  )
+  ctx = await _create_readonly_context(sub_agent)
+
+  assert (
+      await sub_agent.canonical_model_async(ctx) is parent_agent.canonical_model
+  )
+
+
+@pytest.mark.asyncio
+async def test_canonical_model_async_reuses_the_resolved_instance():
+  # It goes through the property, so a name is still resolved only once.
+  agent = LlmAgent(name='test_agent', model='gemini-pro')
+  ctx = await _create_readonly_context(agent)
+
+  with mock.patch.object(
+      LLMRegistry, 'new_llm', wraps=LLMRegistry.new_llm
+  ) as new_llm:
+    first = await agent.canonical_model_async(ctx)
+    second = await agent.canonical_model_async(ctx)
+
+  assert new_llm.call_count == 1
+  assert first is second
+
+
+@pytest.mark.asyncio
+async def test_canonical_live_model_async_matches_the_property():
+  agent = LlmAgent(name='test_agent', model='gemini-pro')
+  ctx = await _create_readonly_context(agent)
+
+  assert (
+      await agent.canonical_live_model_async(ctx) is agent.canonical_live_model
+  )
+
+
+def test_llm_agent_iter_static_children_sub_agents_and_node_tools():
+  """LlmAgent._iter_static_children yields sub-agents and NodeTool/BaseNode tools."""
+  from google.adk.tools.agent_tool import AgentTool
+  from google.adk.workflow import BaseNode
+  from google.adk.workflow import START
+  from google.adk.workflow import Workflow
+
+  sub_agent = LlmAgent(name='sub')
+  wf_as_tool = Workflow(
+      name='tool_wf',
+      input_schema=str,
+      edges=[(START, BaseNode(name='wf_node'))],
+  )
+  agent_tool_agent = LlmAgent(name='standalone_agent')
+  agent_tool = AgentTool(agent=agent_tool_agent)
+  standalone_node = BaseNode(name='appended_node')
+
+  def my_tool():
+    pass
+
+  parent = LlmAgent(
+      name='parent',
+      sub_agents=[sub_agent],
+      tools=[wf_as_tool, agent_tool, my_tool],
+  )
+  parent.tools.append(standalone_node)
+
+  children = list(parent._iter_static_children())
+  assert [c.name for c in children] == ['sub', 'tool_wf', 'appended_node']
+  assert agent_tool_agent not in children

@@ -14,7 +14,19 @@
 
 from __future__ import annotations
 
+import json
+from typing import Any
+
 from google.genai import types
+from pydantic import BaseModel
+
+SKIP_THOUGHT_SIGNATURE_VALIDATOR: bytes = b'skip_thought_signature_validator'
+"""Placeholder ``Part.thought_signature`` that bypasses backend validation.
+
+Set it on a part you synthesize yourself (a model turn or tool call/response
+the model never produced) so the Gemini backend accepts the fabricated part
+instead of rejecting it for a missing signature.
+"""
 
 
 def is_audio_part(part: types.Part) -> bool:
@@ -38,8 +50,80 @@ def filter_audio_parts(content: types.Content) -> types.Content | None:
   return types.Content(role=content.role, parts=filtered_parts)
 
 
-def extract_text_from_content(content: types.Content | None) -> str:
-  """Extracts text from a Content object, filtering out thoughts."""
+def _is_adk_live_artifact_part(part: types.Part) -> bool:
+  """Returns whether `part` references an internal `_adk_live` artifact."""
+  if part.file_data is None:
+    return False
+  file_uri = part.file_data.file_uri or ''
+  return file_uri.startswith('artifact://') and '/_adk_live/' in file_uri
+
+
+def _filter_media_parts(content: types.Content) -> types.Content | None:
+  """Filters media parts out of history replayed to a live connection.
+
+  Removes internal `_adk_live` artifact references (audio and other media
+  persisted when `save_live_blob` is enabled) and any remaining audio parts.
+  Inline image and video parts (e.g. sent via `send_content`) are kept.
+
+  Args:
+    content: The content to filter. It is not modified.
+
+  Returns:
+    A new content with the same role and the remaining parts, or None if no
+    parts remain.
+  """
+  if not content.parts:
+    return None
+  filtered_parts = [
+      part
+      for part in content.parts
+      if not is_audio_part(part) and not _is_adk_live_artifact_part(part)
+  ]
+  if not filtered_parts:
+    return None
+  return types.Content(role=content.role, parts=filtered_parts)
+
+
+def extract_text_from_content(
+    content: types.Content | None, splitter: str = ''
+) -> str:
+  """Extracts text from a Content object, filtering out thoughts.
+
+  Args:
+    content: The content object to extract text from, or None.
+    splitter: Separator used when joining text across parts. Defaults to `''`
+      for chunked model output that forms a single logical string; callers
+      joining distinct user text parts typically pass `' '`.
+
+  Returns:
+    The joined non-thought text from `content`, or `''` if `content` is None or
+    contains no non-empty non-thought text parts.
+  """
   if not content or not content.parts:
     return ''
-  return ''.join(p.text for p in content.parts if p.text and not p.thought)
+  return splitter.join(
+      p.text for p in content.parts if p.text and not p.thought
+  )
+
+
+def to_user_content(value: Any) -> types.Content:
+  """Coerces an arbitrary value into a user-role Content.
+
+  - types.Content -> re-wrapped with role='user' (parts list shared, not
+    deep-copied)
+  - str -> single text part
+  - BaseModel -> model_dump_json() text part
+  - dict/list -> json.dumps() text part (non-ASCII preserved, not escaped)
+  - anything else -> str() text part
+  """
+  if isinstance(value, types.Content):
+    return types.Content(role='user', parts=value.parts)
+  if isinstance(value, str):
+    text = value
+  elif isinstance(value, BaseModel):
+    text = value.model_dump_json()
+  elif isinstance(value, (dict, list)):
+    text = json.dumps(value, ensure_ascii=False)
+  else:
+    text = str(value)
+  return types.Content(role='user', parts=[types.Part(text=text)])

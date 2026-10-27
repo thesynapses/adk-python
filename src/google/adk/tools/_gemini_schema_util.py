@@ -14,15 +14,19 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
+from typing import Literal
 from typing import Optional
+import urllib.parse
 
 from google.genai.types import JSONSchema
 from google.genai.types import Schema
 from pydantic import Field
 
 from ..utils.variant_utils import get_google_llm_variant
+from ..utils.variant_utils import GoogleLLMVariant
 
 
 class _ExtendedJSONSchema(JSONSchema):
@@ -100,20 +104,74 @@ def _sanitize_schema_type(
   if is_array:
     schema.setdefault("items", {"type": "string"})
 
+  effective_type = schema_type
+  if isinstance(schema_type, list):
+    non_null = [t for t in schema_type if t != "null"]
+    effective_type = non_null[0] if non_null else None
+  if effective_type == "string" and isinstance(schema.get("enum"), list):
+    # Gemini rejects non-string enum values on a string-typed field; some
+    # servers emit integer enums on string fields, so render them in their
+    # JSON form. A null member is dropped: nullability is carried by the
+    # schema type, not by an enum entry.
+    schema["enum"] = [
+        v if isinstance(v, str) else json.dumps(v)
+        for v in schema["enum"]
+        if v is not None
+    ]
+
   return schema
 
 
+def _resolve_json_pointer(ref_path: str, root: dict[str, Any]) -> object | None:
+  """Resolves a URI-fragment JSON Pointer (e.g. '#' or '#/path/to/node').
+
+  Returns the referenced value, or None if the pointer is not a valid URI
+  fragment, the path does not exist, or the target value itself is None (JSON
+  null, which callers treat the same as an unresolved path for defs fallback).
+  """
+  if ref_path == "#":
+    return root
+  if not ref_path.startswith("#/"):
+    return None
+  parts = [urllib.parse.unquote(part) for part in ref_path[2:].split("/")]
+  current: object = root
+  for part in parts:
+    part = part.replace("~1", "/").replace("~0", "~")
+    if isinstance(current, dict):
+      if part not in current:
+        return None
+      current = current[part]
+    elif isinstance(current, list):
+      if not re.fullmatch(r"0|[1-9][0-9]*", part):
+        return None
+      idx = int(part)
+      if idx >= len(current):
+        return None
+      current = current[idx]
+    else:
+      return None
+  return current
+
+
 def _dereference_schema(schema: dict[str, Any]) -> dict[str, Any]:
-  """Resolves $ref pointers in a JSON schema."""
+  """Resolves $ref pointers in a JSON schema.
+
+  Unresolvable or dangling $ref nodes, as well as references resolving to
+  non-dict values, are left unchanged in the returned schema. Downstream
+  consumers are responsible for validating that all required references were
+  dereferenced.
+  """
 
   # Support both the draft 2019-09+/2020-12 keyword (`$defs`) and the
   # draft-07 keyword (`definitions`). The MCP specification allows tool
   # `inputSchema`s to use either, so a server sending draft-07 schemas with
   # `definitions` + `$ref: "#/definitions/..."` must dereference correctly.
-  # `$defs` takes precedence on the (pathological) key collision.
+  # If the same definition key appears in both `definitions` and `$defs`,
+  # `$defs` takes precedence. Note that JSON Pointer resolution takes
+  # precedence over `defs` lookups.
   defs = {**schema.get("definitions", {}), **schema.get("$defs", {})}
 
-  def _resolve_refs(sub_schema: Any, path_refs: frozenset[str]) -> Any:
+  def _resolve_refs(sub_schema: object, path_refs: frozenset[str]) -> object:
     if isinstance(sub_schema, dict):
       if "$ref" in sub_schema:
         ref_uri = sub_schema["$ref"]
@@ -127,18 +185,29 @@ def _dereference_schema(schema: dict[str, Any]) -> dict[str, Any]:
 
         new_path = path_refs | {ref_uri}
 
-        if ref_key in defs:
-          # Found the reference, replace it with the definition.
+        # Try to resolve as a JSON Pointer reference (e.g. #/properties/foo).
+        resolved = _resolve_json_pointer(ref_uri, schema)
+        if isinstance(resolved, dict):
+          resolved_copy = resolved.copy()
+          sub_schema_copy = sub_schema.copy()
+          del sub_schema_copy["$ref"]
+          resolved_copy.update(sub_schema_copy)
+          return _resolve_refs(resolved_copy, new_path)
+
+        # Fall back to defs lookup if the definition key exists.
+        if (
+            resolved is None
+            and ref_key in defs
+            and isinstance(defs[ref_key], dict)
+        ):
           resolved = defs[ref_key].copy()
-          # Merge properties from the reference, allowing overrides.
           sub_schema_copy = sub_schema.copy()
           del sub_schema_copy["$ref"]
           resolved.update(sub_schema_copy)
-          # Recursively resolve refs in the newly inserted part.
           return _resolve_refs(resolved, new_path)
-        else:
-          # Reference not found, return as is.
-          return sub_schema
+
+        # Reference not found or resolves to a non-dict, return as is.
+        return sub_schema
       else:
         # No $ref, so traverse deeper into the dictionary.
         return {
@@ -153,6 +222,10 @@ def _dereference_schema(schema: dict[str, Any]) -> dict[str, Any]:
       return sub_schema
 
   dereferenced_schema = _resolve_refs(schema, frozenset())
+  if not isinstance(dereferenced_schema, dict) or not all(
+      isinstance(key, str) for key in dereferenced_schema
+  ):
+    raise TypeError("Dereferenced JSON schema must remain an object.")
   # Remove the definition blocks after resolving so the leftover keywords do
   # not leak into the Gemini schema (which would otherwise raise a KeyError).
   for defs_keyword in ("$defs", "definitions"):
@@ -187,7 +260,8 @@ def _sanitize_schema_formats_for_gemini(
   supported_fields.discard("additional_properties")
   schema_field_names: set[str] = {"items"}
   list_schema_field_names: set[str] = {
-      "any_of",  # 'one_of', 'all_of', 'not' to come
+      "any_of",
+      "one_of",  # 'all_of', 'not' to come
   }
   snake_case_schema: dict[str, Any] = {}
   dict_schema_field_names: tuple[str, ...] = (
@@ -202,12 +276,25 @@ def _sanitize_schema_formats_for_gemini(
       )
     elif field_name in list_schema_field_names:
       should_preserve = field_name in ("any_of", "one_of")
-      snake_case_schema[field_name] = [
+      sanitized_branches = [
           _sanitize_schema_formats_for_gemini(
               value, preserve_null_type=should_preserve
           )
           for value in field_value
       ]
+      if field_name == "one_of":
+        # Gemini's Schema has no one_of and the conversion drops an unknown
+        # field silently, which would leave the property with no type at all.
+        # Widening to any_of keeps the branch types; the difference is that
+        # any_of also accepts a value matching more than one branch.
+        field_name = "any_of"
+      if field_name == "any_of":
+        # A schema may carry both keywords, in either order, so accumulate
+        # instead of letting whichever comes second win.
+        sanitized_branches = (
+            snake_case_schema.get("any_of", []) + sanitized_branches
+        )
+      snake_case_schema[field_name] = sanitized_branches
     elif field_name in dict_schema_field_names and field_value is not None:
       snake_case_schema[field_name] = {
           key: _sanitize_schema_formats_for_gemini(value)
@@ -241,7 +328,11 @@ def _to_gemini_schema(openapi_schema: dict[str, Any]) -> Schema:
 
   dereferenced_schema = _dereference_schema(openapi_schema)
   sanitized_schema = _sanitize_schema_formats_for_gemini(dereferenced_schema)
+  variant = get_google_llm_variant()
+  api_option: Literal["VERTEX_AI", "GEMINI_API"] = (
+      "VERTEX_AI" if variant is GoogleLLMVariant.VERTEX_AI else "GEMINI_API"
+  )
   return Schema.from_json_schema(
       json_schema=_ExtendedJSONSchema.model_validate(sanitized_schema),
-      api_option=get_google_llm_variant(),
+      api_option=api_option,
   )

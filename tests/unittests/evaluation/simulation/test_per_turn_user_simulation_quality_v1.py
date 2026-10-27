@@ -514,6 +514,32 @@ def test_evaluate_first_turn_failure():
   assert result.eval_status == EvalStatus.FAILED
 
 
+@pytest.mark.parametrize(
+    "user_content",
+    [
+        types.Content(role="user", parts=[]),
+        types.Content(),
+    ],
+)
+def test_evaluate_first_turn_not_evaluated_when_user_content_has_no_text(
+    user_content,
+):
+  """First turn with empty/None parts is not evaluated instead of crashing."""
+  evaluator = _create_test_evaluator(
+      threshold=1.0, stop_signal="test stop signal"
+  )
+  conversation_scenario = _create_test_conversation_scenario(
+      conversation_plan="plan",
+      starting_prompt="test starting prompt",
+  )
+  invocation = Invocation(invocation_id="1", user_content=user_content)
+
+  result = evaluator._evaluate_first_turn(invocation, conversation_scenario)  # pylint: disable=protected-access
+
+  assert result.score is None
+  assert result.eval_status == EvalStatus.NOT_EVALUATED
+
+
 def test_aggregate_conversation_results_all_pass_produces_pass():
   evaluator = _create_test_evaluator()
   results = [
@@ -696,3 +722,61 @@ async def test_evaluate_invocations_none_judge_model_config():
 
   assert result.overall_score == 1.0
   assert result.overall_eval_status == EvalStatus.PASSED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "user_judge_model_config",
+    [
+        None,
+        genai_types.GenerateContentConfig(temperature=0.3),
+    ],
+    ids=["default_config", "user_supplied_config"],
+)
+async def test_evaluate_invocations_judge_request_disables_afc(
+    user_judge_model_config,
+):
+  # Judge requests must disable google-genai's automatic function calling
+  # regardless of whether the caller supplied a judge_model_config, since the
+  # judge never calls tools and leaving AFC on only produces a spurious
+  # per-request warning on every eval run.
+  evaluator = PerTurnUserSimulatorQualityV1(
+      EvalMetric(
+          metric_name="test_per_turn_user_simulator_quality_v1",
+          threshold=1.0,
+          criterion=LlmBackedUserSimulatorCriterion(
+              threshold=1.0,
+              stop_signal="test stop signal",
+              judge_model_options=JudgeModelOptions(
+                  judge_model="gemini-2.5-flash",
+                  judge_model_config=user_judge_model_config,
+                  num_samples=1,
+              ),
+          ),
+      ),
+  )
+
+  captured_requests = []
+
+  async def capture_sample(llm_request):
+    captured_requests.append(llm_request)
+    return AutoRaterScore(score=1.0)
+
+  evaluator._sample_llm = capture_sample  # pylint: disable=protected-access
+  starting_prompt = "first user prompt."
+  conversation_scenario = _create_test_conversation_scenario(
+      starting_prompt=starting_prompt
+  )
+  invocations = _create_test_invocations(
+      [starting_prompt, "model 1.", "user 2.", "model 2."]
+  )
+  await evaluator.evaluate_invocations(
+      actual_invocations=invocations,
+      expected_invocations=None,
+      conversation_scenario=conversation_scenario,
+  )
+
+  assert captured_requests
+  for request in captured_requests:
+    assert request.config.automatic_function_calling is not None
+    assert request.config.automatic_function_calling.disable is True

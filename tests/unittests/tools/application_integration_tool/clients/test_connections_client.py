@@ -54,15 +54,37 @@ class TestConnectionsClient:
 
   def test_initialization(self, project, location, connection_name):
     credentials = {"email": "test@example.com"}
-    client = ConnectionsClient(
-        project, location, connection_name, json.dumps(credentials)
-    )
-    assert client.project == project
-    assert client.location == location
-    assert client.connection == connection_name
-    assert client.connector_url == "https://connectors.googleapis.com"
-    assert client.service_account_json == json.dumps(credentials)
-    assert client.credential_cache is None
+    with mock.patch(
+        "google.adk.tools.application_integration_tool.clients.connections_client._mtls_utils.get_api_endpoint",
+        return_value="connectors.googleapis.com",
+    ) as mock_get_api_endpoint:
+      client = ConnectionsClient(
+          project, location, connection_name, json.dumps(credentials)
+      )
+      assert client.project == project
+      assert client.location == location
+      assert client.connection == connection_name
+      assert client.connector_url == "https://connectors.googleapis.com"
+      assert client.service_account_json == json.dumps(credentials)
+      assert client.credential_cache is None
+      mock_get_api_endpoint.assert_called_once_with(
+          location,
+          "connectors.googleapis.com",
+          "connectors.mtls.googleapis.com",
+      )
+
+  def test_initialization_mtls_endpoint(
+      self, project, location, connection_name
+  ):
+    credentials = {"email": "test@example.com"}
+    with mock.patch(
+        "google.adk.tools.application_integration_tool.clients.connections_client._mtls_utils.get_api_endpoint",
+        return_value="connectors.mtls.googleapis.com",
+    ):
+      client = ConnectionsClient(
+          project, location, connection_name, json.dumps(credentials)
+      )
+      assert client.connector_url == "https://connectors.mtls.googleapis.com"
 
   def test_execute_api_call_success(
       self, project, location, connection_name, mock_credentials
@@ -88,6 +110,7 @@ class TestConnectionsClient:
               "Content-Type": "application/json",
               "Authorization": f"Bearer {mock_credentials.token}",
           },
+          timeout=30,
       )
 
   def test_execute_api_call_credential_error(
@@ -261,7 +284,13 @@ class TestConnectionsClient:
       self, project, location, connection_name, mock_credentials
   ):
     credentials = {"email": "test@example.com"}
-    client = ConnectionsClient(project, location, connection_name, credentials)
+    with mock.patch(
+        "google.adk.tools.application_integration_tool.clients.connections_client._mtls_utils.get_api_endpoint",
+        return_value="connectors.googleapis.com",
+    ):
+      client = ConnectionsClient(
+          project, location, connection_name, credentials
+      )
     mock_execute_response_initial = mock.MagicMock()
     mock_execute_response_initial.status_code = 200
     mock_execute_response_initial.json.return_value = {
@@ -335,7 +364,13 @@ class TestConnectionsClient:
       self, project, location, connection_name, mock_credentials
   ):
     credentials = {"email": "test@example.com"}
-    client = ConnectionsClient(project, location, connection_name, credentials)
+    with mock.patch(
+        "google.adk.tools.application_integration_tool.clients.connections_client._mtls_utils.get_api_endpoint",
+        return_value="connectors.googleapis.com",
+    ):
+      client = ConnectionsClient(
+          project, location, connection_name, credentials
+      )
     mock_execute_response_initial = mock.MagicMock()
     mock_execute_response_initial.status_code = 200
     mock_execute_response_initial.json.return_value = {
@@ -419,6 +454,51 @@ class TestConnectionsClient:
     ):
       with pytest.raises(ValueError, match="Request error"):
         client.get_action_schema("action1")
+
+  def test_poll_operation_done_on_first_poll_does_not_sleep(
+      self, project, location, connection_name
+  ):
+    credentials = {"email": "test@example.com"}
+    client = ConnectionsClient(project, location, connection_name, credentials)
+    mock_response = mock.MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"done": True, "response": {"a": 1}}
+
+    with mock.patch.object(
+        client, "_execute_api_call", return_value=mock_response
+    ) as mock_execute_api_call:
+      with mock.patch(
+          "google.adk.tools.application_integration_tool.clients.connections_client.time.sleep"
+      ) as mock_sleep:
+        result = client._poll_operation("operations/test_op")
+
+    assert result == {"done": True, "response": {"a": 1}}
+    assert mock_execute_api_call.call_count == 1
+    assert mock_sleep.call_count == 0
+
+  def test_poll_operation_sleeps_only_between_polls(
+      self, project, location, connection_name
+  ):
+    credentials = {"email": "test@example.com"}
+    client = ConnectionsClient(project, location, connection_name, credentials)
+    responses = []
+    for done in (False, False, True):
+      mock_response = mock.MagicMock()
+      mock_response.status_code = 200
+      mock_response.json.return_value = {"done": done}
+      responses.append(mock_response)
+
+    with mock.patch.object(
+        client, "_execute_api_call", side_effect=responses
+    ) as mock_execute_api_call:
+      with mock.patch(
+          "google.adk.tools.application_integration_tool.clients.connections_client.time.sleep"
+      ) as mock_sleep:
+        result = client._poll_operation("operations/test_op")
+
+    assert result == {"done": True}
+    assert mock_execute_api_call.call_count == 3
+    assert mock_sleep.call_args_list == [mock.call(1), mock.call(1)]
 
   def test_get_connector_base_spec(self):
     spec = ConnectionsClient.get_connector_base_spec()

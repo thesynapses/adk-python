@@ -16,11 +16,15 @@ from __future__ import annotations
 
 """Unit tests for the helper methods on the Event class."""
 
+import copy
+import json
+
 from google.adk.events.event import Event
 from google.adk.events.event import NodeInfo
 from google.adk.events.event_actions import EventActions
 from google.adk.events.request_input import RequestInput
 from google.genai import types
+import pydantic
 import pytest
 
 
@@ -99,6 +103,42 @@ def test_is_final_response_long_running_tool_ids_overrides_function_call():
       parts=[_function_call_part()], long_running_tool_ids={'tool-1'}
   )
   assert event.is_final_response() is True
+
+
+def test_is_final_response_error_event_is_final():
+  event = _event(
+      parts=[_text_part()],
+      error_code='SOME_ERROR',
+      error_message='Something went wrong',
+  )
+  assert event.is_final_response() is True
+
+
+def test_is_final_response_error_event_with_function_response_is_final():
+  event = _event(
+      parts=[_function_response_part()],
+      error_code='SOME_ERROR',
+      error_message='Something went wrong',
+  )
+  assert event.is_final_response() is True
+
+
+def test_is_final_response_error_event_with_function_call_is_not_final():
+  event = _event(
+      parts=[_function_call_part()],
+      error_code='SOME_ERROR',
+      error_message='Something went wrong',
+  )
+  assert event.is_final_response() is False
+
+
+def test_is_final_response_partial_error_event_is_not_final():
+  event = _event(
+      parts=[_text_part()],
+      error_code='SOME_ERROR',
+      partial=True,
+  )
+  assert event.is_final_response() is False
 
 
 # --- get_function_calls ------------------------------------------------------
@@ -372,6 +412,24 @@ class TestMessageSerialization:
     assert restored.message is not None
     assert restored.message.parts[0].text == 'Hello!'
 
+  def test_model_validate_does_not_mutate_input_dict(self):
+    data = {
+        'message': 'Hello!',
+        'state': {'key': 'value'},
+        'route': 'next',
+        'node_path': 'root.node',
+    }
+    original = copy.deepcopy(data)
+
+    event = Event.model_validate(data)
+
+    assert data == original
+    assert event.content is not None
+    assert event.content.parts[0].text == 'Hello!'
+    assert event.actions.state_delta == {'key': 'value'}
+    assert event.actions.route == 'next'
+    assert event.node_info.path == 'root.node'
+
 
 class TestMessageWithOtherKwargs:
   """Tests message combined with other convenience kwargs."""
@@ -425,3 +483,140 @@ class TestMessageSubclassField:
     content = types.Content(parts=[types.Part(text='hi')], role='model')
     event = Event(content=content)
     assert event.message is event.content
+
+
+_TOOL_IDS = frozenset(
+    {'call_1', 'call_2', 'call_3', 'call_4', 'aaa', 'zzz', 'mmm', 'kkk'}
+)
+
+
+class TestLongRunningToolIdsSerialization:
+  """`long_running_tool_ids` must serialize the same way in every process.
+
+  The field is a set, and set iteration order depends on the per-process
+  randomized string hash seed. Without a stable order, the very same unchanged
+  event serializes to different JSON in each process, so a client that diffs
+  serialized events (a debugger UI re-rendering a conversation, a cache keyed
+  on the payload) believes every event changed on every fetch.
+  """
+
+  def test_json_dump_is_sorted(self):
+    event = Event(author='user', long_running_tool_ids=set(_TOOL_IDS))
+
+    dumped = json.loads(event.model_dump_json(exclude_none=True))
+
+    assert dumped['long_running_tool_ids'] == sorted(_TOOL_IDS)
+
+  def test_python_dump_is_sorted(self):
+    event = Event(author='user', long_running_tool_ids=set(_TOOL_IDS))
+
+    dumped = event.model_dump(exclude_none=True)
+
+    assert dumped['long_running_tool_ids'] == sorted(_TOOL_IDS)
+
+  def test_round_trips_back_to_an_equal_set(self):
+    event = Event(author='user', long_running_tool_ids=set(_TOOL_IDS))
+
+    restored = Event.model_validate_json(event.model_dump_json())
+
+    assert restored.long_running_tool_ids == set(_TOOL_IDS)
+
+  def test_unset_value_stays_none(self):
+    event = Event(author='user')
+
+    assert event.model_dump()['long_running_tool_ids'] is None
+    assert 'long_running_tool_ids' not in event.model_dump(exclude_none=True)
+
+  def test_empty_set_stays_empty(self):
+    event = Event(author='user', long_running_tool_ids=set())
+
+    assert event.model_dump(exclude_none=True)['long_running_tool_ids'] == []
+
+
+class TestConvenienceKwargsMerge:
+  """Tests convenience kwargs merging into existing actions and node_info."""
+
+  @pytest.mark.parametrize(
+      'actions',
+      [
+          EventActions(skip_summarization=True, escalate=True),
+          {'skip_summarization': True, 'escalate': True},
+      ],
+  )
+  def test_state_and_route_merge_into_existing_actions(self, actions):
+    event = Event.model_validate(
+        {'actions': actions, 'state': {'k': 'v'}, 'route': 'branch_a'}
+    )
+
+    assert event.actions.skip_summarization is True
+    assert event.actions.escalate is True
+    assert event.actions.state_delta == {'k': 'v'}
+    assert event.actions.route == 'branch_a'
+
+  @pytest.mark.parametrize(
+      'node_info',
+      [
+          NodeInfo(output_for=['target'], message_as_output=True),
+          {'output_for': ['target'], 'message_as_output': True},
+      ],
+  )
+  def test_node_path_merges_into_existing_node_info(self, node_info):
+    event = Event.model_validate(
+        {'node_info': node_info, 'node_path': 'wf@1/step@2'}
+    )
+
+    assert event.node_info.path == 'wf@1/step@2'
+    assert event.node_info.output_for == ['target']
+    assert event.node_info.message_as_output is True
+
+  def test_subclass_field_alias_takes_the_convenience_kwarg(self):
+    class _AliasedEvent(Event):
+      custom_route: str = pydantic.Field(default='', alias='route')
+
+    event = _AliasedEvent(route='custom_target')
+
+    assert event.custom_route == 'custom_target'
+    assert event.actions.route is None
+
+
+@pytest.mark.parametrize(
+    'path, name, run_id, parent_run_id',
+    [
+        ('workflow@10/child_node@20', 'child_node', '20', '10'),
+        ('root_node@5', 'root_node', '5', None),
+        ('workflow/child_node', 'child_node', '', None),
+    ],
+)
+def test_node_info_path_properties(path, name, run_id, parent_run_id):
+  info = NodeInfo(path=path)
+  assert (info.name, info.run_id, info.parent_run_id) == (
+      name,
+      run_id,
+      parent_run_id,
+  )
+
+
+@pytest.mark.parametrize(
+    'event, expected_name',
+    [
+        (Event(node_path='wf@1/worker@2'), 'worker'),
+        (Event(), ''),
+        (
+            Event(
+                node_path='wf@1/worker@2',
+                actions=EventActions(agent_state={'step': 1}),
+            ),
+            '',
+        ),
+        (
+            Event(
+                node_path='wf@1/worker@2',
+                actions=EventActions(end_of_agent=True),
+            ),
+            '',
+        ),
+    ],
+    ids=['leaf_name', 'no_node_info', 'agent_state', 'end_of_agent'],
+)
+def test_event_node_name(event, expected_name):
+  assert event.node_name == expected_name

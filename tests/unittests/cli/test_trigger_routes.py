@@ -23,18 +23,24 @@ import asyncio
 import base64
 import json
 import signal
+from typing import Awaitable
+from typing import Callable
 from typing import Optional
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
+from fastapi import HTTPException
+from fastapi import Request
 from fastapi.testclient import TestClient
 from google.adk.agents.base_agent import BaseAgent
 from google.adk.agents.run_config import RunConfig
 from google.adk.cli import fast_api as fast_api_module
+from google.adk.cli import trigger_routes as trigger_routes_module
 from google.adk.cli.fast_api import get_fast_api_app
 from google.adk.cli.trigger_routes import _is_transient_error
 from google.adk.cli.trigger_routes import TransientError
+from google.adk.cli.trigger_routes import TRIGGER_DELIVERY_STATE_KEY
 from google.adk.cli.trigger_routes import TriggerRouter
 from google.adk.events.event import Event
 from google.adk.runners import Runner
@@ -199,6 +205,12 @@ def _make_test_client(
     mock_memory_service,
     mock_agent_loader,
     trigger_sources: Optional[list[str]] = None,
+    trigger_oidc_audience: Optional[str] = None,
+    trigger_oidc_service_accounts: Optional[list[str]] = None,
+    trigger_auth_verifier: Optional[
+        Callable[[Request], None | Awaitable[None]]
+    ] = None,
+    max_llm_calls: Optional[int] = None,
 ) -> TestClient:
   """Build a TestClient with the given trigger setting."""
   with (
@@ -248,6 +260,10 @@ def _make_test_client(
         memory_service_uri="",
         allow_origins=["*"],
         trigger_sources=trigger_sources,
+        trigger_oidc_audience=trigger_oidc_audience,
+        trigger_oidc_service_accounts=trigger_oidc_service_accounts,
+        trigger_auth_verifier=trigger_auth_verifier,
+        max_llm_calls=max_llm_calls,
     )
     return TestClient(app)
 
@@ -266,6 +282,7 @@ def client(
       mock_memory_service,
       mock_agent_loader,
       trigger_sources=["pubsub", "eventarc"],
+      trigger_auth_verifier=lambda req: None,
   )
 
 
@@ -284,6 +301,456 @@ def client_no_triggers(
       mock_agent_loader,
       trigger_sources=None,
   )
+
+
+@pytest.fixture
+def client_oidc(
+    mock_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+):
+  """TestClient with triggers enabled and OIDC audience verification on."""
+  return _make_test_client(
+      mock_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      trigger_sources=["pubsub", "eventarc"],
+      trigger_oidc_audience="https://my-service.example.run.app",
+  )
+
+
+@pytest.fixture
+def client_oidc_emails(
+    mock_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+):
+  """TestClient with OIDC and allowed service accounts."""
+  return _make_test_client(
+      mock_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      trigger_sources=["pubsub", "eventarc"],
+      trigger_oidc_audience="https://my-service.example.run.app",
+      trigger_oidc_service_accounts=[
+          "allowed@project.iam",
+          "another-allowed@project.iam",
+      ],
+  )
+
+
+_PUBSUB_PAYLOAD = {
+    "message": {
+        "data": base64.b64encode(b"hi").decode("utf-8"),
+        "messageId": "msg-oidc",
+    },
+    "subscription": "projects/p/subscriptions/s",
+}
+_EVENTARC_PAYLOAD = {
+    "data": {"key": "value"},
+}
+
+_TRIGGER_ENDPOINTS_AND_PAYLOADS = [
+    pytest.param(
+        "/apps/test_app/trigger/pubsub",
+        _PUBSUB_PAYLOAD,
+        id="pubsub",
+    ),
+    pytest.param(
+        "/apps/test_app/trigger/eventarc",
+        _EVENTARC_PAYLOAD,
+        id="eventarc",
+    ),
+]
+
+
+class TestTriggerOidcVerification:
+  """Tests for optional OIDC bearer-token verification on trigger routes."""
+
+  @pytest.mark.parametrize("endpoint,payload", _TRIGGER_ENDPOINTS_AND_PAYLOADS)
+  def test_rejects_missing_token(self, client_oidc, endpoint, payload):
+    resp = client_oidc.post(endpoint, json=payload)
+    assert resp.status_code == 401
+
+  @pytest.mark.parametrize("endpoint,payload", _TRIGGER_ENDPOINTS_AND_PAYLOADS)
+  def test_rejects_non_bearer_scheme(self, client_oidc, endpoint, payload):
+    resp = client_oidc.post(
+        endpoint,
+        json=payload,
+        headers={"Authorization": "Basic abc"},
+    )
+    assert resp.status_code == 401
+
+  @pytest.mark.parametrize("endpoint,payload", _TRIGGER_ENDPOINTS_AND_PAYLOADS)
+  def test_rejects_invalid_token(
+      self, client_oidc, monkeypatch, endpoint, payload
+  ):
+    def _fail(*args, **kwargs):
+      raise ValueError("bad token")
+
+    monkeypatch.setattr(
+        trigger_routes_module.google_id_token,
+        "verify_oauth2_token",
+        _fail,
+    )
+    resp = client_oidc.post(
+        endpoint,
+        json=payload,
+        headers={"Authorization": "Bearer forged.jwt.value"},
+    )
+    assert resp.status_code == 401
+
+  @pytest.mark.parametrize("endpoint,payload", _TRIGGER_ENDPOINTS_AND_PAYLOADS)
+  def test_accepts_valid_token(
+      self, client_oidc, monkeypatch, endpoint, payload
+  ):
+    captured_audience = []
+
+    def _ok(token, request, audience):
+      captured_audience.append(audience)
+      return {"aud": audience, "email": "svc@project.iam"}
+
+    monkeypatch.setattr(
+        trigger_routes_module.google_id_token,
+        "verify_oauth2_token",
+        _ok,
+    )
+
+    async def dummy_run_async(self, user_id, session_id, new_message, **kwargs):
+      yield _model_event("ok")
+      await asyncio.sleep(0)
+
+    monkeypatch.setattr(Runner, "run_async", dummy_run_async)
+
+    resp = client_oidc.post(
+        endpoint,
+        json=payload,
+        headers={"Authorization": "Bearer good.jwt.value"},
+    )
+    assert resp.status_code == 200
+    assert captured_audience == ["https://my-service.example.run.app"]
+
+  @pytest.mark.parametrize(
+      "endpoint",
+      [
+          "/apps/test_app/trigger/pubsub",
+          "/apps/test_app/trigger/eventarc",
+      ],
+  )
+  def test_rejects_unauthenticated_junk_body_with_401(
+      self, client_oidc, endpoint
+  ):
+    """Unauthenticated requests with invalid body return 401, not 422."""
+    resp = client_oidc.post(
+        endpoint,
+        json={"junk": "data", "not_a_valid_schema": True},
+    )
+    assert resp.status_code == 401
+
+  @pytest.mark.parametrize("endpoint,payload", _TRIGGER_ENDPOINTS_AND_PAYLOADS)
+  def test_reuses_http_request(
+      self, client_oidc, monkeypatch, endpoint, payload
+  ):
+    captured_requests = []
+
+    def _ok(token, request, audience):
+      captured_requests.append(request)
+      return {"aud": audience, "email": "svc@project.iam"}
+
+    monkeypatch.setattr(
+        trigger_routes_module.google_id_token,
+        "verify_oauth2_token",
+        _ok,
+    )
+
+    async def dummy_run_async(self, user_id, session_id, new_message, **kwargs):
+      yield _model_event("ok")
+      await asyncio.sleep(0)
+
+    monkeypatch.setattr(Runner, "run_async", dummy_run_async)
+
+    client_oidc.post(
+        endpoint,
+        json=payload,
+        headers={"Authorization": "Bearer good.jwt.value"},
+    )
+    client_oidc.post(
+        endpoint,
+        json=payload,
+        headers={"Authorization": "Bearer good.jwt.value"},
+    )
+    assert len(captured_requests) == 2
+    assert captured_requests[0] is captured_requests[1]
+
+  @pytest.mark.parametrize("endpoint,payload", _TRIGGER_ENDPOINTS_AND_PAYLOADS)
+  def test_unauthenticated_by_default(
+      self, client, monkeypatch, endpoint, payload
+  ):
+    """With no audience configured, no token is required (existing behavior)."""
+
+    async def dummy_run_async(self, user_id, session_id, new_message, **kwargs):
+      yield _model_event("ok")
+      await asyncio.sleep(0)
+
+    monkeypatch.setattr(Runner, "run_async", dummy_run_async)
+
+    resp = client.post(endpoint, json=payload)
+    assert resp.status_code == 200
+
+  @pytest.mark.parametrize("endpoint,payload", _TRIGGER_ENDPOINTS_AND_PAYLOADS)
+  def test_rejects_untrusted_email(
+      self, client_oidc_emails, monkeypatch, endpoint, payload
+  ):
+    def _ok(token, request, audience):
+      return {
+          "aud": audience,
+          "email": "attacker@project.iam",
+          "email_verified": True,
+      }
+
+    monkeypatch.setattr(
+        trigger_routes_module.google_id_token,
+        "verify_oauth2_token",
+        _ok,
+    )
+    resp = client_oidc_emails.post(
+        endpoint,
+        json=payload,
+        headers={"Authorization": "Bearer some.jwt.value"},
+    )
+    assert resp.status_code == 403
+    assert "Untrusted token principal" in resp.json()["detail"]
+
+  @pytest.mark.parametrize("endpoint,payload", _TRIGGER_ENDPOINTS_AND_PAYLOADS)
+  def test_rejects_unverified_email(
+      self, client_oidc_emails, monkeypatch, endpoint, payload
+  ):
+    def _ok(token, request, audience):
+      return {
+          "aud": audience,
+          "email": "allowed@project.iam",
+          "email_verified": False,
+      }
+
+    monkeypatch.setattr(
+        trigger_routes_module.google_id_token,
+        "verify_oauth2_token",
+        _ok,
+    )
+    resp = client_oidc_emails.post(
+        endpoint,
+        json=payload,
+        headers={"Authorization": "Bearer some.jwt.value"},
+    )
+    assert resp.status_code == 403
+
+  @pytest.mark.parametrize("endpoint,payload", _TRIGGER_ENDPOINTS_AND_PAYLOADS)
+  @pytest.mark.parametrize("email_verified", ["false", "true", 1])
+  def test_rejects_non_boolean_email_verified(
+      self, client_oidc_emails, monkeypatch, endpoint, payload, email_verified
+  ):
+    """The email_verified claim must be the boolean True."""
+
+    def _ok(token, request, audience):
+      return {
+          "aud": audience,
+          "email": "allowed@project.iam",
+          "email_verified": email_verified,
+      }
+
+    monkeypatch.setattr(
+        trigger_routes_module.google_id_token,
+        "verify_oauth2_token",
+        _ok,
+    )
+    resp = client_oidc_emails.post(
+        endpoint,
+        json=payload,
+        headers={"Authorization": "Bearer some.jwt.value"},
+    )
+    assert resp.status_code == 403
+    assert "Untrusted token principal" in resp.json()["detail"]
+
+  @pytest.mark.parametrize("endpoint,payload", _TRIGGER_ENDPOINTS_AND_PAYLOADS)
+  def test_accepts_allowed_email(
+      self, client_oidc_emails, monkeypatch, endpoint, payload
+  ):
+    def _ok(token, request, audience):
+      return {
+          "aud": audience,
+          "email": "allowed@project.iam",
+          "email_verified": True,
+      }
+
+    monkeypatch.setattr(
+        trigger_routes_module.google_id_token,
+        "verify_oauth2_token",
+        _ok,
+    )
+
+    async def dummy_run_async(self, user_id, session_id, new_message, **kwargs):
+      yield _model_event("ok")
+      await asyncio.sleep(0)
+
+    monkeypatch.setattr(Runner, "run_async", dummy_run_async)
+
+    resp = client_oidc_emails.post(
+        endpoint,
+        json=payload,
+        headers={"Authorization": "Bearer good.jwt.value"},
+    )
+    assert resp.status_code == 200
+
+  def test_service_accounts_without_audience_raises_value_error(
+      self,
+      mock_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+  ):
+    with pytest.raises(
+        ValueError,
+        match="trigger_sources requires trigger_oidc_audience",
+    ):
+      _make_test_client(
+          mock_session_service,
+          mock_artifact_service,
+          mock_memory_service,
+          mock_agent_loader,
+          trigger_sources=["pubsub"],
+          trigger_oidc_service_accounts=["allowed@project.iam"],
+      )
+
+
+@pytest.fixture
+def client_custom_verifier(
+    mock_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+):
+  """TestClient with triggers enabled and a custom verifier."""
+
+  def custom_verifier(request: Request) -> None:
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header != "Bearer secret-token":
+      raise HTTPException(status_code=403, detail="Forbidden")
+
+  return _make_test_client(
+      mock_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      trigger_sources=["pubsub", "eventarc"],
+      trigger_auth_verifier=custom_verifier,
+  )
+
+
+@pytest.fixture
+def client_custom_async_verifier(
+    mock_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+):
+  """TestClient with triggers enabled and a custom async verifier."""
+
+  async def custom_async_verifier(request: Request) -> None:
+    await asyncio.sleep(0)
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header != "Bearer async-secret-token":
+      raise HTTPException(status_code=403, detail="Forbidden")
+
+  return _make_test_client(
+      mock_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      trigger_sources=["pubsub", "eventarc"],
+      trigger_auth_verifier=custom_async_verifier,
+  )
+
+
+class TestTriggerCustomVerification:
+  """Tests for optional custom verifier on trigger routes."""
+
+  @pytest.mark.parametrize("endpoint,payload", _TRIGGER_ENDPOINTS_AND_PAYLOADS)
+  def test_custom_verifier_rejects(
+      self, client_custom_verifier, endpoint, payload
+  ):
+    resp = client_custom_verifier.post(
+        endpoint,
+        json=payload,
+        headers={"Authorization": "Bearer bad-token"},
+    )
+    assert resp.status_code == 403
+
+  @pytest.mark.parametrize("endpoint,payload", _TRIGGER_ENDPOINTS_AND_PAYLOADS)
+  def test_custom_verifier_accepts(
+      self, client_custom_verifier, monkeypatch, endpoint, payload
+  ):
+    async def dummy_run_async(self, user_id, session_id, new_message, **kwargs):
+      yield _model_event("ok")
+      await asyncio.sleep(0)
+
+    monkeypatch.setattr(Runner, "run_async", dummy_run_async)
+
+    resp = client_custom_verifier.post(
+        endpoint,
+        json=payload,
+        headers={"Authorization": "Bearer secret-token"},
+    )
+    assert resp.status_code == 200
+
+  @pytest.mark.parametrize("endpoint,payload", _TRIGGER_ENDPOINTS_AND_PAYLOADS)
+  def test_custom_async_verifier_rejects(
+      self, client_custom_async_verifier, endpoint, payload
+  ):
+    resp = client_custom_async_verifier.post(
+        endpoint,
+        json=payload,
+        headers={"Authorization": "Bearer bad-token"},
+    )
+    assert resp.status_code == 403
+
+  @pytest.mark.parametrize("endpoint,payload", _TRIGGER_ENDPOINTS_AND_PAYLOADS)
+  def test_custom_async_verifier_accepts(
+      self, client_custom_async_verifier, monkeypatch, endpoint, payload
+  ):
+    async def dummy_run_async(self, user_id, session_id, new_message, **kwargs):
+      yield _model_event("ok")
+      await asyncio.sleep(0)
+
+    monkeypatch.setattr(Runner, "run_async", dummy_run_async)
+
+    resp = client_custom_async_verifier.post(
+        endpoint,
+        json=payload,
+        headers={"Authorization": "Bearer async-secret-token"},
+    )
+    assert resp.status_code == 200
+
+  @pytest.mark.parametrize(
+      "endpoint",
+      [
+          "/apps/test_app/trigger/pubsub",
+          "/apps/test_app/trigger/eventarc",
+      ],
+  )
+  def test_custom_verifier_rejects_junk_body_with_403(
+      self, client_custom_verifier, endpoint
+  ):
+    """Custom verifier failure on junk body returns 403, not 422."""
+    resp = client_custom_verifier.post(
+        endpoint,
+        json={"junk": "data"},
+        headers={"Authorization": "Bearer bad-token"},
+    )
+    assert resp.status_code == 403
 
 
 # ===================================================================
@@ -460,6 +927,24 @@ class TestTriggerPubSub:
     assert len(captured_user_ids) == 1
     assert captured_user_ids[0] == "pubsub-caller"
 
+  def test_subscription_user_id_is_path_safe(
+      self, client, mock_session_service
+  ):
+    """Pub/Sub subscription-derived user_id is stored without slashes."""
+    message_data = base64.b64encode(b"test").decode("utf-8")
+    payload = {
+        "message": {"data": message_data},
+        "subscription": "projects/p/subscriptions/orders-sub",
+    }
+
+    resp = client.post("/apps/test_app/trigger/pubsub", json=payload)
+
+    assert resp.status_code == 200
+    assert (
+        "projects--p--subscriptions--orders-sub"
+        in mock_session_service.sessions["test_app"]
+    )
+
   def test_unknown_app_fails_early(
       self, client, mock_agent_loader, mock_session_service
   ):
@@ -480,6 +965,48 @@ class TestTriggerPubSub:
 
     assert resp.status_code == 500
     assert "unknown_app" not in mock_session_service.sessions
+
+  def test_pubsub_passes_max_llm_calls(
+      self,
+      mock_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      monkeypatch,
+  ):
+    """Trigger runs apply max_llm_calls configured on the server."""
+    captured_run_configs = []
+
+    async def dummy_run_async_capture(
+        self, user_id, session_id, new_message, run_config=None, **kwargs
+    ):
+      captured_run_configs.append(run_config)
+      yield _model_event("Success")
+      await asyncio.sleep(0)
+
+    monkeypatch.setattr(Runner, "run_async", dummy_run_async_capture)
+
+    client = _make_test_client(
+        mock_session_service,
+        mock_artifact_service,
+        mock_memory_service,
+        mock_agent_loader,
+        trigger_sources=["pubsub"],
+        trigger_auth_verifier=lambda req: None,
+        max_llm_calls=37,
+    )
+
+    message_data = base64.b64encode(b"test").decode("utf-8")
+    payload = {
+        "message": {"data": message_data},
+    }
+    resp = client.post("/apps/test_app/trigger/pubsub", json=payload)
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "success"
+    assert len(captured_run_configs) == 1
+    assert captured_run_configs[0] is not None
+    assert captured_run_configs[0].max_llm_calls == 37
 
 
 # ===================================================================
@@ -609,6 +1136,25 @@ class TestTriggerEventarc:
     assert resp.status_code == 200
     assert len(captured_user_ids) == 1
     assert captured_user_ids[0] == "eventarc-caller"
+
+  def test_eventarc_source_user_id_is_path_safe(
+      self, client, mock_session_service
+  ):
+    """Eventarc ce-source-derived user_id is stored without slashes."""
+    payload = {
+        "data": {"key": "value"},
+    }
+    resp = client.post(
+        "/apps/test_app/trigger/eventarc",
+        json=payload,
+        headers={"ce-source": "//pubsub.googleapis.com/projects/p/topics/t"},
+    )
+
+    assert resp.status_code == 200
+    assert (
+        "pubsub.googleapis.com--projects--p--topics--t"
+        in mock_session_service.sessions["test_app"]
+    )
 
   def test_complex_event_data(self, client, monkeypatch):
     """Complex nested event data is serialized as JSON for the agent."""
@@ -817,6 +1363,270 @@ class TestTriggerEventarc:
     assert received_data["data"]["name"] == "file.txt"
     assert received_data["attributes"]["ce-id"] == "12345"
 
+  def test_eventarc_passes_max_llm_calls(
+      self,
+      mock_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      monkeypatch,
+  ):
+    """Trigger runs apply max_llm_calls configured on the server."""
+    captured_run_configs = []
+
+    async def dummy_run_async_capture(
+        self, user_id, session_id, new_message, run_config=None, **kwargs
+    ):
+      captured_run_configs.append(run_config)
+      yield _model_event("Success")
+      await asyncio.sleep(0)
+
+    monkeypatch.setattr(Runner, "run_async", dummy_run_async_capture)
+
+    client = _make_test_client(
+        mock_session_service,
+        mock_artifact_service,
+        mock_memory_service,
+        mock_agent_loader,
+        trigger_sources=["eventarc"],
+        trigger_auth_verifier=lambda req: None,
+        max_llm_calls=42,
+    )
+
+    payload = {
+        "bucket": "my-bucket",
+        "name": "file.txt",
+        "contentType": "application/json",
+    }
+    resp = client.post(
+        "/apps/test_app/trigger/eventarc",
+        json=payload,
+        headers={
+            "ce-source": (
+                "//storage.googleapis.com/projects/_/buckets/my-bucket"
+            ),
+            "ce-type": "google.cloud.storage.object.v1.finalized",
+            "ce-id": "12345",
+            "ce-specversion": "1.0",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "success"
+    assert len(captured_run_configs) == 1
+    assert captured_run_configs[0] is not None
+    assert captured_run_configs[0].max_llm_calls == 42
+
+
+# ===================================================================
+# Delivery identity in session state
+# ===================================================================
+
+
+def _capture_delivery_state(monkeypatch) -> list:
+  """Patches the runner to record the delivery each run sees in state."""
+  captured = []
+
+  async def dummy_run_async_capture(
+      self, user_id, session_id, new_message, **kwargs
+  ):
+    session = await self.session_service.get_session(
+        app_name=self.app_name, user_id=user_id, session_id=session_id
+    )
+    captured.append(session.state.get(TRIGGER_DELIVERY_STATE_KEY))
+    yield _model_event("Success")
+    await asyncio.sleep(0)
+
+  monkeypatch.setattr(Runner, "run_async", dummy_run_async_capture)
+  return captured
+
+
+class TestTriggerDeliveryIdentity:
+  """The upstream delivery identity is exposed to the agent's tools."""
+
+  def test_pubsub_message_id_is_in_session_state(self, client, monkeypatch):
+    """Pub/Sub messageId and subscription are stored in session state."""
+    captured = _capture_delivery_state(monkeypatch)
+
+    payload = {
+        "message": {
+            "data": base64.b64encode(b"hello").decode(),
+            "messageId": "msg-100",
+            "publishTime": "2026-01-01T00:00:00Z",
+        },
+        "subscription": "projects/p/subscriptions/orders-sub",
+    }
+    resp = client.post("/apps/test_app/trigger/pubsub", json=payload)
+
+    assert resp.status_code == 200
+    assert captured == [{
+        "source": "pubsub",
+        "id": "msg-100",
+        "subscription": "projects/p/subscriptions/orders-sub",
+        "publish_time": "2026-01-01T00:00:00Z",
+    }]
+
+  def test_pubsub_without_message_id_stores_none(self, client, monkeypatch):
+    """A Pub/Sub request without messageId still records the source."""
+    captured = _capture_delivery_state(monkeypatch)
+
+    payload = {"message": {"data": base64.b64encode(b"hello").decode()}}
+    resp = client.post("/apps/test_app/trigger/pubsub", json=payload)
+
+    assert resp.status_code == 200
+    assert captured[0]["source"] == "pubsub"
+    assert captured[0]["id"] is None
+
+  def test_pubsub_redelivery_lets_tool_skip_repeated_side_effect(
+      self, client, monkeypatch
+  ):
+    """A tool can use the delivery id to avoid repeating a side effect.
+
+    Setup: a runner that pays an invoice through a provider keyed on
+      subscription and messageId, then fails on the first attempt with a
+      non-transient error. The provider's ledger lives outside the session,
+      because each delivery starts with fresh session state.
+    Act: deliver the same Pub/Sub message twice, as Pub/Sub does after a
+      500 response.
+    Assert: the first delivery returns 500, the redelivery returns 200, and
+      the payment happened exactly once.
+    """
+    payments = []
+    provider_idempotency_keys = set()
+
+    async def dummy_run_async_pay_then_fail(
+        self, user_id, session_id, new_message, **kwargs
+    ):
+      session = await self.session_service.get_session(
+          app_name=self.app_name, user_id=user_id, session_id=session_id
+      )
+      delivery = session.state[TRIGGER_DELIVERY_STATE_KEY]
+      idempotency_key = (delivery["subscription"], delivery["id"])
+      if idempotency_key not in provider_idempotency_keys:
+        payments.append("INV-1")
+        provider_idempotency_keys.add(idempotency_key)
+        raise RuntimeError("503 UNAVAILABLE")
+      yield _model_event("Already paid")
+
+    monkeypatch.setattr(Runner, "run_async", dummy_run_async_pay_then_fail)
+
+    payload = {
+        "message": {
+            "data": base64.b64encode(b'{"invoice": "INV-1"}').decode(),
+            "messageId": "msg-pay-1",
+        },
+        "subscription": "projects/p/subscriptions/payments",
+    }
+    first = client.post("/apps/test_app/trigger/pubsub", json=payload)
+    redelivery = client.post("/apps/test_app/trigger/pubsub", json=payload)
+
+    assert first.status_code == 500
+    assert redelivery.status_code == 200
+    assert payments == ["INV-1"]
+
+  def test_eventarc_event_id_is_in_session_state(self, client, monkeypatch):
+    """A structured CloudEvent's id, source and type are stored in state."""
+    captured = _capture_delivery_state(monkeypatch)
+
+    payload = {
+        "data": {"bucket": "my-bucket"},
+        "source": "//storage.googleapis.com/projects/_/buckets/my-bucket",
+        "type": "google.cloud.storage.object.v1.finalized",
+        "id": "evt-100",
+        "specversion": "1.0",
+    }
+    resp = client.post("/apps/test_app/trigger/eventarc", json=payload)
+
+    assert resp.status_code == 200
+    assert captured == [{
+        "source": "eventarc",
+        "id": "evt-100",
+        "event_source": "//storage.googleapis.com/projects/_/buckets/my-bucket",
+        "type": "google.cloud.storage.object.v1.finalized",
+    }]
+
+  def test_eventarc_binary_mode_reads_id_from_headers(
+      self, client, monkeypatch
+  ):
+    """In binary content mode the ce-* headers supply the delivery id."""
+    captured = _capture_delivery_state(monkeypatch)
+
+    payload = {
+        "message": {
+            "data": base64.b64encode(b"hello").decode(),
+            "messageId": "pubsub-msg-1",
+        },
+    }
+    resp = client.post(
+        "/apps/test_app/trigger/eventarc",
+        json=payload,
+        headers={
+            "ce-id": "ce-header-1",
+            "ce-source": "//pubsub.googleapis.com/projects/p/topics/t",
+            "ce-type": "google.cloud.pubsub.topic.v1.messagePublished",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert captured[0]["id"] == "ce-header-1"
+    assert (
+        captured[0]["event_source"]
+        == "//pubsub.googleapis.com/projects/p/topics/t"
+    )
+    assert (
+        captured[0]["type"] == "google.cloud.pubsub.topic.v1.messagePublished"
+    )
+
+  def test_eventarc_pubsub_wrapper_without_ce_id_uses_message_id(
+      self, client, monkeypatch
+  ):
+    """A Pub/Sub-wrapped event without ce-id falls back to the messageId."""
+    captured = _capture_delivery_state(monkeypatch)
+
+    payload = {
+        "message": {
+            "data": base64.b64encode(b"hello").decode(),
+            "messageId": "pubsub-msg-2",
+        },
+    }
+    resp = client.post("/apps/test_app/trigger/eventarc", json=payload)
+
+    assert resp.status_code == 200
+    assert captured[0]["source"] == "eventarc"
+    assert captured[0]["id"] == "pubsub-msg-2"
+
+  def test_retried_attempt_keeps_delivery_in_state(self, client, monkeypatch):
+    """An in-process retry after a 429 still sees the delivery identity."""
+    captured = []
+    attempts = {"count": 0}
+
+    async def dummy_run_async_429_once(
+        self, user_id, session_id, new_message, **kwargs
+    ):
+      session = await self.session_service.get_session(
+          app_name=self.app_name, user_id=user_id, session_id=session_id
+      )
+      captured.append(session.state.get(TRIGGER_DELIVERY_STATE_KEY))
+      attempts["count"] += 1
+      if attempts["count"] == 1:
+        raise RuntimeError("429 Resource has been exhausted")
+      yield _model_event("Success")
+
+    monkeypatch.setattr(Runner, "run_async", dummy_run_async_429_once)
+
+    payload = {
+        "message": {
+            "data": base64.b64encode(b"hello").decode(),
+            "messageId": "msg-retry-1",
+        },
+    }
+    with patch(
+        "google.adk.cli.trigger_routes.asyncio.sleep", new_callable=AsyncMock
+    ):
+      resp = client.post("/apps/test_app/trigger/pubsub", json=payload)
+
+    assert resp.status_code == 200
+    assert [d["id"] for d in captured] == ["msg-retry-1", "msg-retry-1"]
+
 
 # ===================================================================
 # Triggers disabled (default behavior)
@@ -974,6 +1784,7 @@ class TestSelectiveRegistration:
         mock_memory_service,
         mock_agent_loader,
         trigger_sources=["pubsub"],
+        trigger_auth_verifier=lambda req: None,
     )
     # Pub/Sub should work
     ps_resp = client.post(
@@ -1000,6 +1811,7 @@ class TestSelectiveRegistration:
         mock_memory_service,
         mock_agent_loader,
         trigger_sources=["eventarc"],
+        trigger_auth_verifier=lambda req: None,
     )
     # Eventarc should work
     ea_resp = client.post(
@@ -1032,6 +1844,7 @@ class TestUnknownTriggerSources:
         mock_memory_service,
         mock_agent_loader,
         trigger_sources=["unknown_source", "pubsub"],
+        trigger_auth_verifier=lambda req: None,
     )
     # "pubsub" should still be registered
     ps_resp = client.post(
@@ -1060,6 +1873,7 @@ class TestUnknownTriggerSources:
         mock_memory_service,
         mock_agent_loader,
         trigger_sources=["foo", "bar"],
+        trigger_auth_verifier=lambda req: None,
     )
     unknown_resp = client.post(
         "/apps/test_app/trigger/unknown_source", json={"calls": [["test"]]}
@@ -1106,3 +1920,105 @@ class TestTriggersDisabled:
     )
     resp = client.post("/apps/test_app/trigger/eventarc", json={"data": {}})
     assert resp.status_code == 404
+
+
+# ===================================================================
+# Request model validation
+# ===================================================================
+
+
+class TestTriggerRequestModels:
+  """Contract tests for the request models behind the trigger endpoints."""
+
+  def test_pubsub_body_without_message_is_rejected_before_the_agent_runs(
+      self, client, monkeypatch
+  ):
+    """`message` is required, so a malformed push is a 422, not a 500 later."""
+    invocations = []
+
+    async def dummy_run_async_capture(
+        self, user_id, session_id, new_message, **kwargs
+    ):
+      invocations.append(new_message)
+      yield _model_event("Success")
+      await asyncio.sleep(0)
+
+    monkeypatch.setattr(Runner, "run_async", dummy_run_async_capture)
+
+    resp = client.post(
+        "/apps/test_app/trigger/pubsub",
+        json={"subscription": "projects/p/subscriptions/s"},
+    )
+
+    assert resp.status_code == 422
+    assert invocations == []
+
+  def test_pubsub_accepts_the_full_push_envelope(self, client, monkeypatch):
+    """Real push bodies carry extra envelope fields we must tolerate."""
+    captured_messages = []
+
+    async def dummy_run_async_capture(
+        self, user_id, session_id, new_message, **kwargs
+    ):
+      captured_messages.append(new_message.parts[0].text)
+      yield _model_event("Success")
+      await asyncio.sleep(0)
+
+    monkeypatch.setattr(Runner, "run_async", dummy_run_async_capture)
+
+    payload = {
+        "message": {
+            "data": base64.b64encode(b"envelope test").decode("utf-8"),
+            "attributes": {"k": "v"},
+            "messageId": "msg-100",
+            "publishTime": "2026-01-01T00:00:00Z",
+            "orderingKey": "order-1",
+        },
+        "subscription": "projects/p/subscriptions/s",
+        "deliveryAttempt": 3,
+    }
+    resp = client.post("/apps/test_app/trigger/pubsub", json=payload)
+
+    assert resp.status_code == 200
+    assert len(captured_messages) == 1
+    assert json.loads(captured_messages[0]) == {
+        "data": "envelope test",
+        "attributes": {"k": "v"},
+    }
+
+  def test_eventarc_fallback_forwards_only_the_fields_the_caller_set(
+      self, client, monkeypatch
+  ):
+    """Unknown body keys are kept; unset CloudEvents fields are dropped."""
+    captured_messages = []
+
+    async def dummy_run_async_capture(
+        self, user_id, session_id, new_message, **kwargs
+    ):
+      captured_messages.append(new_message.parts[0].text)
+      yield _model_event("Success")
+      await asyncio.sleep(0)
+
+    monkeypatch.setattr(Runner, "run_async", dummy_run_async_capture)
+
+    resp = client.post(
+        "/apps/test_app/trigger/eventarc",
+        json={"bucket": "my-bucket", "name": "file.txt"},
+        headers={
+            "ce-source": "//storage.googleapis.com/b",
+            "ce-type": "google.cloud.storage.object.v1.finalized",
+            "ce-id": "evt-9",
+            "ce-specversion": "1.0",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert len(captured_messages) == 1
+    parsed_msg = json.loads(captured_messages[0])
+    assert parsed_msg["data"] == {"bucket": "my-bucket", "name": "file.txt"}
+    assert parsed_msg["attributes"] == {
+        "ce-id": "evt-9",
+        "ce-type": "google.cloud.storage.object.v1.finalized",
+        "ce-source": "//storage.googleapis.com/b",
+        "ce-specversion": "1.0",
+    }

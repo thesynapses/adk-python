@@ -33,6 +33,7 @@ from google.adk.tools.environment_simulation.strategies import base as base_mock
 from google.adk.tools.environment_simulation.strategies import tool_spec_mock_strategy
 from google.adk.tools.environment_simulation.tool_connection_analyzer import ToolConnectionAnalyzer
 from google.adk.tools.environment_simulation.tool_connection_map import ToolConnectionMap
+from google.genai import types as genai_types
 
 from ...features import experimental
 from ...features import FeatureName
@@ -66,8 +67,15 @@ class EnvironmentSimulationEngine:
         llm_name=config.simulation_model,
         llm_config=config.simulation_model_configuration,
     )
-    self._state_store = {}
+    self._state_store: Dict[str, Any] = {}
     self._random_generator = random.Random()
+    self._seeded_generators: dict[tuple[str, int], random.Random] = {}
+    for c in config.tool_simulation_configs:
+      for i, injection_config in enumerate(c.injection_configs):
+        if injection_config.random_seed is not None:
+          self._seeded_generators[(c.tool_name, i)] = random.Random(
+              injection_config.random_seed
+          )
     self._environment_data = config.environment_data
     self._tracing = config.tracing
 
@@ -90,20 +98,17 @@ class EnvironmentSimulationEngine:
         self._tool_connection_map = await self._analyzer.analyze(tools)
       self._is_analyzed = True
 
-    for injection_config in tool_sim_config.injection_configs:
+    for i, injection_config in enumerate(tool_sim_config.injection_configs):
       if injection_config.match_args:
         if not all(
             item in args.items() for item in injection_config.match_args.items()
         ):
           continue
 
-      if injection_config.random_seed is not None:
-        self._random_generator.seed(injection_config.random_seed)
-
-      if (
-          self._random_generator.random()
-          < injection_config.injection_probability
-      ):
+      generator = self._seeded_generators.get(
+          (tool.name, i), self._random_generator
+      )
+      if generator.random() < injection_config.injection_probability:
         await asyncio.sleep(injection_config.injected_latency_seconds)
         if injection_config.injected_error:
           return {

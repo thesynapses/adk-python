@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import abc
+import asyncio
+from collections.abc import Iterator
 import inspect
 import logging
 from typing import Any
@@ -40,11 +42,12 @@ from typing_extensions import deprecated
 from typing_extensions import override
 from typing_extensions import TypeAlias
 
+from ..events._node_path_builder import _NodePathBuilder
 from ..events.event import Event
 from ..events.event_actions import EventActions
-from ..features import experimental
-from ..features import FeatureName
-from ..telemetry import _instrumentation
+from ..utils._callback_pipeline import _normalize_callbacks
+from ..utils._callback_pipeline import _run_callbacks
+from ..utils._callback_pipeline import _stop_on_truthy
 from ..utils.context_utils import Aclosing
 from ..workflow import BaseNode
 from .base_agent_config import BaseAgentConfig as BaseAgentConfig
@@ -76,7 +79,6 @@ AfterAgentCallback: TypeAlias = Union[
 SelfAgent = TypeVar('SelfAgent', bound='BaseAgent')
 
 
-@experimental(FeatureName.AGENT_STATE)
 class BaseAgentState(BaseModel):
   """Base class for all agent states."""
 
@@ -86,6 +88,42 @@ class BaseAgentState(BaseModel):
 
 
 AgentState = TypeVar('AgentState', bound=BaseAgentState)
+
+
+def _agent_state_key(ctx: Any, agent_name: str) -> str:
+  """Returns the key used to store agent state for `agent_name`."""
+  node_path = getattr(ctx, 'node_path', None)
+  if (
+      isinstance(node_path, str)
+      and node_path
+      and _NodePathBuilder.from_string(node_path).node_name == agent_name
+  ):
+    return node_path
+  return agent_name
+
+
+def _subtree_names(agent: Any, visited: set[int]) -> set[str]:
+  if agent is None or id(agent) in visited:
+    return set()
+  visited.add(id(agent))
+  children = getattr(agent, 'sub_agents', None)
+  sub = children if isinstance(children, (list, tuple)) else ()
+  name = getattr(agent, 'name', None)
+  return ({name} if isinstance(name, str) else set()) | {
+      n for c in sub for n in _subtree_names(c, visited)
+  }
+
+
+def _warn_duplicate_agent_names(duplicates: set[str]) -> None:
+  if not duplicates:
+    return
+  duplicate_names_str = ', '.join(f'`{name}`' for name in sorted(duplicates))
+  logger.warning(
+      'Found duplicate agent names: %s. '
+      'All agents in the tree must have unique names. '
+      'find_agent() returns the first match in a depth-first walk.',
+      duplicate_names_str,
+  )
 
 
 # TODO: drop the explicit abc.ABC base once BaseNode surfaces ABCMeta to
@@ -150,29 +188,38 @@ class BaseAgent(BaseNode, abc.ABC):
   """Callback or list of callbacks to be invoked before the agent run.
 
   When a list of callbacks is provided, the callbacks will be called in the
-  order they are listed until a callback does not return None.
+  order they are listed until a callback returns a truthy value.
+
+  Arguments are passed by keyword first. If keyword binding fails, ADK tries
+  positional binding in the argument order below. Keyword-only parameters must
+  use the documented names; positional parameters may use different names.
 
   Args:
-    callback_context: MUST be named 'callback_context' (enforced).
+    callback_context: The context of the agent invocation.
 
   Returns:
     Optional[types.Content]: The content to return to the user.
-      When the content is present, the agent run will be skipped and the
+      When the content is truthy, the agent run will be skipped and the
       provided content will be returned to user.
   """
   after_agent_callback: Optional[AfterAgentCallback] = None
   """Callback or list of callbacks to be invoked after the agent run.
 
   When a list of callbacks is provided, the callbacks will be called in the
-  order they are listed until a callback does not return None.
+  order they are listed until a callback returns a truthy value.
+
+  Arguments are passed by keyword first. If keyword binding fails, ADK tries
+  positional binding in the argument order below. Keyword-only parameters must
+  use the documented names; positional parameters may use different names.
 
   Args:
-    callback_context: MUST be named 'callback_context' (enforced).
+    callback_context: The context of the agent invocation.
 
   Returns:
     Optional[types.Content]: The content to return to the user.
-      When the content is present, an additional event with the provided content
-      will be appended to event history as an additional agent response.
+      When the content is truthy, an additional event with the provided
+      content will be appended to event history as an additional agent
+      response.
   """
 
   def _load_agent_state(
@@ -189,10 +236,20 @@ class BaseAgent(BaseNode, abc.ABC):
     Returns:
         The current state if exists; otherwise, None.
     """
-    if ctx.agent_states is None or self.name not in ctx.agent_states:
+    if ctx.agent_states is None:
       return None
-    else:
-      return state_type.model_validate(ctx.agent_states.get(self.name))
+    key = _agent_state_key(ctx, self.name)
+    raw_state = ctx.agent_states.get(key) if key in ctx.agent_states else None
+    if (
+        raw_state is None
+        and key != self.name
+        and key not in ctx.end_of_agents
+        and self.name in ctx.agent_states
+    ):
+      raw_state = ctx.agent_states.get(self.name)
+    if raw_state is None:
+      return None
+    return state_type.model_validate(raw_state)
 
   def _create_agent_state_event(
       self,
@@ -207,9 +264,20 @@ class BaseAgent(BaseNode, abc.ABC):
       An event with the current agent state set in the invocation context.
     """
     event_actions = EventActions()
-    if (agent_state := ctx.agent_states.get(self.name)) is not None:
+    key = _agent_state_key(ctx, self.name)
+    agent_state = ctx.agent_states.get(key)
+    if (
+        agent_state is None
+        and key != self.name
+        and key not in ctx.end_of_agents
+    ):
+      agent_state = ctx.agent_states.get(self.name)
+    if agent_state is not None:
       event_actions.agent_state = agent_state
-    if ctx.end_of_agents.get(self.name):
+    end_of_agent = ctx.end_of_agents.get(key)
+    if end_of_agent is None and key != self.name:
+      end_of_agent = ctx.end_of_agents.get(self.name)
+    if end_of_agent:
       event_actions.end_of_agent = True
     return Event(
         invocation_id=ctx.invocation_id,
@@ -222,6 +290,9 @@ class BaseAgent(BaseNode, abc.ABC):
       self: SelfAgent, update: Mapping[str, Any] | None = None
   ) -> SelfAgent:
     """Creates a copy of this agent instance.
+
+    A callback that is a method of this agent is rebound to the copy, so it
+    acts on the copy rather than on this agent.
 
     Args:
       update: Optional mapping of new values for the fields of the cloned agent.
@@ -251,6 +322,15 @@ class BaseAgent(BaseNode, abc.ABC):
 
     cloned_agent = self.model_copy(update=update)
 
+    # A callback registered as one of this agent's own methods (e.g.
+    # before_agent_callback=self._handler) keeps mutating this agent while the
+    # clone runs, so whatever it sets never reaches the clone. Methods bound to
+    # any other object are left alone.
+    def _rebind(value: object) -> object:
+      if inspect.ismethod(value) and value.__self__ is self:
+        return value.__func__.__get__(cloned_agent)
+      return value
+
     # If any field is stored as list and not provided in the update, need to
     # shallow copy it for the cloned agent to avoid sharing the same list object
     # with the original agent.
@@ -261,7 +341,9 @@ class BaseAgent(BaseNode, abc.ABC):
         continue
       field = getattr(cloned_agent, field_name)
       if isinstance(field, list):
-        setattr(cloned_agent, field_name, field.copy())
+        setattr(cloned_agent, field_name, [_rebind(item) for item in field])
+      elif inspect.ismethod(field):
+        setattr(cloned_agent, field_name, _rebind(field))
 
     if update is None or 'sub_agents' not in update:
       # If `sub_agents` is not provided in the update, need to recursively clone
@@ -293,22 +375,10 @@ class BaseAgent(BaseNode, abc.ABC):
     Yields:
       Event: the events generated by the agent.
     """
-
-    ctx = self._create_invocation_context(parent_context)
-    async with _instrumentation.record_agent_invocation(ctx, self):
-      if event := await self._handle_before_agent_callback(ctx):
-        yield event
-      if ctx.end_invocation:
-        return
-
-      async with Aclosing(self._run_async_impl(ctx)) as agen:
-        async for event in agen:
-          yield event
-
-      if ctx.end_invocation:
-        return
-
-      if event := await self._handle_after_agent_callback(ctx):
+    async with Aclosing(
+        self._run_with_lifecycle(parent_context, self._run_async_impl)
+    ) as agen:
+      async for event in agen:
         yield event
 
   @override
@@ -344,20 +414,73 @@ class BaseAgent(BaseNode, abc.ABC):
     Yields:
       Event: the events generated by the agent.
     """
+    async with Aclosing(
+        self._run_with_lifecycle(parent_context, self._run_live_impl)
+    ) as agen:
+      async for event in agen:
+        yield event
+
+  async def _run_with_lifecycle(
+      self,
+      parent_context: InvocationContext,
+      impl_fn: Callable[[InvocationContext], AsyncGenerator[Event, None]],
+  ) -> AsyncGenerator[Event, None]:
+    """Runs an agent implementation generator with full callback and trace lifecycle."""
+    from ..telemetry import _instrumentation
 
     ctx = self._create_invocation_context(parent_context)
-    async with _instrumentation.record_agent_invocation(ctx, self):
-      if event := await self._handle_before_agent_callback(ctx):
-        yield event
-      if ctx.end_invocation:
-        return
 
-      async with Aclosing(self._run_live_impl(ctx)) as agen:
+    async def _run() -> AsyncGenerator[Event, None]:
+      before_callback_completed = False
+      after_callback_called = False
+      try:
+        event = await self._handle_before_agent_callback(ctx)
+        before_callback_completed = True
+        if event:
+          yield event
+        if ctx.end_invocation:
+          return
+
+        async with Aclosing(impl_fn(ctx)) as agen:
+          async for event in agen:
+            yield event
+
+        if ctx.end_invocation:
+          return
+
+        after_callback_called = True
+        if event := await self._handle_after_agent_callback(ctx):
+          yield event
+      except asyncio.CancelledError:
+        if (
+            before_callback_completed
+            and not after_callback_called
+            and not ctx.end_invocation
+        ):
+          try:
+            await self._handle_after_agent_callback(ctx)
+          except asyncio.CancelledError:
+            raise
+          except Exception:  # pylint: disable=broad-except
+            logger.exception(
+                'after_agent_callback raised on cancellation;'
+                ' suppressing so original cancellation propagates.'
+            )
+        raise
+      except Exception as e:
+        await self._handle_agent_error_callback(ctx, e)
+        raise
+
+    # The scope is entered out here rather than inside `_run`, so that its
+    # span is not opened and closed by whoever happens to drive the generator,
+    # and `stream_in_scope` attaches it only while `_run` is actually running
+    # (b/485899016).
+    async with _instrumentation.record_agent_invocation(ctx, self) as scope:
+      async with Aclosing(
+          _instrumentation.stream_in_scope(scope.otel_context, _run())
+      ) as agen:
         async for event in agen:
           yield event
-
-      if event := await self._handle_after_agent_callback(ctx):
-        yield event
 
   async def _run_async_impl(
       self, ctx: InvocationContext
@@ -426,6 +549,11 @@ class BaseAgent(BaseNode, abc.ABC):
         return result
     return None
 
+  @override
+  def _iter_static_children(self) -> Iterator[BaseNode]:
+    """Yields direct static children (sub-agents) of this agent."""
+    yield from self.sub_agents
+
   def _create_invocation_context(
       self, parent_context: InvocationContext
   ) -> InvocationContext:
@@ -439,11 +567,7 @@ class BaseAgent(BaseNode, abc.ABC):
 
     This method is only for use by Agent Development Kit.
     """
-    if not self.before_agent_callback:
-      return []
-    if isinstance(self.before_agent_callback, list):
-      return self.before_agent_callback
-    return [self.before_agent_callback]
+    return _normalize_callbacks(self.before_agent_callback)
 
   @property
   def canonical_after_agent_callbacks(self) -> list[_SingleAgentCallback]:
@@ -451,11 +575,72 @@ class BaseAgent(BaseNode, abc.ABC):
 
     This method is only for use by Agent Development Kit.
     """
-    if not self.after_agent_callback:
-      return []
-    if isinstance(self.after_agent_callback, list):
-      return self.after_agent_callback
-    return [self.after_agent_callback]
+    return _normalize_callbacks(self.after_agent_callback)
+
+  async def _handle_agent_callbacks(
+      self,
+      ctx: InvocationContext,
+      *,
+      plugin_hook: Callable[..., Awaitable[Optional[types.Content]]],
+      callbacks: list[_SingleAgentCallback],
+      end_invocation_on_content: bool,
+  ) -> Optional[Event]:
+    """Runs the plugin hook and then the canonical agent callbacks.
+
+    Args:
+      ctx: InvocationContext, the invocation context for this agent.
+      plugin_hook: The plugin manager hook consulted before the canonical
+        callbacks. A non-empty result from it suppresses them.
+      callbacks: The canonical callbacks to run when the plugins provide no
+        override.
+      end_invocation_on_content: Whether returned content ends the invocation.
+
+    Returns:
+      Optional[Event]: an event if a callback provides content or changed state
+        or artifacts.
+    """
+    callback_context = CallbackContext(ctx)
+
+    # Run callbacks from the plugins.
+    callback_content = await plugin_hook(
+        agent=self, callback_context=callback_context
+    )
+
+    # If no overrides are provided from the plugins, further run the canonical
+    # callbacks.
+    if not callback_content and callbacks:
+      callback_content = await _run_callbacks(
+          callbacks,
+          _stop_on_truthy,
+          callback_context=callback_context,
+      )
+
+    # Process the override content if exists, and further process the state
+    # change if exists.
+    if callback_content:
+      ret_event = Event(
+          invocation_id=ctx.invocation_id,
+          author=self.name,
+          branch=ctx.branch,
+          content=callback_content,
+          actions=callback_context.actions,
+      )
+      if end_invocation_on_content:
+        ctx.end_invocation = True
+      return ret_event
+
+    if (
+        callback_context.state.has_delta()
+        or callback_context._event_actions.artifact_delta
+    ):
+      return Event(
+          invocation_id=ctx.invocation_id,
+          author=self.name,
+          branch=ctx.branch,
+          actions=callback_context._event_actions,
+      )
+
+    return None
 
   async def _handle_before_agent_callback(
       self, ctx: InvocationContext
@@ -466,54 +651,15 @@ class BaseAgent(BaseNode, abc.ABC):
       ctx: InvocationContext, the invocation context for this agent.
 
     Returns:
-      Optional[Event]: an event if callback provides content or changed state.
+      Optional[Event]: an event if a callback provides content or changed state
+        or artifacts.
     """
-    callback_context = CallbackContext(ctx)
-
-    # Run callbacks from the plugins.
-    before_agent_callback_content = (
-        await ctx.plugin_manager.run_before_agent_callback(
-            agent=self, callback_context=callback_context
-        )
+    return await self._handle_agent_callbacks(
+        ctx,
+        plugin_hook=ctx.plugin_manager.run_before_agent_callback,
+        callbacks=self.canonical_before_agent_callbacks,
+        end_invocation_on_content=True,
     )
-
-    # If no overrides are provided from the plugins, further run the canonical
-    # callbacks.
-    if (
-        not before_agent_callback_content
-        and self.canonical_before_agent_callbacks
-    ):
-      for callback in self.canonical_before_agent_callbacks:
-        before_agent_callback_content = callback(
-            callback_context=callback_context
-        )
-        if inspect.isawaitable(before_agent_callback_content):
-          before_agent_callback_content = await before_agent_callback_content
-        if before_agent_callback_content:
-          break
-
-    # Process the override content if exists, and further process the state
-    # change if exists.
-    if before_agent_callback_content:
-      ret_event = Event(
-          invocation_id=ctx.invocation_id,
-          author=self.name,
-          branch=ctx.branch,
-          content=before_agent_callback_content,
-          actions=callback_context._event_actions,
-      )
-      ctx.end_invocation = True
-      return ret_event
-
-    if callback_context.state.has_delta():
-      return Event(
-          invocation_id=ctx.invocation_id,
-          author=self.name,
-          branch=ctx.branch,
-          actions=callback_context._event_actions,
-      )
-
-    return None
 
   async def _handle_after_agent_callback(
       self, invocation_context: InvocationContext
@@ -525,63 +671,60 @@ class BaseAgent(BaseNode, abc.ABC):
         agent.
 
     Returns:
-      Optional[Event]: an event if callback provides content or changed state.
+      Optional[Event]: an event if a callback provides content or changed state
+        or artifacts.
     """
-
-    callback_context = CallbackContext(invocation_context)
-
-    # Run callbacks from the plugins.
-    after_agent_callback_content = (
-        await invocation_context.plugin_manager.run_after_agent_callback(
-            agent=self, callback_context=callback_context
-        )
+    return await self._handle_agent_callbacks(
+        invocation_context,
+        plugin_hook=invocation_context.plugin_manager.run_after_agent_callback,
+        callbacks=self.canonical_after_agent_callbacks,
+        end_invocation_on_content=False,
     )
 
-    # If no overrides are provided from the plugins, further run the canonical
-    # callbacks.
-    if (
-        not after_agent_callback_content
-        and self.canonical_after_agent_callbacks
-    ):
-      for callback in self.canonical_after_agent_callbacks:
-        after_agent_callback_content = callback(
-            callback_context=callback_context
-        )
-        if inspect.isawaitable(after_agent_callback_content):
-          after_agent_callback_content = await after_agent_callback_content
-        if after_agent_callback_content:
-          break
+  async def _handle_agent_error_callback(
+      self,
+      invocation_context: InvocationContext,
+      error: Exception,
+  ) -> None:
+    """Runs the on_agent_error_callback for all plugins.
 
-    # Process the override content if exists, and further process the state
-    # change if exists.
-    if after_agent_callback_content:
-      ret_event = Event(
-          invocation_id=invocation_context.invocation_id,
-          author=self.name,
-          branch=invocation_context.branch,
-          content=after_agent_callback_content,
-          actions=callback_context._event_actions,
-      )
-      return ret_event
+    This is notification-only and best-effort: the triggering exception is
+    always re-raised by the caller, and any exception from the callback itself
+    (or from a test double that does not implement it) is logged and suppressed
+    so it can never mask the original error.
 
-    if callback_context.state.has_delta():
-      return Event(
-          invocation_id=invocation_context.invocation_id,
-          author=self.name,
-          branch=invocation_context.branch,
-          content=after_agent_callback_content,
-          actions=callback_context._event_actions,
+    Args:
+      invocation_context: The invocation context for this agent.
+      error: The exception that escaped agent execution.
+    """
+    callback_context = CallbackContext(invocation_context)
+    try:
+      await invocation_context.plugin_manager.run_on_agent_error_callback(
+          agent=self,
+          callback_context=callback_context,
+          error=error,
       )
-    return None
+    except Exception:  # pylint: disable=broad-except
+      logger.exception(
+          'on_agent_error_callback raised; suppressing so the original agent'
+          ' error propagates.'
+      )
 
   @override
   def model_post_init(self, __context: Any) -> None:
     super().model_post_init(__context)
+    # >= 2 branches already warned in validate_sub_agents_unique_names.
+    if (
+        isinstance(self.sub_agents, (list, tuple))
+        and sum(self.name in _subtree_names(c, set()) for c in self.sub_agents)
+        == 1
+    ):
+      _warn_duplicate_agent_names({self.name})
     self.__set_parent_agent_for_sub_agents()
 
   @field_validator('name', mode='after')
   @classmethod
-  def validate_name(cls, value: str):
+  def validate_name(cls, value: str) -> str:
     if not value.isidentifier():
       raise ValueError(
           f'Found invalid agent name: `{value}`.'
@@ -610,29 +753,13 @@ class BaseAgent(BaseNode, abc.ABC):
       The validated list of sub-agents.
 
     """
-    if not value:
-      return value
-
     seen_names: set[str] = set()
     duplicates: set[str] = set()
-
     for sub_agent in value:
-      name = sub_agent.name
-      if name in seen_names:
-        duplicates.add(name)
-      else:
-        seen_names.add(name)
-
-    if duplicates:
-      duplicate_names_str = ', '.join(
-          f'`{name}`' for name in sorted(duplicates)
-      )
-      logger.warning(
-          'Found duplicate sub-agent names: %s. '
-          'All sub-agents must have unique names.',
-          duplicate_names_str,
-      )
-
+      branch_names = _subtree_names(sub_agent, set())
+      duplicates |= seen_names & branch_names
+      seen_names |= branch_names
+    _warn_duplicate_agent_names(duplicates)
     return value
 
   def __set_parent_agent_for_sub_agents(self) -> BaseAgent:
@@ -649,89 +776,60 @@ class BaseAgent(BaseNode, abc.ABC):
   @classmethod
   @deprecated(
       'BaseAgent.from_config is deprecated and will be removed in future'
-      ' versions.'
+      ' versions. Use `google.adk.agents.config_agent_utils.from_config`'
+      ' instead.'
   )
-  @experimental(FeatureName.AGENT_CONFIG)
   def from_config(
       cls: Type[SelfAgent],
-      config: BaseAgentConfig,
+      config: Union[BaseModel, dict[str, Any]],
       config_abs_path: str,
   ) -> SelfAgent:
     """Creates an agent from a config.
 
-    If sub-classes use a custom agent config, override `_parse_config` to
-    return updated kwargs for the agent constructor.
-
     Args:
-      config: The config to create the agent from.
-      config_abs_path: The absolute path to the config file that contains the
-        agent config.
-
-    Returns:
-      The created agent.
+      config: The agent's config, either as its config model or as the raw
+        mapping parsed from YAML.
+      config_abs_path: Absolute path of the config file, used to resolve
+        references it makes to sibling files.
     """
-    kwargs = cls.__create_kwargs(config, config_abs_path)
-    kwargs = cls._parse_config(config, config_abs_path, kwargs)
+    from .config_agent_utils import _AgentConfigMapper
+    from .config_agent_utils import _underlying
+
+    if isinstance(config, BaseModel):
+      data = config.model_dump(exclude_unset=True)
+      if hasattr(config, 'model_extra') and config.model_extra:
+        data.update(config.model_extra)
+    elif isinstance(config, dict):
+      data = config
+    else:
+      raise ValueError(
+          'Invalid config type: expected Pydantic model or dict, got'
+          f' {type(config)}'
+      )
+
+    mapper = _AgentConfigMapper(config_abs_path)
+    kwargs = mapper.map(data, cls)
+
+    # Invoke _parse_config only where it is actually overridden. Comparing the
+    # bound classmethods would compare their __self__ too, which differs for
+    # every subclass, so the underlying functions are compared instead.
+    if getattr(cls, '_parse_config', None) is not None and _underlying(
+        cls._parse_config
+    ) is not _underlying(BaseAgent._parse_config):
+      kwargs = cls._parse_config(config, config_abs_path, kwargs)
     return cls(**kwargs)
 
   @classmethod
-  @experimental(FeatureName.AGENT_CONFIG)
+  @deprecated(
+      'BaseAgent._parse_config is deprecated and will be removed in future'
+      ' versions. Please define fields directly on the class or use the dynamic'
+      ' YAML loader.'
+  )
   def _parse_config(
       cls: Type[SelfAgent],
-      config: BaseAgentConfig,
+      config: Any,
       config_abs_path: str,
       kwargs: Dict[str, Any],
   ) -> Dict[str, Any]:
-    """Parses the config and returns updated kwargs to construct the agent.
-
-    Sub-classes should override this method to use a custom agent config class.
-
-    Args:
-      config: The config to parse.
-      config_abs_path: The absolute path to the config file that contains the
-        agent config.
-      kwargs: The keyword arguments used for agent constructor.
-
-    Returns:
-      The updated keyword arguments used for agent constructor.
-    """
-    return kwargs
-
-  @classmethod
-  def __create_kwargs(
-      cls,
-      config: BaseAgentConfig,
-      config_abs_path: str,
-  ) -> Dict[str, Any]:
-    """Creates kwargs for the fields of BaseAgent."""
-
-    from .config_agent_utils import resolve_agent_reference
-    from .config_agent_utils import resolve_callbacks
-
-    kwargs: Dict[str, Any] = {
-        'name': config.name,
-        'description': config.description,
-    }
-    if config.sub_agents:
-      sub_agents = []
-      for sub_agent_config in config.sub_agents:
-        sub_agent = resolve_agent_reference(sub_agent_config, config_abs_path)
-        sub_agents.append(sub_agent)
-      kwargs['sub_agents'] = sub_agents
-
-    if config.before_agent_callbacks:
-      kwargs['before_agent_callback'] = resolve_callbacks(
-          config.before_agent_callbacks
-      )
-    if config.after_agent_callbacks:
-      kwargs['after_agent_callback'] = resolve_callbacks(
-          config.after_agent_callbacks
-      )
-
-    # Preserves 1.x AgentConfigMapper behavior: extra YAML fields that match
-    # a constructor parameter pass through automatically.
-    if config.model_extra:
-      for key, value in config.model_extra.items():
-        if key in cls.model_fields and key not in kwargs:
-          kwargs[key] = value
+    """Parses the config and returns updated kwargs to construct the agent."""
     return kwargs

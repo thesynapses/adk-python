@@ -26,26 +26,24 @@ from typing_extensions import override
 from ..auth.auth_credential import AuthCredential
 from ..auth.auth_tool import AuthConfig
 from ..auth.credential_manager import CredentialManager
-from ..features import experimental
-from ..features import FeatureName
 from .function_tool import FunctionTool
 from .tool_context import ToolContext
 
 logger = logging.getLogger("google_adk." + __name__)
 
 
-@experimental(FeatureName.AUTHENTICATED_FUNCTION_TOOL)
 class AuthenticatedFunctionTool(FunctionTool):
-  """A FunctionTool that handles authentication before the actual tool logic
-  gets called. Functions can accept a special `credential` argument which is the
-  credential ready for use.(Experimental)
+  """A FunctionTool that handles authentication before the actual tool logic.
+
+  Functions can accept a special `credential` argument which is the credential
+  ready for use.
   """
 
   def __init__(
       self,
       *,
       func: Callable[..., Any],
-      auth_config: AuthConfig = None,
+      auth_config: Optional[AuthConfig] = None,
       response_for_auth_required: Optional[Union[dict[str, Any], str]] = None,
   ):
     """Initializes the AuthenticatedFunctionTool.
@@ -65,6 +63,7 @@ class AuthenticatedFunctionTool(FunctionTool):
     super().__init__(func=func)
     self._ignore_params.append("credential")
 
+    self._credentials_manager: Optional[CredentialManager]
     if auth_config and auth_config.auth_scheme:
       self._credentials_manager = CredentialManager(auth_config=auth_config)
     else:
@@ -98,7 +97,7 @@ class AuthenticatedFunctionTool(FunctionTool):
       *,
       args: dict[str, Any],
       tool_context: ToolContext,
-      credential: AuthCredential,
+      credential: Optional[AuthCredential],
   ) -> Any:
     args_to_call = args.copy()
     signature = inspect.signature(self.func)

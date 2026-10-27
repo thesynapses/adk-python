@@ -23,6 +23,22 @@ from opentelemetry.sdk.trace.export import SpanExportResult
 from opentelemetry.trace import SpanContext
 from opentelemetry.trace import TraceFlags
 from opentelemetry.trace import TraceState
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def shutdown_created_exporters(monkeypatch):
+  exporters = []
+  original_init = SqliteSpanExporter.__init__
+
+  def initialize(exporter, *, db_path):
+    original_init(exporter, db_path=db_path)
+    exporters.append(exporter)
+
+  monkeypatch.setattr(SqliteSpanExporter, "__init__", initialize)
+  yield
+  for exporter in exporters:
+    exporter.shutdown()
 
 
 def _create_span(

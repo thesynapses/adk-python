@@ -28,9 +28,10 @@ from typing import TYPE_CHECKING
 
 from ...features import experimental
 from ...features import FeatureName
+from ...utils import _json_utils
 
 if TYPE_CHECKING:
-  import vertexai
+  import agentplatform
 
 logger = logging.getLogger("google_adk." + __name__)
 
@@ -105,15 +106,16 @@ class SandboxClient:
 
   def __init__(
       self,
-      vertexai_client: "vertexai.Client",
+      vertexai_client: "agentplatform.Client",
       sandbox: Any,
       access_token: str,
   ):
     """Initialize the sandbox client.
 
     Args:
-      vertexai_client: The Vertex AI client instance.
-      sandbox: The sandbox object from vertexai SDK (SandboxEnvironment).
+      vertexai_client: The Agent Platform client instance.
+      sandbox: The sandbox object from the agentplatform SDK
+        (SandboxEnvironment).
       access_token: The access token for authenticating with the sandbox.
     """
     self._client = vertexai_client
@@ -129,10 +131,10 @@ class SandboxClient:
     Returns:
       The parsed JSON response as a dict.
     """
-    import json
-
     if hasattr(response, "body") and response.body:
-      return json.loads(response.body)
+      return _json_utils.safe_json_loads(
+          response.body, context="sandbox response"
+      )
     return {}
 
   def update_access_token(self, access_token: str) -> None:
@@ -166,7 +168,7 @@ class SandboxClient:
     request_dict = {"command": command, "params": params}
 
     response = await asyncio.to_thread(
-        self._client.agent_engines.sandboxes.send_command,
+        self._client.sandboxes.send_command,
         http_method="POST",
         path="cdp",
         access_token=self._access_token,
@@ -198,7 +200,7 @@ class SandboxClient:
     try:
       request_dict = {"commands": commands, "stop_on_error": stop_on_error}
       response = await asyncio.to_thread(
-          self._client.agent_engines.sandboxes.send_command,
+          self._client.sandboxes.send_command,
           http_method="POST",
           path="cdps",
           access_token=self._access_token,
@@ -286,7 +288,7 @@ class SandboxClient:
     for attempt in range(max_retries):
       try:
         response = await asyncio.to_thread(
-            self._client.agent_engines.sandboxes.send_command,
+            self._client.sandboxes.send_command,
             http_method="GET",
             path="tabs",
             access_token=self._access_token,
@@ -494,10 +496,12 @@ class SandboxClient:
       direction: The scroll direction.
       magnitude: The scroll amount in pixels.
     """
-    direction = direction.lower()
-    sign = -1 if direction in ("left", "up") else 1
-    delta_x = sign * magnitude if direction in ("left", "right") else 0
-    delta_y = sign * magnitude if direction in ("up", "down") else 0
+    normalized_direction = direction.lower()
+    sign = -1 if normalized_direction in ("left", "up") else 1
+    delta_x = (
+        sign * magnitude if normalized_direction in ("left", "right") else 0
+    )
+    delta_y = sign * magnitude if normalized_direction in ("up", "down") else 0
 
     await self.make_cdp_request(
         _CDP_COMMAND_INPUT_DISPATCH_MOUSE_EVENT,
@@ -568,8 +572,8 @@ class SandboxClient:
       elif upper_key in _META_KEY_MAP:
         # Special key like Enter, Backspace
         cdp_key = _META_KEY_MAP[upper_key]
-        params_down = {"type": "keyDown", "key": cdp_key}
-        params_up = {"type": "keyUp", "key": cdp_key}
+        params_down: dict[str, Any] = {"type": "keyDown", "key": cdp_key}
+        params_up: dict[str, Any] = {"type": "keyUp", "key": cdp_key}
         if cdp_key == "Enter":
           params_down["windowsVirtualKeyCode"] = 13
           params_up["windowsVirtualKeyCode"] = 13
@@ -664,7 +668,7 @@ class SandboxClient:
 
     try:
       response = await asyncio.to_thread(
-          self._client.agent_engines.sandboxes.send_command,
+          self._client.sandboxes.send_command,
           http_method="GET",
           path="",
           access_token=self._access_token,

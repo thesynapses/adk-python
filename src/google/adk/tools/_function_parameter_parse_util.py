@@ -17,10 +17,12 @@ from __future__ import annotations
 
 from enum import Enum
 import inspect
+import json
 import logging
 import types as typing_types
-from typing import _GenericAlias
+from typing import _GenericAlias  # type: ignore[attr-defined]
 from typing import Any
+from typing import cast
 from typing import get_args
 from typing import get_origin
 from typing import Literal
@@ -93,6 +95,50 @@ def _add_unevaluated_items_to_fixed_len_tuple_schema(
   return json_schema
 
 
+def _normalize_tuple_schema_for_genai_schema(
+    json_schema: Any,
+) -> Any:
+  """Normalizes tuple schema keywords unsupported by `types.Schema`.
+
+  Pydantic emits `prefixItems` for fixed-length tuples. `types.Schema` does not
+  support `prefixItems`, so we convert tuple item definitions into
+  `items.anyOf`. We also drop `unevaluatedItems`, which is unsupported by
+  `types.Schema`.
+
+  Args:
+    json_schema: The JSON schema to normalize.
+
+  Returns:
+    The normalized JSON schema.
+  """
+  if isinstance(json_schema, list):
+    return [
+        _normalize_tuple_schema_for_genai_schema(item) for item in json_schema
+    ]
+  if not isinstance(json_schema, dict):
+    return json_schema
+
+  normalized_schema = {
+      key: _normalize_tuple_schema_for_genai_schema(value)
+      for key, value in json_schema.items()
+      if key != 'unevaluatedItems'
+  }
+
+  prefix_items = normalized_schema.pop('prefixItems', None)
+  if isinstance(prefix_items, list):
+    if len(prefix_items) == 1:
+      normalized_schema['items'] = prefix_items[0]
+    elif prefix_items:
+      normalized_schema['items'] = {'anyOf': prefix_items}
+
+  # Pydantic can emit `items: false` for tuple schemas, which is unsupported by
+  # `types.Schema`.
+  if normalized_schema.get('items') is False:  # pylint: disable=g-bool-id-comparison
+    normalized_schema.pop('items')
+
+  return normalized_schema
+
+
 def _raise_for_unsupported_param(
     param: inspect.Parameter,
     func_name: str,
@@ -106,16 +152,35 @@ def _raise_for_unsupported_param(
   ) from exception
 
 
-def _raise_for_invalid_enum_value(param: inspect.Parameter):
+def _raise_for_invalid_enum_value(param: inspect.Parameter) -> None:
   """Raises an error if the default value is not a valid enum value."""
   if inspect.isclass(param.annotation) and issubclass(param.annotation, Enum):
-    if param.default is not inspect.Parameter.empty and param.default not in [
-        e.value for e in param.annotation
-    ]:
-      raise ValueError(
-          f'Default value {param.default} is not a valid enum value for'
-          f' {param.annotation}.'
+    if param.default is not inspect.Parameter.empty:
+      default_value = (
+          param.default.value
+          if isinstance(param.default, Enum)
+          else param.default
       )
+      if default_value not in [e.value for e in param.annotation]:
+        raise ValueError(
+            f'Default value {param.default} is not a valid enum value for'
+            f' {param.annotation}.'
+        )
+
+
+def _render_enum_value(value: object, annotation: object) -> str:
+  """Renders an enum value to string for legacy schema declarations."""
+  if isinstance(value, str):
+    return value
+  try:
+    return json.dumps(value)
+  except TypeError as e:
+    # Raising ValueError triggers the fallback to pydantic schema generation in
+    # _automatic_function_calling_util.build_function_declaration.
+    raise ValueError(
+        f'Enum value {value!r} of {annotation} is not serializable for'
+        ' automatic function calling.'
+    ) from e
 
 
 def _generate_json_schema_for_parameter(
@@ -136,23 +201,26 @@ def _generate_json_schema_for_parameter(
   json_schema_dict = _add_unevaluated_items_to_fixed_len_tuple_schema(
       json_schema_dict
   )
-  return json_schema_dict
+  return cast(
+      dict[str, Any],
+      _normalize_tuple_schema_for_genai_schema(json_schema_dict),
+  )
 
 
 def _is_builtin_primitive_or_compound(
-    annotation: inspect.Parameter.annotation,
+    annotation: object,
 ) -> bool:
-  return annotation in _py_builtin_type_to_schema_type.keys()
+  return annotation in _py_builtin_type_to_schema_type
 
 
-def _raise_for_any_of_if_mldev(schema: types.Schema):
+def _raise_for_any_of_if_mldev(schema: types.Schema) -> None:
   if schema.any_of:
     raise ValueError(
         'AnyOf is not supported in function declaration schema for Google AI.'
     )
 
 
-def _update_for_default_if_mldev(schema: types.Schema):
+def _update_for_default_if_mldev(schema: types.Schema) -> None:
   if schema.default is not None:
     # TODO: Remove this workaround once mldev supports default value.
     schema.default = None
@@ -164,25 +232,27 @@ def _update_for_default_if_mldev(schema: types.Schema):
 
 def _raise_if_schema_unsupported(
     variant: GoogleLLMVariant, schema: types.Schema
-):
+) -> None:
   if variant == GoogleLLMVariant.GEMINI_API:
     _raise_for_any_of_if_mldev(schema)
     # _update_for_default_if_mldev(schema) # No need of this since GEMINI now supports default value
 
 
 def _is_default_value_compatible(
-    default_value: Any, annotation: inspect.Parameter.annotation
+    default_value: object, annotation: object
 ) -> bool:
   # None type is expected to be handled external to this function
+  if annotation is Any:
+    return True
   if _is_builtin_primitive_or_compound(annotation):
-    return isinstance(default_value, annotation)
+    return isinstance(default_value, cast(type, annotation))
 
   if (
       isinstance(annotation, _GenericAlias)
       or isinstance(annotation, typing_types.GenericAlias)
       or isinstance(annotation, typing_types.UnionType)
   ):
-    origin = get_origin(annotation)
+    origin: Any = get_origin(annotation)
     if origin in (Union, typing_types.UnionType):
       return any(
           _is_default_value_compatible(default_value, arg)
@@ -206,6 +276,22 @@ def _is_default_value_compatible(
               for arg in get_args(annotation)
           )
           for item in default_value
+      )
+
+    if origin is tuple:
+      if not isinstance(default_value, tuple):
+        return False
+      args = get_args(annotation)
+      if len(args) == 2 and args[-1] is Ellipsis:
+        return all(
+            _is_default_value_compatible(item, args[0])
+            for item in default_value
+        )
+      if len(args) != len(default_value):
+        return False
+      return all(
+          _is_default_value_compatible(item, arg)
+          for item, arg in zip(default_value, args)
       )
 
     if origin is Literal:
@@ -238,17 +324,24 @@ def _parse_schema_from_parameter(
     _raise_if_schema_unsupported(variant, schema)
     return schema
   if isinstance(param.annotation, type) and issubclass(param.annotation, Enum):
+    # `schema.type` is always STRING here, so every enum value must be a
+    # string too. Use `json.dumps` rather than `str` for parity with
+    # `_gemini_schema_util._sanitize_schema_type` (e.g. `bool` values serialize
+    # as 'true'/'false' rather than 'True'/'False').
     schema.type = types.Type.STRING
-    schema.enum = [e.value for e in param.annotation]
+    values = [e.value for e in param.annotation]
+
+    schema.enum = [_render_enum_value(v, param.annotation) for v in values]
     if param.default is not inspect.Parameter.empty:
       default_value = (
           param.default.value
           if isinstance(param.default, Enum)
           else param.default
       )
-      if default_value not in schema.enum:
+      if default_value not in values:
         raise ValueError(default_value_error_msg)
-      schema.default = default_value
+      # Emit the member's own value, so `default` is always one of `enum`.
+      schema.default = schema.enum[values.index(default_value)]
     _raise_if_schema_unsupported(variant, schema)
     return schema
   if (
@@ -274,12 +367,10 @@ def _parse_schema_from_parameter(
           ),
           func_name,
       )
-      if (
-          schema_in_any_of.model_dump_json(exclude_none=True)
-          not in unique_types
-      ):
+      schema_key = schema_in_any_of.model_dump_json(exclude_none=True)
+      if schema_key not in unique_types:
         schema.any_of.append(schema_in_any_of)
-        unique_types.add(schema_in_any_of.model_dump_json(exclude_none=True))
+        unique_types.add(schema_key)
     if len(schema.any_of) == 1:  # param: list | None -> Array
       collapsed = schema.any_of[0]
       if schema.nullable:
@@ -299,10 +390,26 @@ def _parse_schema_from_parameter(
       or isinstance(param.annotation, typing_types.GenericAlias)
       or isinstance(param.annotation, typing_types.UnionType)
   ):
-    origin = get_origin(param.annotation)
+    origin: Any = get_origin(param.annotation)
     args = get_args(param.annotation)
     if origin is dict:
       schema.type = types.Type.OBJECT
+      # args[1] is the value type of dict[K, V]. Untyped dictionaries (where
+      # len(args) == 0) intentionally leave additional_properties unset.
+      # Google AI has no such field on its declaration schema and rejects the
+      # whole request when it is present, so there the value type is dropped
+      # and the parameter is declared as a plain object.
+      if len(args) == 2 and variant != GoogleLLMVariant.GEMINI_API:
+        value_type = args[1]
+        schema.additional_properties = _parse_schema_from_parameter(
+            variant,
+            inspect.Parameter(
+                'value',
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                annotation=value_type,
+            ),
+            func_name,
+        )
       if param.default is not inspect.Parameter.empty:
         if not _is_default_value_compatible(param.default, param.annotation):
           raise ValueError(default_value_error_msg)
@@ -339,6 +446,43 @@ def _parse_schema_from_parameter(
         schema.default = param.default
       _raise_if_schema_unsupported(variant, schema)
       return schema
+    if origin is tuple:
+      # A genai array schema only carries a single `items` type, so only
+      # homogeneous tuples can be represented. `tuple[T, ...]` maps to an
+      # unbounded array, while a fixed-length homogeneous tuple
+      # (e.g. `tuple[T, T]`) additionally pins min_items/max_items to the
+      # arity. Heterogeneous tuples (e.g. `tuple[str, int]`) cannot be
+      # represented and intentionally raise so that from_function_with_options
+      # routes them through the standard unsupported-parameter handling.
+      fixed_length = None
+      if len(args) == 2 and args[-1] is Ellipsis:
+        item_annotation = args[0]
+      elif args and all(arg == args[0] for arg in args):
+        item_annotation = args[0]
+        fixed_length = len(args)
+      else:
+        raise ValueError(
+            f'Tuple type {param.annotation} must use one repeated item type.'
+        )
+      schema.type = types.Type.ARRAY
+      schema.items = _parse_schema_from_parameter(
+          variant,
+          inspect.Parameter(
+              'item',
+              inspect.Parameter.POSITIONAL_OR_KEYWORD,
+              annotation=item_annotation,
+          ),
+          func_name,
+      )
+      if fixed_length is not None:
+        schema.min_items = fixed_length
+        schema.max_items = fixed_length
+      if param.default is not inspect.Parameter.empty:
+        if not _is_default_value_compatible(param.default, param.annotation):
+          raise ValueError(default_value_error_msg)
+        schema.default = param.default
+      _raise_if_schema_unsupported(variant, schema)
+      return schema
     if origin in (Union, typing_types.UnionType):
       schema.any_of = []
       schema.type = types.Type.OBJECT
@@ -367,12 +511,10 @@ def _parse_schema_from_parameter(
             ):
               # Optional type with list, for example Optional[list[str]]
               schema.items = schema_in_any_of.items
-        if (
-            schema_in_any_of.model_dump_json(exclude_none=True)
-            not in unique_types
-        ):
+        schema_key = schema_in_any_of.model_dump_json(exclude_none=True)
+        if schema_key not in unique_types:
           schema.any_of.append(schema_in_any_of)
-          unique_types.add(schema_in_any_of.model_dump_json(exclude_none=True))
+          unique_types.add(schema_key)
       if len(schema.any_of) == 1:  # param: Union[List, None] -> Array
         collapsed = schema.any_of[0]
         if schema.nullable:
@@ -445,7 +587,7 @@ def _parse_schema_from_parameter(
 
 def _get_required_fields(schema: types.Schema) -> list[str]:
   if not schema.properties:
-    return
+    return []
   return [
       field_name
       for field_name, field_schema in schema.properties.items()

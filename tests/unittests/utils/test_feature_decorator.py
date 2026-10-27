@@ -16,8 +16,20 @@ import os
 import tempfile
 import warnings
 
+from google.adk.features import FeatureName
+from google.adk.utils.feature_decorator import _make_feature_decorator
+from google.adk.utils.feature_decorator import _WARNED_MESSAGES
 from google.adk.utils.feature_decorator import experimental
 from google.adk.utils.feature_decorator import working_in_progress
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def reset_warned_messages():
+  """Let each test observe the first warning for the surfaces it exercises."""
+  _WARNED_MESSAGES.clear()
+  yield
+  _WARNED_MESSAGES.clear()
 
 
 @working_in_progress("in complete feature, don't use yet")
@@ -181,8 +193,6 @@ def test_working_in_progress_loads_from_dotenv_file():
   try:
     from dotenv import load_dotenv
   except ImportError:
-    import pytest
-
     pytest.skip("python-dotenv not available")
 
   # Ensure environment variable is not set in os.environ
@@ -257,6 +267,24 @@ def test_experimental_class_warns(monkeypatch):
     assert "class may change" in str(w[0].message)
 
 
+def test_experimental_warns_once_per_surface(monkeypatch):
+  """Repeated use of one surface warns once; another surface still warns."""
+  monkeypatch.delenv(
+      "ADK_SUPPRESS_EXPERIMENTAL_FEATURE_WARNINGS", raising=False
+  )
+  with warnings.catch_warnings(record=True) as w:
+    warnings.simplefilter("always")
+
+    for _ in range(3):
+      experimental_fn()
+      ExperimentalClass()
+
+    messages = [str(warning.message) for warning in w]
+    assert len(messages) == 2
+    assert any("[EXPERIMENTAL] experimental_fn:" in m for m in messages)
+    assert any("[EXPERIMENTAL] ExperimentalClass:" in m for m in messages)
+
+
 def test_experimental_function_bypassed_with_env_var(monkeypatch):
   """Experimental function emits no warning when bypass env var is true."""
   true_values = ["true", "True", "TRUE", "1", "yes", "YES", "on", "ON"]
@@ -286,6 +314,7 @@ def test_experimental_function_not_bypassed_for_false_env_var(monkeypatch):
   """Experimental function still warns for non-true bypass env var values."""
   false_values = ["false", "False", "FALSE", "0", "", "no", "off"]
   for false_val in false_values:
+    _WARNED_MESSAGES.clear()
     monkeypatch.setenv("ADK_SUPPRESS_EXPERIMENTAL_FEATURE_WARNINGS", false_val)
     with warnings.catch_warnings(record=True) as w:
       warnings.simplefilter("always")
@@ -298,6 +327,7 @@ def test_experimental_class_not_bypassed_for_false_env_var(monkeypatch):
   """Experimental class still warns for non-true bypass env var values."""
   false_values = ["false", "False", "FALSE", "0", "", "no", "off"]
   for false_val in false_values:
+    _WARNED_MESSAGES.clear()
     monkeypatch.setenv("ADK_SUPPRESS_EXPERIMENTAL_FEATURE_WARNINGS", false_val)
     with warnings.catch_warnings(record=True) as w:
       warnings.simplefilter("always")
@@ -382,3 +412,45 @@ def test_experimental_function_empty_parens_warns(monkeypatch):
     assert "This feature is experimental and may change or be removed" in str(
         w[0].message
     )
+
+
+@pytest.mark.parametrize("decorator", [experimental, working_in_progress])
+def test_feature_name_is_rejected(decorator):
+  """A FeatureName must not be swallowed as the warning message."""
+  with pytest.raises(TypeError, match="google.adk.features"):
+    decorator(FeatureName.TOOL_CONFIG)
+
+
+def test_experimental_block_usage_still_raises_with_warning_suppression(
+    monkeypatch,
+):
+  """Suppression must not bypass block_usage RuntimeError."""
+  blocked_decorator = _make_feature_decorator(
+      label="EXPERIMENTAL",
+      default_message="blocked experimental feature",
+      block_usage=True,
+  )
+
+  @blocked_decorator
+  def blocked_func():
+    return "executed"
+
+  @blocked_decorator
+  class BlockedClass:
+    pass
+
+  monkeypatch.setenv("ADK_SUPPRESS_EXPERIMENTAL_FEATURE_WARNINGS", "1")
+  with pytest.raises(RuntimeError, match=r"\[EXPERIMENTAL\] blocked_func:"):
+    blocked_func()
+  with pytest.raises(RuntimeError, match=r"\[EXPERIMENTAL\] BlockedClass:"):
+    BlockedClass()
+
+
+def test_working_in_progress_still_raises_with_general_suppression(
+    monkeypatch,
+):
+  """The experimental suppression flag must not lift the WIP RuntimeError."""
+  monkeypatch.delenv("ADK_ALLOW_WIP_FEATURES", raising=False)
+  monkeypatch.setenv("ADK_SUPPRESS_EXPERIMENTAL_FEATURE_WARNINGS", "true")
+  with pytest.raises(RuntimeError, match=r"\[WIP\] wip_function:"):
+    wip_function()

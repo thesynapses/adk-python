@@ -1,5 +1,20 @@
-# Step 6: Builds and publishes the package to PyPI from a release/v{version} branch.
-# Creates a merge-back PR (step 7) to sync release changes to main.
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Builds and publishes the package to PyPI from a release/v* branch.
+# Supports both main (v2+) stable releases and v1 pre-releases (with auto PEP 440 version mapping).
+# Creates a merge-back PR to sync changes back to the base branch (main or v1).
 name: "Release: Publish to PyPi"
 
 on:
@@ -10,35 +25,132 @@ permissions:
   pull-requests: write
 
 jobs:
+  # A published version can never be replaced, so nothing is built until the
+  # artifact-check job has passed in every Release: Artifact Check run on the
+  # commit being released and the commit carries a release/rc-gate status of
+  # success. The quickstart-smoke job calls a live model, so it does not gate.
+  release-checks:
+    if: github.repository == 'google/adk-python'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      statuses: read
+    steps:
+      - name: Require passing release checks on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RC_GATE_CONTEXT: release/rc-gate
+        run: |
+          set -euo pipefail
+          # Without this, a failed jobs lookup inside $( ) drops that run silently.
+          shopt -s inherit_errexit
+          blocked=0
+
+          # A cancelled run was superseded by a newer one, so it decides nothing.
+          # The jobs endpoint reports each job's latest attempt, so a re-run counts.
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/release-artifact-check.yml/runs?head_sha=$GITHUB_SHA&per_page=100" \
+              --jq '.workflow_runs[] | select(.conclusion != "cancelled") | "\(.id) \(.status) \(.html_url)"' \
+            | while read -r id status url; do
+                gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs" \
+                  | jq -c --arg status "$status" --arg url "$url" \
+                    'first(.jobs[] | select(.name == "artifact-check") | {status, conclusion, url: .html_url}) // {status: $status, conclusion: null, url: $url}'
+              done | jq -s '.')
+          failed=$(jq -r '.[] | select(.status == "completed" and .conclusion != "success") | .url' <<< "$jobs")
+          running=$(jq -r '.[] | select(.status != "completed") | .url' <<< "$jobs")
+          passed=$(jq '[.[] | select(.conclusion == "success")] | length' <<< "$jobs")
+          if [[ -n "$failed" ]]; then
+            echo "::error::The artifact-check job failed on $GITHUB_SHA. Fix the candidate, or re-run the job if the failure was not caused by it: ${failed//$'\n'/ }"
+            blocked=1
+          elif [[ -n "$running" ]]; then
+            echo "::error::The artifact-check job is still running on $GITHUB_SHA. Publish again once it passes: ${running//$'\n'/ }"
+            blocked=1
+          elif [[ "$passed" -eq 0 ]]; then
+            echo "::error::Release: Artifact Check has not run on $GITHUB_SHA. Dispatch it on ${GITHUB_REF_NAME}, then publish again once it passes."
+            blocked=1
+          else
+            echo "The artifact-check job passed on $GITHUB_SHA ($passed run(s))."
+          fi
+
+          gate=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/status" \
+            | jq -r --arg context "$RC_GATE_CONTEXT" \
+              'first(.statuses[] | select(.context == $context) | "\(.state)\t\(.description // "")") // "missing\t"')
+          state=${gate%%$'\t'*}
+          description=${gate#*$'\t'}
+          if [[ "$state" == "success" ]]; then
+            echo "$RC_GATE_CONTEXT is success on $GITHUB_SHA: $description"
+          elif [[ "$state" == "missing" ]]; then
+            echo "::error::$GITHUB_SHA has no $RC_GATE_CONTEXT status. Once release testing clears this commit, the release owner sets it with: gh api repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA -f context=$RC_GATE_CONTEXT -f state=success -f description='Release testing found no blockers'"
+            blocked=1
+          else
+            echo "::error::$RC_GATE_CONTEXT is $state on $GITHUB_SHA: $description"
+            blocked=1
+          fi
+
+          exit "$blocked"
+
   publish:
+    needs: release-checks
+    if: github.repository == 'google/adk-python'
     runs-on: ubuntu-latest
     steps:
       - name: Validate branch
         run: |
-          if [[ ! "${GITHUB_REF_NAME}" =~ ^release/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Error: Must run from a release/v* branch (e.g., release/v0.3.0)"
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^release/v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "Error: Must run from a release/v* branch (e.g., release/v0.3.0 or release/v1.35.0-alpha.1)"
             exit 1
           fi
 
-      - name: Extract version
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Determine Release Type and Extract Version
         id: version
         run: |
-          VERSION="${GITHUB_REF_NAME}"
-          VERSION="${VERSION#release/v}"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Publishing version: $VERSION"
+          BRANCH_NAME="${GITHUB_REF_NAME}"
+          VERSION="${BRANCH_NAME#release/v}"
 
-      - uses: actions/checkout@v6
+          # Check if this version matches the one in the v1 manifest to determine if it's a v1 release
+          if [ -f .github/.release-please-manifest-v1.json ] && jq -e --arg v "$VERSION" '.["."] == $v' .github/.release-please-manifest-v1.json &>/dev/null; then
+            echo "is_v1=true" >> $GITHUB_OUTPUT
+            echo "base_branch=v1" >> $GITHUB_OUTPUT
+
+            SEMVER="$VERSION"
+            echo "semver=$SEMVER" >> $GITHUB_OUTPUT
+            echo "Semver version (v1): $SEMVER"
+
+            # PEP 440 Conversion (e.g., 2.0.0-alpha.1 -> 2.0.0a1)
+            PEP440=$(echo "$SEMVER" | sed -E 's/-alpha\./a/; s/-beta\./b/; s/-rc\./rc/')
+            echo "pep440=$PEP440" >> $GITHUB_OUTPUT
+            echo "PEP 440 version (v1): $PEP440"
+          else
+            echo "is_v1=false" >> $GITHUB_OUTPUT
+            echo "base_branch=main" >> $GITHUB_OUTPUT
+
+            echo "semver=$VERSION" >> $GITHUB_OUTPUT
+            echo "pep440=$VERSION" >> $GITHUB_OUTPUT
+            echo "Semver version (main): $VERSION"
+          fi
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           version: "latest"
+          enable-cache: true
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.11"
+
+      - name: Update version.py with PEP 440 version (v1 only)
+        if: steps.version.outputs.is_v1 == 'true'
+        env:
+          PEP440_VERSION: ${{ steps.version.outputs.pep440 }}
+        run: |
+          sed -i "s/^__version__ = .*/__version__ = \"${PEP440_VERSION}\"/" src/google/adk/version.py
+          echo "Updated version.py to ${PEP440_VERSION}"
+          grep __version__ src/google/adk/version.py
 
       - name: Build package
         run: uv build
@@ -51,10 +163,12 @@ jobs:
       - name: Create merge-back PR
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PAT }}
-          STEPS_VERSION_OUTPUTS_VERSION: ${{ steps.version.outputs.version }}
+          SEMVER_VERSION: ${{ steps.version.outputs.semver }}
+          PEP440_VERSION: ${{ steps.version.outputs.pep440 }}
+          BASE_BRANCH: ${{ steps.version.outputs.base_branch }}
         run: |
           gh pr create \
-            --base main \
+            --base "$BASE_BRANCH" \
             --head "${GITHUB_REF_NAME}" \
-            --title "chore: merge release v${STEPS_VERSION_OUTPUTS_VERSION} to main" \
-            --body "Syncs version bump and CHANGELOG from release v${STEPS_VERSION_OUTPUTS_VERSION} to main."
+            --title "chore: merge release v${PEP440_VERSION} to $BASE_BRANCH" \
+            --body "Syncs version bump and CHANGELOG from release v${SEMVER_VERSION} to $BASE_BRANCH."

@@ -15,8 +15,10 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Annotated
 from typing import Any
 from typing import Dict
+from typing import Iterator
 from typing import List
 from typing import Literal
 
@@ -26,8 +28,57 @@ from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import model_validator
 
+from ..utils._function_call_names import REQUEST_EUC_FUNCTION_CALL_NAME as _REQUEST_EUC_FUNCTION_CALL_NAME
 
-class BaseModelWithConfig(BaseModel):
+_REDACTED = "<redacted>"
+
+# By-alias (camelCase) and by-name (snake_case) names of every field on a
+# credential model that is marked `repr=False` above. `repr=False` only redacts
+# these from Python's `repr()`/`str()` (logs, error strings); it has no effect
+# on `model_dump()`/`model_dump_json()`, which is what actually goes out over
+# the network (e.g. FastAPI's /run, /run_sse, /run_live, and session
+# responses). Anything serializing an `AuthCredential`-derived object for an
+# external, untrusted client -- as opposed to internal persistence via
+# SessionService -- must additionally strip these keys. Kept as one set here,
+# next to the field declarations, so the two lists can't silently drift apart.
+_CREDENTIAL_SECRET_KEYS = frozenset({
+    "password",
+    "token",
+    "additionalHeaders",
+    "additional_headers",
+    "clientSecret",
+    "client_secret",
+    "authResponseUri",
+    "auth_response_uri",
+    "authCode",
+    "auth_code",
+    "accessToken",
+    "access_token",
+    "refreshToken",
+    "refresh_token",
+    "idToken",
+    "id_token",
+    "codeVerifier",
+    "code_verifier",
+    "privateKeyId",
+    "private_key_id",
+    "privateKey",
+    "private_key",
+    "apiKey",
+    "api_key",
+})
+
+
+# Pydantic echoes the rejected value into ValidationError messages
+# ("input_value=..."), which would put a malformed secret straight into logs and
+# into the error strings surfaced to the LLM. The field name and error type are
+# still reported. Passed as a class keyword rather than added to `model_config`
+# below: `model_config` states what these models accept, and rewriting that
+# declaration reads as an API change to the breaking-change detector even though
+# nothing about what they accept has changed.
+class BaseModelWithConfig(BaseModel, hide_input_in_errors=True):
+  """Base model for credential types, hardened against leaking secrets."""
+
   model_config = ConfigDict(
       extra="allow",
       alias_generator=alias_generators.to_camel,
@@ -35,16 +86,38 @@ class BaseModelWithConfig(BaseModel):
   )
   """The pydantic model config."""
 
+  def __repr_args__(self) -> Iterator[tuple[str | None, Any]]:
+    """Redacts the values of extra (unmodeled) fields from repr and str.
+
+    `extra="allow"` lets callers attach arbitrary keys to these credential
+    models, and pydantic renders extras in repr unconditionally: marking a
+    declared field `repr=False` does nothing for a secret that arrives under an
+    unexpected key (e.g. a non-standard field in an OAuth2 token response).
+    Redacting the values keeps them out of logs and out of error strings that
+    reach the LLM, while still showing which keys were set.
+
+    Yields:
+      `(name, value)` pairs to render, with the values of extra fields replaced
+      by a redaction placeholder.
+    """
+    extra = self.__pydantic_extra__ or {}
+    for key, value in super().__repr_args__():
+      yield key, _REDACTED if key in extra else value
+
 
 class HttpCredentials(BaseModelWithConfig):
   """Represents the secret token value for HTTP authentication, like user name, password, oauth token, etc."""
 
   username: str | None = None
-  password: str | None = None
-  token: str | None = None
+  password: Annotated[str | None, Field(repr=False)] = None
+  token: Annotated[str | None, Field(repr=False)] = None
 
+  # Narrows pydantic's model_validate(obj: Any, *, strict, from_attributes,
+  # context) -> Self to a dict-only form, which is not a compatible override.
   @classmethod
-  def model_validate(cls, data: Dict[str, Any]) -> "HttpCredentials":
+  def model_validate(  # type: ignore[override]
+      cls, data: Dict[str, Any]
+  ) -> "HttpCredentials":
     return cls(
         username=data.get("username"),
         password=data.get("password"),
@@ -61,14 +134,14 @@ class HttpAuth(BaseModelWithConfig):
   # Examples: 'basic', 'bearer'
   scheme: str
   credentials: HttpCredentials
-  additional_headers: Dict[str, str] | None = None
+  additional_headers: Annotated[dict[str, str] | None, Field(repr=False)] = None
 
 
 class OAuth2Auth(BaseModelWithConfig):
   """Represents credential value and its metadata for a OAuth2 credential."""
 
   client_id: str | None = None
-  client_secret: str | None = None
+  client_secret: Annotated[str | None, Field(repr=False)] = None
   # tool or adk can generate the auth_uri with the state info thus client
   # can verify the state
   auth_uri: str | None = None
@@ -79,15 +152,16 @@ class OAuth2Auth(BaseModelWithConfig):
   state: str | None = None
   # tool or adk can decide the redirect_uri if they don't want client to decide
   redirect_uri: str | None = None
-  auth_response_uri: str | None = None
-  auth_code: str | None = None
-  access_token: str | None = None
-  refresh_token: str | None = None
-  id_token: str | None = None
+  auth_response_uri: Annotated[str | None, Field(repr=False)] = None
+  auth_code: Annotated[str | None, Field(repr=False)] = None
+  access_token: Annotated[str | None, Field(repr=False)] = None
+  refresh_token: Annotated[str | None, Field(repr=False)] = None
+  id_token: Annotated[str | None, Field(repr=False)] = None
   expires_at: int | None = None
   expires_in: int | None = None
   audience: str | None = None
-  code_verifier: str | None = None
+  prompt: str | None = None
+  code_verifier: Annotated[str | None, Field(repr=False)] = None
   code_challenge_method: str | None = None
   token_endpoint_auth_method: (
       Literal[
@@ -140,8 +214,8 @@ class ServiceAccountCredential(BaseModelWithConfig):
 
   type_: str = Field("", alias="type")
   project_id: str
-  private_key_id: str
-  private_key: str
+  private_key_id: Annotated[str, Field(repr=False)]
+  private_key: Annotated[str, Field(repr=False)]
   client_email: str
   client_id: str
   auth_uri: str
@@ -279,7 +353,104 @@ class AuthCredential(BaseModelWithConfig):
   # This will be supported in the future.
   resource_ref: str | None = None
 
-  api_key: str | None = None
+  api_key: Annotated[str | None, Field(repr=False)] = None
   http: HttpAuth | None = None
   service_account: ServiceAccount | None = None
   oauth2: OAuth2Auth | None = None
+
+
+_AUTH_TYPE_VALUES = (
+    frozenset(e.value for e in AuthCredentialTypes)
+    | frozenset(e.name for e in AuthCredentialTypes)
+    | frozenset(e.name.lower() for e in AuthCredentialTypes)
+)
+
+
+def _redact_auth_config_secrets(value: Any) -> Any:
+  """Strips credential-secret keys from an authConfig subtree."""
+  if isinstance(value, dict):
+    return {
+        key: _redact_auth_config_secrets(val)
+        for key, val in value.items()
+        if key not in _CREDENTIAL_SECRET_KEYS
+    }
+  if isinstance(value, list):
+    return [_redact_auth_config_secrets(item) for item in value]
+  return value
+
+
+def _redact_credential_secrets(value: Any) -> Any:
+  """Strips credential secrets from auth carriers and credential payloads.
+
+  Serializers calling this function are expected to serialize Pydantic models
+  with `by_alias=True` so on-wire payloads match the camelCase aliases used by
+  FastAPI and frontend clients, though `_CREDENTIAL_SECRET_KEYS` also handles
+  snake_case keys for raw dicts and `by_alias=False` dumps.
+
+  Args:
+    value: The payload to redact, typically a serialized dict or list containing
+      auth credentials, function call args, or event actions.
+
+  Returns:
+    A copy of the payload with credential secret keys stripped.
+  """
+  if isinstance(value, dict):
+    for key in ("authType", "auth_type"):
+      auth_type = value.get(key)
+      if (
+          isinstance(auth_type, str) and auth_type in _AUTH_TYPE_VALUES
+      ) or isinstance(auth_type, AuthCredentialTypes):
+        return _redact_auth_config_secrets(value)
+
+    if value.get("name") == _REQUEST_EUC_FUNCTION_CALL_NAME:
+      result = {}
+      for key, val in value.items():
+        if key == "args" and isinstance(val, dict):
+          new_args = dict(val)
+          for auth_key in ("authConfig", "auth_config"):
+            if auth_key in new_args:
+              new_args[auth_key] = _redact_auth_config_secrets(
+                  new_args[auth_key]
+              )
+          result[key] = new_args
+        elif key == "response":
+          result[key] = _redact_auth_config_secrets(val)
+        else:
+          result[key] = _redact_credential_secrets(val)
+      return result
+
+    if "requestedAuthConfigs" in value or "requested_auth_configs" in value:
+      result = {}
+      for key, val in value.items():
+        if key in ("requestedAuthConfigs", "requested_auth_configs"):
+          result[key] = _redact_auth_config_secrets(val)
+        else:
+          result[key] = _redact_credential_secrets(val)
+      return result
+
+    if any(
+        k in value
+        for k in (
+            "rawAuthCredential",
+            "raw_auth_credential",
+            "exchangedAuthCredential",
+            "exchanged_auth_credential",
+        )
+    ):
+      result = {}
+      for key, val in value.items():
+        if key in (
+            "rawAuthCredential",
+            "raw_auth_credential",
+            "exchangedAuthCredential",
+            "exchanged_auth_credential",
+        ):
+          result[key] = _redact_auth_config_secrets(val)
+        else:
+          result[key] = _redact_credential_secrets(val)
+      return result
+
+    return {key: _redact_credential_secrets(val) for key, val in value.items()}
+  if isinstance(value, list):
+    return [_redact_credential_secrets(item) for item in value]
+  return value

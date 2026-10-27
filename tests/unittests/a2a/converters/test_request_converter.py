@@ -12,15 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from unittest.mock import Mock
-from unittest.mock import patch
 
+from a2a.auth.user import User
 from a2a.server.agent_execution import RequestContext
+from google.adk.a2a import _compat
 from google.adk.a2a.converters.request_converter import _get_user_id
+from google.adk.a2a.converters.request_converter import _warn_unauthenticated_user_name_once
 from google.adk.a2a.converters.request_converter import convert_a2a_request_to_agent_run_request
 from google.adk.runners import RunConfig
 from google.genai import types as genai_types
 import pytest
+
+
+class _UnverifiedUser(User):
+  """A principal an auth layer passed through with the caller's claimed name."""
+
+  @property
+  def is_authenticated(self) -> bool:
+    return False
+
+  @property
+  def user_name(self) -> str:
+    return "victim@example.com"
 
 
 class TestGetUserId:
@@ -30,6 +45,7 @@ class TestGetUserId:
     """Test getting user ID from call context when auth is enabled."""
     # Arrange
     mock_user = Mock()
+    mock_user.is_authenticated = True
     mock_user.user_name = "authenticated_user"
 
     mock_call_context = Mock()
@@ -125,6 +141,67 @@ class TestGetUserId:
     # Assert
     assert result == "A2A_USER_None"
 
+  def test_get_user_id_ignores_unauthenticated_user_name(self):
+    """Test that an unverified principal's name is not used as the user ID."""
+    # Arrange
+    mock_call_context = Mock()
+    mock_call_context.user = _UnverifiedUser()
+
+    request = Mock(spec=RequestContext)
+    request.call_context = mock_call_context
+    request.context_id = "test_context"
+
+    # Act
+    result = _get_user_id(request)
+
+    # Assert
+    assert result == "A2A_USER_test_context"
+
+  def test_get_user_id_warns_once_about_unauthenticated_user_name(self, caplog):
+    """Test that an ignored name is logged once and the name is not logged."""
+    # Arrange
+    mock_call_context = Mock()
+    mock_call_context.user = _UnverifiedUser()
+
+    request = Mock(spec=RequestContext)
+    request.call_context = mock_call_context
+    request.context_id = "test_context"
+    _warn_unauthenticated_user_name_once.cache_clear()
+
+    # Act
+    with caplog.at_level(logging.WARNING, logger="google_adk"):
+      _get_user_id(request)
+      _get_user_id(request)
+
+    # Assert
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "unauthenticated A2A caller" in warnings[0].getMessage()
+    assert "victim@example.com" not in caplog.text
+
+  def test_get_user_id_does_not_warn_for_authenticated_user(self, caplog):
+    """Test that an authenticated principal is used without a warning."""
+    # Arrange
+    mock_user = Mock()
+    mock_user.is_authenticated = True
+    mock_user.user_name = "authenticated_user"
+
+    mock_call_context = Mock()
+    mock_call_context.user = mock_user
+
+    request = Mock(spec=RequestContext)
+    request.call_context = mock_call_context
+    request.context_id = "test_context"
+    _warn_unauthenticated_user_name_once.cache_clear()
+
+    # Act
+    with caplog.at_level(logging.WARNING, logger="google_adk"):
+      result = _get_user_id(request)
+
+    # Assert
+    assert result == "authenticated_user"
+    assert not caplog.records
+
 
 class TestConvertA2aRequestToAgentRunRequest:
   """Test cases for convert_a2a_request_to_agent_run_request function."""
@@ -139,6 +216,7 @@ class TestConvertA2aRequestToAgentRunRequest:
     mock_message.parts = [mock_part1, mock_part2]
 
     mock_user = Mock()
+    mock_user.is_authenticated = True
     mock_user.user_name = "test_user"
 
     mock_call_context = Mock()
@@ -188,6 +266,7 @@ class TestConvertA2aRequestToAgentRunRequest:
     mock_message.parts = [mock_part1, mock_part2]
 
     mock_user = Mock()
+    mock_user.is_authenticated = True
     mock_user.user_name = "test_user"
 
     mock_call_context = Mock()
@@ -229,6 +308,54 @@ class TestConvertA2aRequestToAgentRunRequest:
     assert mock_convert_part.call_count == 2
     mock_convert_part.assert_any_call(mock_part1)
     mock_convert_part.assert_any_call(mock_part2)
+
+  def test_convert_a2a_request_normalizes_proto_struct_metadata(self):
+    """Request metadata is normalized to a plain dict across SDK versions."""
+    # Build metadata in the native shape of the active SDK (proto Struct on 1.x,
+    # plain dict on 0.3.x) by writing onto a real a2a Message.
+    message_with_meta = _compat.make_message(
+        message_id="m1", role=_compat.ROLE_USER, parts=[]
+    )
+    _compat.set_struct_metadata(
+        message_with_meta, {"test_key": "test_value", "n": 1}
+    )
+
+    mock_message = Mock()
+    mock_message.parts = []
+
+    request = Mock(spec=RequestContext)
+    request.message = mock_message
+    request.context_id = "ctx"
+    request.call_context = None
+    request.metadata = message_with_meta.metadata
+
+    result = convert_a2a_request_to_agent_run_request(request, Mock())
+
+    stored = result.run_config.custom_metadata["a2a_metadata"]
+    # Must be a plain dict (not a proto Struct) regardless of SDK version.
+    assert isinstance(stored, dict)
+    assert stored["test_key"] == "test_value"
+    # Numbers may come back as float on 1.x (proto Struct) -> tolerate both.
+    assert float(stored["n"]) == 1.0
+
+  def test_convert_a2a_request_empty_metadata_omitted(self):
+    """Empty request metadata must not add an ``a2a_metadata`` entry."""
+    empty_meta_msg = _compat.make_message(
+        message_id="m1", role=_compat.ROLE_USER, parts=[]
+    )
+
+    mock_message = Mock()
+    mock_message.parts = []
+
+    request = Mock(spec=RequestContext)
+    request.message = mock_message
+    request.context_id = "ctx"
+    request.call_context = None
+    request.metadata = empty_meta_msg.metadata
+
+    result = convert_a2a_request_to_agent_run_request(request, Mock())
+
+    assert "a2a_metadata" not in result.run_config.custom_metadata
 
   def test_convert_a2a_request_no_message_raises_error(self):
     """Test that conversion raises ValueError when message is None."""
@@ -342,6 +469,7 @@ class TestIntegration:
     """Test end-to-end conversion with authenticated user."""
     # Arrange
     mock_user = Mock()
+    mock_user.is_authenticated = True
     mock_user.user_name = "auth_user"
 
     mock_call_context = Mock()

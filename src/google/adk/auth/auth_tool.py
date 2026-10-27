@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from typing import Any
 from typing import Optional
 
 from pydantic import BaseModel
@@ -36,7 +37,8 @@ def _stable_model_digest(model: BaseModel) -> str:
   """
   if getattr(model, "model_extra", None):
     model = model.model_copy(deep=True)
-    model.model_extra.clear()
+    if model.model_extra is not None:
+      model.model_extra.clear()
 
   dumped = model.model_dump(by_alias=True, exclude_none=True, mode="json")
   canonical_json = json.dumps(
@@ -79,33 +81,36 @@ class AuthConfig(BaseModelWithConfig):
   service.
   """
 
-  def __init__(self, **data):
+  def __init__(self, **data: Any) -> None:
     super().__init__(**data)
     if self.credential_key:
       return
     for obj in (self.raw_auth_credential, self.auth_scheme):
-      if not obj or not getattr(obj, "model_extra", None):
+      if not obj or not obj.model_extra:
         continue
       for key in ("credential_key", "credentialKey"):
         value = obj.model_extra.get(key)
         if isinstance(value, str) and value:
           self.credential_key = value
           return
-    self.credential_key = self.get_credential_key()
+    self.credential_key = self._build_credential_key()
 
   @deprecated("This method is deprecated. Use credential_key instead.")
-  def get_credential_key(self):
+  def get_credential_key(self) -> str:
     """Builds a stable key based on auth_scheme and raw_auth_credential.
 
     This is used to save/load credentials to/from a credential service when
     `credential_key` is not explicitly provided.
     """
+    return self._build_credential_key()
 
+  def _build_credential_key(self) -> str:
     auth_scheme = self.auth_scheme
 
     if auth_scheme.model_extra:
       auth_scheme = auth_scheme.model_copy(deep=True)
-      auth_scheme.model_extra.clear()
+      if auth_scheme.model_extra is not None:
+        auth_scheme.model_extra.clear()
 
     type_ = auth_scheme.type_
     type_name = type_.name if type_ and hasattr(type_, "name") else str(type_)
@@ -118,17 +123,20 @@ class AuthConfig(BaseModelWithConfig):
     auth_credential = self.raw_auth_credential
     if auth_credential and auth_credential.model_extra:
       auth_credential = auth_credential.model_copy(deep=True)
-      auth_credential.model_extra.clear()
+      if auth_credential.model_extra is not None:
+        auth_credential.model_extra.clear()
     if auth_credential and auth_credential.oauth2:
       auth_credential = auth_credential.model_copy(deep=True)
-      auth_credential.oauth2.auth_uri = None
-      auth_credential.oauth2.state = None
-      auth_credential.oauth2.auth_response_uri = None
-      auth_credential.oauth2.auth_code = None
-      auth_credential.oauth2.access_token = None
-      auth_credential.oauth2.refresh_token = None
-      auth_credential.oauth2.expires_at = None
-      auth_credential.oauth2.expires_in = None
+      if auth_credential.oauth2:
+        auth_credential.oauth2.auth_uri = None
+        auth_credential.oauth2.state = None
+        auth_credential.oauth2.auth_response_uri = None
+        auth_credential.oauth2.auth_code = None
+        auth_credential.oauth2.access_token = None
+        auth_credential.oauth2.refresh_token = None
+        auth_credential.oauth2.expires_at = None
+        auth_credential.oauth2.expires_in = None
+        auth_credential.oauth2.redirect_uri = None
     credential_name = (
         f"{auth_credential.auth_type.value}_{_stable_model_digest(auth_credential)}"
         if auth_credential

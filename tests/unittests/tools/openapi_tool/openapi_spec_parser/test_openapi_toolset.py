@@ -282,6 +282,173 @@ def test_openapi_toolset_default_snake_case_conversion(
   assert "calendarId" not in schema["properties"]
 
 
+def test_openapi_toolset_optional_operation_security():
+  """An operation that allows anonymous access builds an unauthed tool."""
+  spec = {
+      "openapi": "3.0.0",
+      "info": {"title": "Test API", "version": "1.0"},
+      "servers": [{"url": "https://api.example.com"}],
+      "components": {
+          "securitySchemes": {
+              "apiKey": {
+                  "type": "apiKey",
+                  "in": "header",
+                  "name": "X-API-Key",
+              }
+          }
+      },
+      "paths": {
+          "/items": {
+              "get": {
+                  "operationId": "listItems",
+                  # An empty object means auth is optional for this operation.
+                  "security": [{}, {"apiKey": []}],
+                  "responses": {"200": {"description": "OK"}},
+              }
+          }
+      },
+  }
+
+  toolset = OpenAPIToolset(spec_dict=spec)
+  tool = toolset.get_tool("list_items")
+  assert isinstance(tool, RestApiTool)
+  assert tool.endpoint.path == "/items"
+  assert tool.auth_scheme is None
+
+
+def test_openapi_toolset_optional_global_security():
+  """A global list that allows anonymous access leaves every tool unauthed."""
+  spec = {
+      "openapi": "3.0.0",
+      "info": {"title": "Test API", "version": "1.0"},
+      "servers": [{"url": "https://api.example.com"}],
+      # An empty object means auth is optional for every operation.
+      "security": [{}, {"apiKey": []}],
+      "components": {
+          "securitySchemes": {
+              "apiKey": {
+                  "type": "apiKey",
+                  "in": "header",
+                  "name": "X-API-Key",
+              }
+          }
+      },
+      "paths": {
+          "/items": {
+              "get": {
+                  "operationId": "listItems",
+                  "responses": {"200": {"description": "OK"}},
+              }
+          }
+      },
+  }
+
+  toolset = OpenAPIToolset(spec_dict=spec)
+  assert toolset.get_tool("list_items").auth_scheme is None
+
+
+def test_openapi_toolset_optional_security_listed_after_the_scheme():
+  """The empty requirement makes auth optional wherever it appears."""
+  spec = {
+      "openapi": "3.0.0",
+      "info": {"title": "Test API", "version": "1.0"},
+      "servers": [{"url": "https://api.example.com"}],
+      "security": [{"apiKey": []}, {}],
+      "components": {
+          "securitySchemes": {
+              "apiKey": {
+                  "type": "apiKey",
+                  "in": "header",
+                  "name": "X-API-Key",
+              }
+          }
+      },
+      "paths": {
+          "/items": {
+              "get": {
+                  "operationId": "listItems",
+                  "responses": {"200": {"description": "OK"}},
+              }
+          }
+      },
+  }
+
+  toolset = OpenAPIToolset(spec_dict=spec)
+  assert toolset.get_tool("list_items").auth_scheme is None
+
+
+def test_openapi_toolset_required_global_security():
+  """A list with no empty requirement still makes auth mandatory."""
+  spec = {
+      "openapi": "3.0.0",
+      "info": {"title": "Test API", "version": "1.0"},
+      "servers": [{"url": "https://api.example.com"}],
+      "security": [{"apiKey": []}],
+      "components": {
+          "securitySchemes": {
+              "apiKey": {
+                  "type": "apiKey",
+                  "in": "header",
+                  "name": "X-API-Key",
+              }
+          }
+      },
+      "paths": {
+          "/items": {
+              "get": {
+                  "operationId": "listItems",
+                  "responses": {"200": {"description": "OK"}},
+              }
+          }
+      },
+  }
+
+  toolset = OpenAPIToolset(spec_dict=spec)
+  tool = toolset.get_tool("list_items")
+  assert isinstance(tool.auth_scheme, APIKey)
+  assert tool.auth_scheme.name == "X-API-Key"
+
+
+def test_openapi_toolset_operation_security_overrides_global():
+  """Test an operation that opts out of the global security requirement."""
+  spec = {
+      "openapi": "3.0.0",
+      "info": {"title": "Test API", "version": "1.0"},
+      "servers": [{"url": "https://api.example.com"}],
+      "security": [{"apiKey": []}],
+      "components": {
+          "securitySchemes": {
+              "apiKey": {
+                  "type": "apiKey",
+                  "in": "header",
+                  "name": "X-API-Key",
+              }
+          }
+      },
+      "paths": {
+          "/items": {
+              "get": {
+                  "operationId": "listItems",
+                  # Declaring only an empty object opts out of the global
+                  # requirement rather than inheriting it.
+                  "security": [{}],
+                  "responses": {"200": {"description": "OK"}},
+              }
+          },
+          "/other": {
+              "get": {
+                  "operationId": "listOther",
+                  "responses": {"200": {"description": "OK"}},
+              }
+          },
+      },
+  }
+
+  toolset = OpenAPIToolset(spec_dict=spec)
+  assert toolset.get_tool("list_items").auth_scheme is None
+  assert isinstance(toolset.get_tool("list_other").auth_scheme, APIKey)
+
+
 def test_openapi_toolset_preserve_property_names_body_params():
   """Test preserve_property_names with request body properties."""
   spec = {
@@ -332,3 +499,87 @@ def test_openapi_toolset_preserve_property_names_body_params():
   assert "first_name" in param_names_default
   assert "last_name" in param_names_default
   assert "email_address" in param_names_default
+
+
+def test_openapi_toolset_disambiguates_colliding_truncated_names() -> None:
+  """operationIds sharing a >60-char prefix must not collapse to one tool."""
+  common_prefix = (
+      "list_all_company_organization_department_users_by_filter_crit"
+  )
+  assert len(common_prefix) > 60
+
+  spec = {
+      "openapi": "3.0.0",
+      "info": {"title": "Test API", "version": "1.0"},
+      "servers": [{"url": "https://api.example.com"}],
+      "paths": {
+          "/users/v1": {
+              "get": {
+                  "operationId": f"{common_prefix}v1",
+                  "responses": {"200": {"description": "OK"}},
+              }
+          },
+          "/users/v2": {
+              "get": {
+                  "operationId": f"{common_prefix}v2",
+                  "responses": {"200": {"description": "OK"}},
+              }
+          },
+      },
+  }
+
+  toolset = OpenAPIToolset(spec_dict=spec)
+  names = [tool.name for tool in toolset._tools]
+
+  assert len(names) == len(set(names)), f"Tool names collided: {names}"
+  assert all(len(name) <= 60 for name in names)
+  # Both endpoints must still be reachable through get_tool().
+  tool_1 = toolset.get_tool(names[0])
+  assert tool_1 is not None
+  assert tool_1.endpoint.path == "/users/v1"
+  tool_2 = toolset.get_tool(names[1])
+  assert tool_2 is not None
+  assert tool_2.endpoint.path == "/users/v2"
+
+
+@pytest.mark.parametrize(
+    ("operation_ids", "expected_names"),
+    [
+        (
+            ["getItem", "get_item", "get_item_2"],
+            ["get_item", "get_item_3", "get_item_2"],
+        ),
+        (
+            ["get_item_2", "getItem", "get_item"],
+            ["get_item_2", "get_item", "get_item_3"],
+        ),
+    ],
+)
+def test_openapi_toolset_disambiguates_when_suffixed_name_already_taken(
+    operation_ids: list[str],
+    expected_names: list[str],
+) -> None:
+  """Disambiguation skips `_N` suffixes that collide with reserved names."""
+  spec = {
+      "openapi": "3.0.0",
+      "info": {"title": "Test API", "version": "1.0"},
+      "servers": [{"url": "https://api.example.com"}],
+      "paths": {
+          f"/items/{i}": {
+              "get": {
+                  "operationId": op_id,
+                  "responses": {"200": {"description": "OK"}},
+              }
+          }
+          for i, op_id in enumerate(operation_ids)
+      },
+  }
+
+  toolset = OpenAPIToolset(spec_dict=spec)
+  names = [tool.name for tool in toolset._tools]
+
+  assert names == expected_names
+  for i, name in enumerate(names):
+    tool = toolset.get_tool(name)
+    assert tool is not None
+    assert tool.endpoint.path == f"/items/{i}"

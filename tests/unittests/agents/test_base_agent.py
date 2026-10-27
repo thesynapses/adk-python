@@ -14,6 +14,8 @@
 
 """Testings for the BaseAgent."""
 
+import abc
+import asyncio
 from enum import Enum
 from functools import partial
 import logging
@@ -22,16 +24,20 @@ from typing import List
 from typing import Optional
 from typing import Union
 from unittest import mock
+import warnings
 
 from google.adk.agents.base_agent import BaseAgent
 from google.adk.agents.base_agent import BaseAgentState
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.agents.invocation_context import InvocationContext
+from google.adk.agents.llm_agent import LlmAgent
 from google.adk.apps.app import ResumabilityConfig
+from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
 from google.adk.events.event import Event
 from google.adk.plugins.base_plugin import BasePlugin
 from google.adk.plugins.plugin_manager import PluginManager
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from google.adk.workflow import BaseNode
 from google.genai import types
 import pytest
 import pytest_mock
@@ -169,6 +175,27 @@ async def _create_parent_invocation_context(
 def test_invalid_agent_name():
   with pytest.raises(ValueError):
     _ = _TestingAgent(name='not an identifier')
+
+
+def test_user_agent_name_validation():
+  """Verifies that 'user' is rejected but capitalized variations are allowed."""
+  with pytest.raises(ValueError, match='Agent name cannot be `user`'):
+    _ = _TestingAgent(name='user')
+
+  agent_capitalized = _TestingAgent(name='User')
+  assert agent_capitalized.name == 'User'
+
+  agent_all_caps = _TestingAgent(name='USER')
+  assert agent_all_caps.name == 'USER'
+
+
+def test_base_agent_iter_static_children_yields_sub_agents():
+  """BaseAgent._iter_static_children yields direct sub-agents in order."""
+  sub1 = _TestingAgent(name='sub1')
+  sub2 = _TestingAgent(name='sub2')
+  parent = _TestingAgent(name='parent', sub_agents=[sub1, sub2])
+
+  assert list(parent._iter_static_children()) == [sub1, sub2]
 
 
 @pytest.mark.asyncio
@@ -340,9 +367,53 @@ async def test_run_async_with_async_before_agent_callback_bypass_agent(
   assert events[0].content.parts[0].text == 'agent run is bypassed.'
 
 
+@pytest.mark.asyncio
+async def test_run_async_before_agent_callback_content_carries_nested_write(
+    request: pytest.FixtureRequest,
+):
+  """The event built from returned content carries the write to storage."""
+
+  def callback(callback_context: CallbackContext) -> types.Content:
+    callback_context.state['cfg']['b'] = 2
+    return types.Content(parts=[types.Part(text='agent run is bypassed.')])
+
+  agent = _TestingAgent(
+      name=f'{request.function.__name__}_test_agent',
+      before_agent_callback=callback,
+  )
+  parent_ctx = await _create_parent_invocation_context(
+      request.function.__name__, agent
+  )
+  parent_ctx.session.state['cfg'] = {'a': 1}
+
+  events = [e async for e in agent.run_async(parent_ctx)]
+
+  assert len(events) == 1
+  assert events[0].actions.state_delta == {'cfg': {'a': 1, 'b': 2}}
+
+
 class CallbackType(Enum):
   SYNC = 1
   ASYNC = 2
+
+
+def test_canonical_agent_callbacks_preserve_list_identity_without_warnings():
+  before_callbacks = [_before_agent_callback_noop]
+  after_callbacks = [_after_agent_callback_noop]
+  agent = _TestingAgent(
+      name='test_agent',
+      before_agent_callback=before_callbacks,
+      after_agent_callback=after_callbacks,
+  )
+
+  with warnings.catch_warnings(record=True) as caught_warnings:
+    warnings.simplefilter('always')
+    canonical_before_callbacks = agent.canonical_before_agent_callbacks
+    canonical_after_callbacks = agent.canonical_after_agent_callbacks
+
+  assert canonical_before_callbacks is agent.before_agent_callback
+  assert canonical_after_callbacks is agent.after_agent_callback
+  assert caught_warnings == []
 
 
 async def mock_async_agent_cb_side_effect(
@@ -685,6 +756,394 @@ async def test_run_async_with_async_after_agent_callback_append_reply(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('callback_field', 'filename', 'artifact_event_idx', 'reply_event_idx'),
+    [
+        ('before_agent_callback', 'before_agent.txt', 0, 1),
+        ('after_agent_callback', 'after_agent.txt', 1, 0),
+    ],
+)
+async def test_run_async_agent_callback_records_artifact_delta(
+    request: pytest.FixtureRequest,
+    callback_field: str,
+    filename: str,
+    artifact_event_idx: int,
+    reply_event_idx: int,
+) -> None:
+  async def _save_artifact(callback_context: CallbackContext) -> None:
+    await callback_context.save_artifact(
+        filename, types.Part.from_text(text=f'saved in {callback_field}')
+    )
+
+  agent = _TestingAgent(
+      name=f'{request.function.__name__}_test_agent',
+      before_agent_callback=(
+          _save_artifact if callback_field == 'before_agent_callback' else None
+      ),
+      after_agent_callback=(
+          _save_artifact if callback_field == 'after_agent_callback' else None
+      ),
+  )
+  parent_ctx = await _create_parent_invocation_context(
+      request.function.__name__, agent
+  )
+  parent_ctx.artifact_service = InMemoryArtifactService()
+
+  events = [e async for e in agent.run_async(parent_ctx)]
+
+  assert len(events) == 2
+  assert events[artifact_event_idx].author == agent.name
+  assert events[artifact_event_idx].content is None
+  assert events[artifact_event_idx].actions.artifact_delta == {filename: 0}
+  assert events[reply_event_idx].content == types.Content(
+      parts=[types.Part(text='Hello, world!')]
+  )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method_name', ['run_async', 'run_live'])
+@pytest.mark.parametrize('exit_type', ['cancelled', 'generator_exit'])
+async def test_after_agent_callback_runs_on_cancellation_or_exit(
+    request: pytest.FixtureRequest,
+    mocker: pytest_mock.MockerFixture,
+    method_name: str,
+    exit_type: str,
+):
+  """after_agent_callback executes for side-effects when execution is cancelled or closed."""
+
+  class _InterruptibleAgent(BaseAgent):
+
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+      yield Event(author=self.name, invocation_id=ctx.invocation_id)
+      await asyncio.sleep(100)
+
+    async def _run_live_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+      yield Event(author=self.name, invocation_id=ctx.invocation_id)
+      await asyncio.sleep(100)
+
+  callback_completed = False
+
+  async def _async_callback(callback_context: CallbackContext) -> None:
+    nonlocal callback_completed
+    await asyncio.sleep(0.01)
+    callback_completed = True
+
+  agent = _InterruptibleAgent(
+      name=f'{request.function.__name__}_agent',
+      after_agent_callback=_async_callback,
+  )
+  parent_ctx = await _create_parent_invocation_context(
+      request.function.__name__, agent
+  )
+  spy_callback = mocker.spy(agent, 'after_agent_callback')
+
+  agen = getattr(agent, method_name)(parent_ctx)
+  _ = await anext(agen)
+
+  if exit_type == 'cancelled':
+
+    async def _consume() -> None:
+      async for _ in agen:
+        pass
+
+    task = asyncio.create_task(_consume())
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+
+    assert callback_completed
+    spy_callback.assert_called_once()
+  else:
+    await agen.aclose()
+    assert not callback_completed
+    spy_callback.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_after_agent_callback_error_does_not_mask_cancellation(
+    request: pytest.FixtureRequest,
+    mocker: pytest_mock.MockerFixture,
+):
+  """Exceptions raised by after_agent_callback are logged and do not mask cancellation."""
+
+  def _failing_callback(callback_context: CallbackContext) -> None:
+    del callback_context
+    raise RuntimeError('cleanup failed in callback')
+
+  class _CancellingAgent(BaseAgent):
+
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+      yield Event(author=self.name, invocation_id=ctx.invocation_id)
+      await asyncio.sleep(100)
+
+  agent = _CancellingAgent(
+      name=f'{request.function.__name__}_agent',
+      after_agent_callback=_failing_callback,
+  )
+  parent_ctx = await _create_parent_invocation_context(
+      request.function.__name__, agent
+  )
+  mock_logger = mocker.patch('google.adk.agents.base_agent.logger.exception')
+
+  agen = agent.run_async(parent_ctx)
+  _ = await anext(agen)
+
+  async def _consume() -> None:
+    async for _ in agen:
+      pass
+
+  task = asyncio.create_task(_consume())
+  await asyncio.sleep(0)
+  task.cancel()
+
+  with pytest.raises(asyncio.CancelledError):
+    await task
+
+  mock_logger.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_after_agent_callback_cancellation_does_not_hang(
+    request: pytest.FixtureRequest,
+):
+  """A hanging after_agent_callback remains cancellable if cancelled again."""
+
+  async def _hanging_callback(callback_context: CallbackContext) -> None:
+    del callback_context
+    await asyncio.sleep(100)
+
+  class _HangingAgent(BaseAgent):
+
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+      yield Event(author=self.name, invocation_id=ctx.invocation_id)
+      await asyncio.sleep(100)
+
+  agent = _HangingAgent(
+      name=f'{request.function.__name__}_agent',
+      after_agent_callback=_hanging_callback,
+  )
+  parent_ctx = await _create_parent_invocation_context(
+      request.function.__name__, agent
+  )
+
+  agen = agent.run_async(parent_ctx)
+  _ = await anext(agen)
+
+  async def _consume() -> None:
+    async for _ in agen:
+      pass
+
+  task = asyncio.create_task(_consume())
+  await asyncio.sleep(0)
+  task.cancel()  # Cancels the agent sleep, entering after_agent_callback.
+  await asyncio.sleep(0)
+  task.cancel()  # Cancels the hanging after_agent_callback await.
+
+  with pytest.raises(asyncio.CancelledError):
+    await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method_name', ['run_async', 'run_live'])
+async def test_after_agent_callback_not_called_on_cancellation_during_before_callback(
+    request: pytest.FixtureRequest,
+    mocker: pytest_mock.MockerFixture,
+    method_name: str,
+):
+  """Cancellation during before_agent_callback does not trigger after_agent_callback."""
+
+  async def _slow_before_callback(
+      callback_context: CallbackContext,
+  ) -> None:
+    del callback_context
+    await asyncio.sleep(100)
+
+  agent = _TestingAgent(
+      name=f'{request.function.__name__}_agent',
+      before_agent_callback=_slow_before_callback,
+      after_agent_callback=_after_agent_callback_noop,
+  )
+  parent_ctx = await _create_parent_invocation_context(
+      request.function.__name__, agent
+  )
+  spy_after_callback = mocker.spy(agent, 'after_agent_callback')
+
+  agen = getattr(agent, method_name)(parent_ctx)
+
+  async def _consume() -> None:
+    async for _ in agen:
+      pass
+
+  task = asyncio.create_task(_consume())
+  await asyncio.sleep(0)  # Advances into _slow_before_callback
+  task.cancel()
+
+  with pytest.raises(asyncio.CancelledError):
+    await task
+
+  spy_after_callback.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method_name', ['run_async', 'run_live'])
+@pytest.mark.parametrize('exit_type', ['cancelled', 'aclose'])
+async def test_after_agent_callback_called_on_cancellation_at_before_callback_event(
+    request: pytest.FixtureRequest,
+    mocker: pytest_mock.MockerFixture,
+    method_name: str,
+    exit_type: str,
+):
+  """Cancellation after yielding before_agent_callback event still triggers after_agent_callback."""
+
+  def _state_before_callback(
+      callback_context: CallbackContext,
+  ) -> None:
+    callback_context.state['before_ran'] = True
+
+  class _SleepAgent(BaseAgent):
+
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+      yield Event(author=self.name, invocation_id=ctx.invocation_id)
+      await asyncio.sleep(100)
+
+    async def _run_live_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+      yield Event(author=self.name, invocation_id=ctx.invocation_id)
+      await asyncio.sleep(100)
+
+  agent = _SleepAgent(
+      name=f'{request.function.__name__}_agent',
+      before_agent_callback=_state_before_callback,
+      after_agent_callback=_after_agent_callback_noop,
+  )
+  parent_ctx = await _create_parent_invocation_context(
+      request.function.__name__, agent
+  )
+  spy_after_callback = mocker.spy(agent, 'after_agent_callback')
+
+  agen = getattr(agent, method_name)(parent_ctx)
+  first_event = await anext(agen)
+  assert first_event.actions.state_delta['before_ran'] is True
+
+  if exit_type == 'cancelled':
+
+    async def _consume() -> None:
+      async for _ in agen:
+        pass
+
+    task = asyncio.create_task(_consume())
+    await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+      await task
+
+    spy_after_callback.assert_called_once()
+  else:
+    await agen.aclose()
+    spy_after_callback.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method_name', ['run_async', 'run_live'])
+@pytest.mark.parametrize(
+    'short_circuit_source', ['before_callback', 'in_agent']
+)
+async def test_after_agent_callback_suppressed_on_end_invocation(
+    request: pytest.FixtureRequest,
+    mocker: pytest_mock.MockerFixture,
+    method_name: str,
+    short_circuit_source: str,
+):
+  """Short-circuited invocations with end_invocation=True do not trigger after_agent_callback."""
+
+  class _ShortCircuitAgent(BaseAgent):
+
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+      if short_circuit_source == 'in_agent':
+        ctx.end_invocation = True
+      yield Event(
+          author=self.name,
+          invocation_id=ctx.invocation_id,
+          content=types.Content(parts=[types.Part(text='event')]),
+      )
+
+    async def _run_live_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+      if short_circuit_source == 'in_agent':
+        ctx.end_invocation = True
+      yield Event(
+          author=self.name,
+          invocation_id=ctx.invocation_id,
+          content=types.Content(parts=[types.Part(text='event')]),
+      )
+
+  agent = _ShortCircuitAgent(
+      name=f'{request.function.__name__}_agent',
+      before_agent_callback=(
+          _before_agent_callback_bypass_agent
+          if short_circuit_source == 'before_callback'
+          else None
+      ),
+      after_agent_callback=_after_agent_callback_append_agent_reply,
+  )
+  parent_ctx = await _create_parent_invocation_context(
+      request.function.__name__, agent
+  )
+  spy_callback = mocker.spy(agent, 'after_agent_callback')
+
+  agen = getattr(agent, method_name)(parent_ctx)
+  _ = await anext(agen)
+  await agen.aclose()
+
+  spy_callback.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method_name', ['run_async', 'run_live'])
+async def test_after_agent_callback_not_called_twice_on_generator_exit(
+    request: pytest.FixtureRequest,
+    mocker: pytest_mock.MockerFixture,
+    method_name: str,
+):
+  """Closing the generator after yielding the callback event does not re-run after_agent_callback."""
+  agent = _TestingAgent(
+      name=f'{request.function.__name__}_agent',
+      after_agent_callback=_after_agent_callback_append_agent_reply,
+  )
+  parent_ctx = await _create_parent_invocation_context(
+      request.function.__name__, agent
+  )
+  spy_callback = mocker.spy(agent, 'after_agent_callback')
+
+  agen = getattr(agent, method_name)(parent_ctx)
+  _ = await anext(agen)
+  callback_event = await anext(agen)
+  assert (
+      callback_event.content.parts[0].text
+      == 'Agent reply from after agent callback.'
+  )
+
+  await agen.aclose()
+  spy_callback.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_run_async_incomplete_agent(request: pytest.FixtureRequest):
   agent = _IncompleteAgent(name=f'{request.function.__name__}_test_agent')
   parent_ctx = await _create_parent_invocation_context(
@@ -722,6 +1181,61 @@ async def test_run_live_with_branch(request: pytest.FixtureRequest):
   assert events[0].author == agent.name
   assert events[0].content.parts[0].text == 'Hello, live!'
   assert events[0].branch == 'parent_branch'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('entrypoint', ['run_async', 'run_live'])
+@pytest.mark.parametrize('end_invocation', [False, True])
+async def test_after_agent_callbacks_respect_end_invocation(
+    request: pytest.FixtureRequest,
+    mocker: pytest_mock.MockerFixture,
+    entrypoint: str,
+    end_invocation: bool,
+):
+  """Ending either execution mode skips plugin and agent after callbacks."""
+
+  class _EndingAgent(_TestingAgent):
+
+    @override
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+      async for event in super()._run_async_impl(ctx):
+        yield event
+      ctx.end_invocation = end_invocation
+
+    @override
+    async def _run_live_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+      async for event in super()._run_live_impl(ctx):
+        yield event
+      ctx.end_invocation = end_invocation
+
+  plugin = MockPlugin()
+  agent = _EndingAgent(
+      name='agent',
+      after_agent_callback=_after_agent_callback_append_agent_reply,
+  )
+  parent_ctx = await _create_parent_invocation_context(
+      request.function.__name__, agent, plugins=[plugin]
+  )
+  plugin_callback = mocker.spy(plugin, 'after_agent_callback')
+  agent_callback = mocker.spy(agent, 'after_agent_callback')
+
+  events = [event async for event in getattr(agent, entrypoint)(parent_ctx)]
+
+  if end_invocation:
+    plugin_callback.assert_not_called()
+    agent_callback.assert_not_called()
+    assert len(events) == 1
+  else:
+    plugin_callback.assert_called_once()
+    agent_callback.assert_called_once()
+    assert len(events) == 2
+    assert events[-1].content.parts[0].text == (
+        'Agent reply from after agent callback.'
+    )
 
 
 @pytest.mark.asyncio
@@ -869,7 +1383,7 @@ def test_validate_sub_agents_unique_names_single_duplicate(
         name=f'{request.function.__name__}_parent',
         sub_agents=[sub_agent_1, sub_agent_2],
     )
-  assert f'Found duplicate sub-agent names: `{duplicate_name}`' in caplog.text
+  assert f'Found duplicate agent names: `{duplicate_name}`' in caplog.text
 
 
 def test_validate_sub_agents_unique_names_multiple_duplicates(
@@ -949,6 +1463,157 @@ def test_validate_sub_agents_unique_names_no_duplicates(
   assert parent.sub_agents[2].name == f'{request.function.__name__}_sub_agent_3'
 
 
+def test_validate_sub_agents_unique_names_across_parents(
+    request: pytest.FixtureRequest,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+  """Cousins under different parents that share a name must warn."""
+  shared = f'{request.function.__name__}_shared'
+  left = _TestingAgent(
+      name=f'{request.function.__name__}_left',
+      sub_agents=[_TestingAgent(name=shared)],
+  )
+  right = _TestingAgent(
+      name=f'{request.function.__name__}_right',
+      sub_agents=[_TestingAgent(name=shared)],
+  )
+
+  with caplog.at_level(logging.WARNING):
+    root = _TestingAgent(
+        name=f'{request.function.__name__}_root',
+        sub_agents=[left, right],
+    )
+
+  assert f'Found duplicate agent names: `{shared}`' in caplog.text
+  assert 'unique names' in caplog.text
+  # First DFS match wins; the other cousin is unreachable by name.
+  found = root.find_agent(shared)
+  assert found is not None
+  assert found is left.sub_agents[0]
+
+
+def test_validate_sub_agents_unique_names_parent_shares_name_with_descendant(
+    request: pytest.FixtureRequest,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+  """A parent sharing a name with a descendant must warn."""
+  shared = f'{request.function.__name__}_shared'
+  grandchild = _TestingAgent(name=shared)
+  child = _TestingAgent(
+      name=f'{request.function.__name__}_child',
+      sub_agents=[grandchild],
+  )
+
+  with caplog.at_level(logging.WARNING):
+    root = _TestingAgent(
+        name=shared,
+        sub_agents=[child],
+    )
+
+  assert f'Found duplicate agent names: `{shared}`' in caplog.text
+  assert 'unique names' in caplog.text
+  # Parent matches first in DFS; the descendant is shadowed.
+  found = root.find_agent(shared)
+  assert found is root
+
+
+def test_validate_sub_agents_unique_names_tolerates_mock_without_sub_agents(
+    request: pytest.FixtureRequest,
+) -> None:
+  """Mocks standing in for sub-agents without sub_agents must survive."""
+  mock_agent = mock.MagicMock(spec=BaseAgent)
+  mock_agent.name = f'{request.function.__name__}_mock'
+  mock_agent.parent_agent = None
+  parent = _TestingAgent(
+      name=f'{request.function.__name__}_parent',
+      sub_agents=[mock_agent],
+  )
+  assert len(parent.sub_agents) == 1
+
+
+def test_validate_sub_agents_unique_names_direct_call_backward_compatibility(
+    request: pytest.FixtureRequest,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+  """Direct invocation without validation context stays backward compatible."""
+  shared = f'{request.function.__name__}_shared'
+  sub_agents: list[BaseAgent] = [
+      _TestingAgent(name=shared),
+      _TestingAgent(name=shared),
+  ]
+  with caplog.at_level(logging.WARNING):
+    result = BaseAgent.validate_sub_agents_unique_names(sub_agents)
+
+  assert result == sub_agents
+  assert f'Found duplicate agent names: `{shared}`' in caplog.text
+
+
+def test_validate_sub_agents_unique_names_cousins_warn_with_internal_duplicates(
+    request: pytest.FixtureRequest,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+  """Cousin collisions must warn even when a subtree has internal duplicates."""
+  internal_dup = f'{request.function.__name__}_internal_dup'
+  cousin_shared = f'{request.function.__name__}_cousin_shared'
+  left = _TestingAgent(
+      name=f'{request.function.__name__}_left',
+      sub_agents=[
+          _TestingAgent(name=internal_dup),
+          _TestingAgent(name=internal_dup),
+          _TestingAgent(name=cousin_shared),
+      ],
+  )
+  right = _TestingAgent(
+      name=f'{request.function.__name__}_right',
+      sub_agents=[_TestingAgent(name=cousin_shared)],
+  )
+
+  with caplog.at_level(logging.WARNING):
+    caplog.clear()
+    _ = _TestingAgent(
+        name=f'{request.function.__name__}_root',
+        sub_agents=[left, right],
+    )
+  assert internal_dup not in caplog.text
+  assert f'Found duplicate agent names: `{cousin_shared}`' in caplog.text
+
+
+def test_validate_sub_agents_ancestor_does_not_rewarn_child_internal_duplicates(
+    request: pytest.FixtureRequest,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+  """Ancestors must not re-warn on duplicates internal to a child branch."""
+  shared = f'{request.function.__name__}_shared'
+  child = _TestingAgent(
+      name=f'{request.function.__name__}_child',
+      sub_agents=[
+          _TestingAgent(name=shared),
+          _TestingAgent(name=shared),
+      ],
+  )
+
+  caplog.clear()
+  with caplog.at_level(logging.WARNING):
+    root = _TestingAgent(
+        name=f'{request.function.__name__}_root',
+        sub_agents=[child],
+    )
+  assert root.sub_agents == [child]
+  assert f'Found duplicate agent names: `{shared}`' not in caplog.text
+
+
+def test_validate_sub_agents_unique_names_same_instance_twice_warns(
+    request: pytest.FixtureRequest,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+  """Passing the same agent instance twice to the validator must warn."""
+  name = f'{request.function.__name__}_agent'
+  agent: BaseAgent = _TestingAgent(name=name)
+  with caplog.at_level(logging.WARNING):
+    BaseAgent.validate_sub_agents_unique_names([agent, agent])
+  assert f'Found duplicate agent names: `{name}`' in caplog.text
+
+
 def test_validate_sub_agents_unique_names_empty_list(
     request: pytest.FixtureRequest,
 ):
@@ -959,6 +1624,32 @@ def test_validate_sub_agents_unique_names_empty_list(
   )
 
   assert len(parent.sub_agents) == 0
+
+
+@pytest.mark.parametrize('agent_class', [BaseNode, BaseAgent, LlmAgent])
+def test_agent_classes_are_abstract(agent_class: type[BaseNode]):
+  """Each class reaches `abc.ABC` through an explicitly declared base.
+
+  Subclasses declare `@abc.abstractmethod` without inheriting `abc.ABC`
+  themselves. Static type checkers only honor that when a base says `abc.ABC`
+  in source, because they do not see `ABCMeta` through pydantic's
+  `ModelMetaclass`. Losing it makes those subclasses look concrete and their
+  abstract methods look like they return `None`.
+  """
+  assert issubclass(agent_class, abc.ABC)
+
+
+def test_abstract_subclass_cannot_be_instantiated():
+  """A subclass that leaves an abstract method unimplemented still raises."""
+
+  class _Incomplete(LlmAgent):
+
+    @abc.abstractmethod
+    def summarize(self) -> str:
+      """Left unimplemented on purpose."""
+
+  with pytest.raises(TypeError, match='abstract'):
+    _Incomplete(name='incomplete')
 
 
 if __name__ == '__main__':
@@ -989,6 +1680,11 @@ async def test_load_agent_state_not_resumable():
 
   # Test case 2: is_resumable is False
   ctx.resumability_config = ResumabilityConfig(is_resumable=False)
+  state = agent._load_agent_state(ctx, _TestAgentState)
+  assert state is None
+
+  # Test case 3: agent_states is None
+  ctx.agent_states = None
   state = agent._load_agent_state(ctx, _TestAgentState)
   assert state is None
 
@@ -1066,3 +1762,116 @@ async def test_create_agent_state_event():
   assert event is not None
   assert event.actions.agent_state is None
   assert not event.actions.end_of_agent
+
+
+_OMITTED = object()
+
+# (field name, name of the canonical property that resolves it)
+_CANONICAL_CALLBACK_PROPERTIES = [
+    ('before_agent_callback', 'canonical_before_agent_callbacks'),
+    ('after_agent_callback', 'canonical_after_agent_callbacks'),
+]
+
+
+@pytest.mark.parametrize(
+    'field_name, property_name', _CANONICAL_CALLBACK_PROPERTIES
+)
+@pytest.mark.parametrize('value', [_OMITTED, None], ids=['omitted', 'none'])
+def test_canonical_agent_callbacks_unset_resolves_to_empty_list(
+    field_name, property_name, value
+):
+  """Callers iterate the canonical list directly, so it is never None."""
+  kwargs = {} if value is _OMITTED else {field_name: value}
+  agent = _TestingAgent(name='test_agent', **kwargs)
+
+  assert getattr(agent, property_name) == []
+
+
+@pytest.mark.parametrize(
+    'field_name, property_name', _CANONICAL_CALLBACK_PROPERTIES
+)
+def test_canonical_agent_callbacks_single_callable_resolves_to_one_element_list(
+    field_name, property_name
+):
+  """A bare callable is wrapped so callers only ever handle the list form."""
+  agent = _TestingAgent(
+      name='test_agent', **{field_name: _before_agent_callback_noop}
+  )
+
+  assert getattr(agent, property_name) == [_before_agent_callback_noop]
+
+
+@pytest.mark.parametrize(
+    'field_name, property_name', _CANONICAL_CALLBACK_PROPERTIES
+)
+def test_canonical_agent_callbacks_list_keeps_declaration_order(
+    field_name, property_name
+):
+  """Order matters: the chain stops at the first callback that answers."""
+  callbacks = [
+      _before_agent_callback_noop,
+      _async_before_agent_callback_noop,
+  ]
+  agent = _TestingAgent(name='test_agent', **{field_name: callbacks})
+
+  assert getattr(agent, property_name) == [
+      _before_agent_callback_noop,
+      _async_before_agent_callback_noop,
+  ]
+
+
+def test_find_agent_prefers_self_over_same_named_descendant(
+    request: pytest.FixtureRequest,
+):
+  """find_agent matches self first; only find_sub_agent skips self."""
+  shared_name = f'{request.function.__name__}_shared_name'
+  descendant = _TestingAgent(name=shared_name)
+  agent = _TestingAgent(name=shared_name, sub_agents=[descendant])
+
+  assert agent.find_agent(shared_name) is agent
+  assert agent.find_sub_agent(shared_name) is descendant
+
+
+def test_find_agent_with_duplicate_sub_agent_names_returns_the_first(
+    request: pytest.FixtureRequest,
+):
+  """Duplicate names only warn; the earlier sub-agent shadows the later."""
+  duplicate_name = f'{request.function.__name__}_duplicate'
+  first = _TestingAgent(name=duplicate_name, description='first')
+  second = _TestingAgent(name=duplicate_name, description='second')
+
+  parent = _TestingAgent(
+      name=f'{request.function.__name__}_parent',
+      sub_agents=[first, second],
+  )
+
+  assert parent.sub_agents[0] is first
+  assert parent.sub_agents[1] is second
+  assert first.parent_agent is parent
+  assert second.parent_agent is parent
+  assert parent.find_agent(duplicate_name) is first
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method_name', ['run_async', 'run_live'])
+async def test_before_agent_callback_bypass_skips_after_callback(
+    request: pytest.FixtureRequest,
+    mocker: pytest_mock.MockerFixture,
+    method_name: str,
+):
+  """A before_agent_callback that returns content skips after_agent_callback."""
+  agent = _TestingAgent(
+      name=f'{request.function.__name__}_agent',
+      before_agent_callback=_before_agent_callback_bypass_agent,
+      after_agent_callback=_after_agent_callback_append_agent_reply,
+  )
+  parent_ctx = await _create_parent_invocation_context(
+      request.function.__name__, agent
+  )
+  spy_after = mocker.spy(agent, 'after_agent_callback')
+
+  events = [e async for e in getattr(agent, method_name)(parent_ctx)]
+
+  assert len(events) == 1
+  assert events[0].content.parts[0].text == 'agent run is bypassed.'
+  spy_after.assert_not_called()

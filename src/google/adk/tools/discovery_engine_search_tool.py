@@ -19,6 +19,7 @@ import enum
 import json
 import logging
 import re
+import threading
 from typing import Any
 from typing import Optional
 
@@ -27,7 +28,9 @@ from google.api_core.exceptions import GoogleAPICallError
 import google.auth
 from google.cloud import discoveryengine_v1beta as discoveryengine
 from google.genai import types
+from typing_extensions import override
 
+from ..utils._mtls_utils import get_api_endpoint
 from .function_tool import FunctionTool
 
 logger = logging.getLogger('google_adk.' + __name__)
@@ -37,6 +40,7 @@ _STRUCTURED_STORE_ERROR_PATTERN = re.compile(
 )
 
 _DEFAULT_ENDPOINT = 'discoveryengine.googleapis.com'
+_DEFAULT_MTLS_ENDPOINT = 'discoveryengine.mtls.googleapis.com'
 _GLOBAL_LOCATION = 'global'
 _LOCATION_PATTERN = re.compile(
     r'/locations/([a-z0-9-]+)(?:/|$)', flags=re.IGNORECASE
@@ -85,6 +89,18 @@ def _resolve_location(resource_id: str, location: Optional[str]) -> str:
   return _GLOBAL_LOCATION
 
 
+def _get_api_endpoint(location: str) -> str:
+  """Returns API endpoint based on mTLS configuration and cert availability."""
+  default_template = '{location}-' + _DEFAULT_ENDPOINT
+  mtls_template = '{location}-' + _DEFAULT_MTLS_ENDPOINT
+
+  return get_api_endpoint(
+      location=location,
+      default_template=default_template,
+      mtls_template=mtls_template,
+  )
+
+
 def _build_client_options(
     resource_id: str,
     quota_project_id: Optional[str],
@@ -95,9 +111,7 @@ def _build_client_options(
   resolved_location = _resolve_location(resource_id, location)
 
   if resolved_location != _GLOBAL_LOCATION:
-    client_options_kwargs['api_endpoint'] = (
-        f'{resolved_location}-{_DEFAULT_ENDPOINT}'
-    )
+    client_options_kwargs['api_endpoint'] = _get_api_endpoint(resolved_location)
   if quota_project_id:
     client_options_kwargs['quota_project_id'] = quota_project_id
 
@@ -131,6 +145,8 @@ class DiscoveryEngineSearchTool(FunctionTool):
       *,
       search_result_mode: Optional[SearchResultMode] = None,
       location: Optional[str] = None,
+      name: Optional[str] = None,
+      description: Optional[str] = None,
   ):
     """Initializes the DiscoveryEngineSearchTool.
 
@@ -151,8 +167,16 @@ class DiscoveryEngineSearchTool(FunctionTool):
       location: Optional endpoint location override.
         Examples: "global", "us", "eu". If not specified, location is inferred
           from `data_store_id` or `search_engine_id` and defaults to "global".
+      name: Optional override for the tool name advertised to the model.
+        Defaults to the function name, "discovery_engine_search".
+      description: Optional override for the tool description advertised to the
+        model. Defaults to the function docstring.
     """
     super().__init__(self.discovery_engine_search)
+    if name:
+      self.name = name
+    if description:
+      self.description = description
     if (data_store_id is None and search_engine_id is None) or (
         data_store_id is not None and search_engine_id is not None
     ):
@@ -172,6 +196,7 @@ class DiscoveryEngineSearchTool(FunctionTool):
     self._filter = filter
     self._max_results = max_results
     self._search_result_mode = search_result_mode
+    self._search_result_mode_lock = threading.Lock()
     self._location = location
 
     credentials, _ = google.auth.default()
@@ -185,6 +210,22 @@ class DiscoveryEngineSearchTool(FunctionTool):
     self._discovery_engine_client = discoveryengine.SearchServiceClient(
         credentials=credentials, client_options=options
     )
+
+  @override
+  def _get_declaration(self) -> Optional[types.FunctionDeclaration]:
+    # FunctionTool builds the declaration from `self.func`, ignoring
+    # `self.name`. LlmRequest.append_tools advertises `declaration.name` to the
+    # model but keys dispatch on `tool.name`; if the two diverge the model emits
+    # a call that cannot be resolved. Keep them in sync here.
+    #
+    # Safe to mutate: FunctionTool._get_declaration() already returns
+    # `declaration.model_copy(deep=True)`, so the shared
+    # `_build_declaration_cached` lru_cache entry is not touched.
+    declaration = super()._get_declaration()
+    if declaration is not None:
+      declaration.name = self.name
+      declaration.description = self.description
+    return declaration
 
   def discovery_engine_search(
       self,
@@ -204,19 +245,29 @@ class DiscoveryEngineSearchTool(FunctionTool):
       if mode is not None:
         return self._do_search(query, mode)
 
-      # Auto-detect: try CHUNKS first, fall back to DOCUMENTS
-      # if the datastore requires it.
-      try:
-        return self._do_search(query, SearchResultMode.CHUNKS)
-      except GoogleAPICallError as e:
-        if _STRUCTURED_STORE_ERROR_PATTERN.search(str(e)):
-          logger.info(
-              'CHUNKS mode failed for structured datastore,'
-              ' retrying with DOCUMENTS mode.'
-          )
-          self._search_result_mode = SearchResultMode.DOCUMENTS
-          return self._do_search(query, SearchResultMode.DOCUMENTS)
-        raise
+      # Auto-detect is per datastore, not per query. Keep the probe
+      # single-flight so concurrent first calls do not all spend a CHUNKS
+      # request before learning the same DOCUMENTS fallback.
+      with self._search_result_mode_lock:
+        mode = self._search_result_mode
+        if mode is None:
+          try:
+            result = self._do_search(query, SearchResultMode.CHUNKS)
+          except GoogleAPICallError as e:
+            if _STRUCTURED_STORE_ERROR_PATTERN.search(str(e)):
+              logger.info(
+                  'CHUNKS mode failed for structured datastore,'
+                  ' retrying with DOCUMENTS mode.'
+              )
+              self._search_result_mode = SearchResultMode.DOCUMENTS
+              mode = SearchResultMode.DOCUMENTS
+            else:
+              raise
+          else:
+            self._search_result_mode = SearchResultMode.CHUNKS
+            return result
+
+      return self._do_search(query, mode)
     except GoogleAPICallError as e:
       return {'status': 'error', 'error_message': str(e)}
 

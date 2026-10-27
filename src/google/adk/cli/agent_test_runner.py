@@ -14,18 +14,22 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 import json
 import os
 from pathlib import Path
 from typing import Any
 from typing import AsyncGenerator
+from typing import cast
 from typing import Optional
+from typing import TYPE_CHECKING
 from unittest import mock
 
-from google.adk.agents.base_agent import BaseAgent
 from google.adk.apps.app import App
 from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
 from google.adk.cli.utils.agent_loader import AgentLoader
+from google.adk.events._branch_path import _BranchPath
+from google.adk.events._node_path_builder import _NodePathBuilder
 from google.adk.events.event import Event as AdkEvent
 from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
 from google.adk.models.base_llm import BaseLlm
@@ -33,9 +37,17 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.runners import Runner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from google.adk.tools.set_model_response_tool import SetModelResponseTool
 from google.genai import types
 from pydantic import alias_generators
 import pytest
+
+if TYPE_CHECKING:
+  from collections.abc import Iterable
+  from collections.abc import Mapping
+
+  from google.adk.agents.base_agent import BaseAgent
+  from google.adk.sessions.session import Session
 
 EXCLUDED_EVENT_FIELDS = {
     "id",
@@ -50,11 +62,22 @@ EXCLUDED_EVENT_FIELDS = {
     "citation_metadata",
 }
 
+# The Interactions API stamps these volatile, non-reproducible fields onto every
+# model response (interaction_id is a server-issued token; turn_complete is only
+# emitted by the live API), so they are excluded from fixture comparison too.
+# They are kept in a separate, private constant so the value of the public
+# EXCLUDED_EVENT_FIELDS stays stable for the API breaking-change detector.
+_EXTRA_EXCLUDED_EVENT_FIELDS = frozenset({"interaction_id", "turn_complete"})
+
+_ALL_EXCLUDED_EVENT_FIELDS = (
+    EXCLUDED_EVENT_FIELDS | _EXTRA_EXCLUDED_EVENT_FIELDS
+)
+
 
 # Read target folder from environment
 def get_test_files(
     target_folder: str | None = None,
-) -> list[pytest.ParameterSet]:
+) -> list[pytest.ParameterSet]:  # type: ignore[name-defined]
   """Returns list of (agent_dir, test_file_path) recursively."""
   folder = target_folder or os.environ.get("ADK_TEST_FOLDER")
   if not folder:
@@ -102,7 +125,7 @@ class MockModel(BaseLlm):
   response_index: int = -1
 
   @classmethod
-  def create(cls, contents: list[types.Content]):
+  def create(cls, contents: list[types.Content]) -> MockModel:
     llm_responses = [LlmResponse(content=content) for content in contents]
     return cls(responses=llm_responses)
 
@@ -120,13 +143,16 @@ class MockModel(BaseLlm):
 
 class InMemoryRunner:
 
-  def __init__(self, root_agent=None, app=None):
+  def __init__(
+      self, root_agent: BaseAgent | None = None, app: App | None = None
+  ) -> None:
+    self._session_service = InMemorySessionService()
     if app:
       self.app_name = app.name
       self.runner = Runner(
           app=app,
           artifact_service=InMemoryArtifactService(),
-          session_service=InMemorySessionService(),
+          session_service=self._session_service,
           memory_service=InMemoryMemoryService(),
       )
     else:
@@ -135,24 +161,30 @@ class InMemoryRunner:
           app_name="test_app",
           agent=root_agent,
           artifact_service=InMemoryArtifactService(),
-          session_service=InMemorySessionService(),
+          session_service=self._session_service,
           memory_service=InMemoryMemoryService(),
       )
-    self.session_id = None
+    self.session_id: str | None = None
 
   @property
-  def session(self):
+  def session(self) -> Session | None:
     if not self.session_id:
-      session = self.runner.session_service.create_session_sync(
+      session = self._session_service.create_session_sync(
           app_name=self.app_name, user_id="test_user"
       )
       self.session_id = session.id
       return session
-    return self.runner.session_service.get_session_sync(
+    return self._session_service.get_session_sync(
         app_name=self.app_name, user_id="test_user", session_id=self.session_id
     )
 
-  def run(self, new_message) -> list[AdkEvent]:
+  def _session_or_raise(self) -> Session:
+    session = self.session
+    if session is None:
+      raise ValueError(f"Session {self.session_id} not found.")
+    return session
+
+  def run(self, new_message: types.Content | str) -> list[AdkEvent]:
     content = (
         new_message
         if isinstance(new_message, types.Content)
@@ -162,36 +194,51 @@ class InMemoryRunner:
     )
     return list(
         self.runner.run(
-            user_id=self.session.user_id,
-            session_id=self.session.id,
+            user_id=self._session_or_raise().user_id,
+            session_id=self._session_or_raise().id,
             new_message=content,
         )
     )
 
 
-def normalize_events(events, is_json=False):
+def normalize_events(
+    events: Iterable[AdkEvent] | Iterable[Mapping[str, object]],
+    is_json: bool = False,
+) -> list[dict[str, Any]]:
   normalized = []
   for e in events:
+    d: dict[str, Any]
     if is_json:
-      d = dict(e)
-      for k in EXCLUDED_EVENT_FIELDS:
+      d = dict(cast("Mapping[str, object]", e))  # is_json: recorded JSON events
+      for k in _ALL_EXCLUDED_EVENT_FIELDS:
         d.pop(k, None)
         d.pop(alias_generators.to_camel(k), None)
       d = {k: v for k, v in d.items() if v is not None}
     else:
-      d = e.model_dump(
+      d = cast(AdkEvent, e).model_dump(
           mode="json",
           by_alias=True,
-          exclude=EXCLUDED_EVENT_FIELDS,
+          exclude=_ALL_EXCLUDED_EVENT_FIELDS,
           exclude_none=True,
       )
 
     if "content" in d and isinstance(d["content"], dict):
       content = d["content"]
       if "parts" in content and isinstance(content["parts"], list):
+        is_hitl = False
         for part in content["parts"]:
           if isinstance(part, dict) and "thoughtSignature" in part:
             del part["thoughtSignature"]
+          if isinstance(part, dict) and "functionCall" in part:
+            fc_name = part["functionCall"].get("name")
+            if fc_name in (
+                "adk_request_input",
+                "adk_request_confirmation",
+                "adk_request_credential",
+            ):
+              is_hitl = True
+        if is_hitl:
+          content.pop("role", None)
 
     if "longRunningToolIds" in d:
       if isinstance(d["longRunningToolIds"], list):
@@ -222,13 +269,15 @@ def normalize_events(events, is_json=False):
   return normalized
 
 
-def make_sort_key(d):
+def make_sort_key(d: Mapping[str, Any]) -> tuple[str, str, str]:
   node_path = d.get("nodeInfo", {}).get("path", "")
   author = d.get("author", "")
   return (author, node_path, json.dumps(d, sort_keys=True))
 
 
-def _make_nodes_sequential(obj, visited=None):
+def _make_nodes_sequential(
+    obj: object, visited: set[int] | None = None
+) -> None:
   if visited is None:
     visited = set()
 
@@ -245,39 +294,12 @@ def _make_nodes_sequential(obj, visited=None):
       for node in obj.graph.nodes:
         _make_nodes_sequential(node, visited)
   elif isinstance(obj, _ParallelWorker):
-    obj.max_concurrency = 1
+    obj.max_parallel_workers = 1
     if hasattr(obj, "_node"):
       _make_nodes_sequential(obj._node, visited)
 
 
-def _get_all_agent_names(obj, visited=None):
-  if visited is None:
-    visited = set()
-
-  if id(obj) in visited:
-    return set()
-  visited.add(id(obj))
-
-  from google.adk.workflow._parallel_worker import _ParallelWorker
-  from google.adk.workflow._workflow import Workflow
-
-  names = set()
-  if isinstance(obj, BaseAgent) and hasattr(obj, "name"):
-    names.add(obj.name)
-    if hasattr(obj, "sub_agents") and obj.sub_agents:
-      for sub in obj.sub_agents:
-        names.update(_get_all_agent_names(sub, visited))
-  elif isinstance(obj, Workflow):
-    if obj.graph and obj.graph.nodes:
-      for node in obj.graph.nodes:
-        names.update(_get_all_agent_names(node, visited))
-  elif isinstance(obj, _ParallelWorker):
-    if hasattr(obj, "_node"):
-      names.update(_get_all_agent_names(obj._node, visited))
-  return names
-
-
-def _extract_user_content(event: dict) -> Optional[types.Content]:
+def _extract_user_content(event: Mapping[str, Any]) -> Optional[types.Content]:
   """Extracts user content from an event dict and returns a types.Content object.
 
   Agent-emitted user-role events (e.g., task FRs synthesized by the Task
@@ -329,7 +351,23 @@ def _extract_user_content(event: dict) -> Optional[types.Content]:
   return None
 
 
-def _remap_node_path(path: str, id_map: dict[str, str]) -> str:
+def _has_unmapped_function_response(
+    content: types.Content,
+    mapped_function_call_ids: Collection[str],
+) -> bool:
+  """Returns whether replaying content would submit an orphaned response."""
+  return bool(
+      content.parts
+      and any(
+          part.function_response
+          and part.function_response.id
+          and part.function_response.id not in mapped_function_call_ids
+          for part in content.parts
+      )
+  )
+
+
+def _remap_node_path(path: str, id_map: Mapping[str | None, str]) -> str:
   """Rewrite ``<name>@<id>`` segments in a node path using ``id_map``.
 
   Path segments encode ``<node_name>@<run_id>``; when the run_id was an
@@ -374,17 +412,28 @@ def _normalize_ids(events: list[AdkEvent]) -> list[AdkEvent]:
             fc.args[k] = new_id
 
   # Pass 2: Update actions and user responses in all events
-  call_name_to_ids = {}
+  call_name_to_ids: dict[str | None, list[str | None]] = {}
   for e in events:
     for fc in e.get_function_calls():
       call_name_to_ids.setdefault(fc.name, []).append(fc.id)
 
-    if getattr(e, "branch", None) and e.branch.startswith("task:"):
+    if e.branch and e.branch.startswith("task:"):
       parts = e.branch.split(":")
       if len(parts) > 1:
         fc_id = parts[1]
         if fc_id in final_orig_to_new_id:
           e.branch = f"task:{final_orig_to_new_id[fc_id]}"
+
+    if getattr(e, "branch", None):
+      bp = _BranchPath.from_string(e.branch)
+      new_segments = []
+      for segment in bp.segments:
+        parts = segment.rsplit("@", 1)
+        if len(parts) > 1 and parts[1] in final_orig_to_new_id:
+          new_segments.append(f"{parts[0]}@{final_orig_to_new_id[parts[1]]}")
+        else:
+          new_segments.append(segment)
+      e.branch = str(_BranchPath(new_segments))
 
     # Task wrappers stamp isolation_scope with the dispatching FC's
     # id (random at run time) and ``node_info.path`` encodes
@@ -428,7 +477,7 @@ def _normalize_ids(events: list[AdkEvent]) -> list[AdkEvent]:
   return events
 
 
-def _remap_ids_in_args(value: Any, id_map: dict[str, str]) -> None:
+def _remap_ids_in_args(value: Any, id_map: Mapping[str | None, str]) -> None:
   """Walk a FC ``args`` value and remap any ``id`` field that names an FC.
 
   Tool-confirmation FCs (``adk_request_confirmation``) carry the
@@ -472,28 +521,8 @@ def test_agent_replay(agent_dir, test_file, monkeypatch):
         else agent_or_app
     )
     _make_nodes_sequential(root_agent)
-    agent_names = _get_all_agent_names(root_agent)
 
-    import inspect
-
-    # Dynamically locate the loaded agent module from sys.modules
-    mod = sys.modules.get(f"{agent_dir.name}.agent") or sys.modules.get(
-        agent_dir.name
-    )
-    if not mod:
-      # Fallback for namespace packages or nested imports
-      for k, v in sys.modules.items():
-        if k.endswith(f"{agent_dir.name}.agent") or k.endswith(agent_dir.name):
-          mod = v
-          break
-
-    # Reflectively find all Agent instances defined in the module (e.g. dynamic agents)
-    if mod:
-      for _, obj in inspect.getmembers(mod):
-        if isinstance(obj, BaseAgent) and hasattr(obj, "name"):
-          agent_names.add(obj.name)
-
-    with open(test_file, "r") as f:
+    with open(test_file, "r", encoding="utf-8") as f:
       session_data = json.load(f)
 
     events_data = session_data.get("events", [])
@@ -528,7 +557,7 @@ def test_agent_replay(agent_dir, test_file, monkeypatch):
           for part in parts:
             if "functionResponse" in part:
               func_resp = part["functionResponse"]
-              if func_resp.get("name") == "set_model_response":
+              if func_resp.get("name") == SetModelResponseTool.NAME:
                 last_was_set_model_response = True
 
         elif role == "model":
@@ -536,21 +565,25 @@ def test_agent_replay(agent_dir, test_file, monkeypatch):
             last_was_set_model_response = False
             continue
 
-          if ev.get("author", "") not in agent_names:
-            continue
-
-          parts = content_dict.get("parts", [])
-          is_sys_hitl = False
-          for part in parts:
-            if "functionCall" in part:
-              fc_name = part["functionCall"].get("name")
+          parts_list = content_dict.get("parts", [])
+          is_workflow_hitl = False
+          node_path = ev.get("nodeInfo", {}).get("path", "")
+          for p in parts_list:
+            if isinstance(p, dict) and "functionCall" in p:
+              fc_name = p["functionCall"].get("name")
               if fc_name in (
                   "adk_request_confirmation",
                   "adk_request_credential",
               ):
-                is_sys_hitl = True
+                is_workflow_hitl = True
                 break
-          if is_sys_hitl:
+              if (
+                  fc_name == "adk_request_input"
+                  and _NodePathBuilder.from_string(node_path).parent is not None
+              ):
+                is_workflow_hitl = True
+                break
+          if is_workflow_hitl:
             continue
 
           try:
@@ -597,7 +630,9 @@ def test_agent_replay(agent_dir, test_file, monkeypatch):
     if mock_responses:
       mock_model = MockModel.create(contents=mock_responses)
 
-      async def mock_gen_async(instance, llm_request, stream=False):
+      async def mock_gen_async(
+          instance: BaseLlm, llm_request: LlmRequest, stream: bool = False
+      ) -> AsyncGenerator[LlmResponse, None]:
         async for resp in mock_model.generate_content_async(
             llm_request, stream
         ):
@@ -612,7 +647,7 @@ def test_agent_replay(agent_dir, test_file, monkeypatch):
     # Make RequestInput IDs deterministic during replay as well
     fc_counter = 0
 
-    def get_next_fc_id():
+    def get_next_fc_id() -> str:
       nonlocal fc_counter
       fc_counter += 1
       return f"fc-{fc_counter}"
@@ -644,9 +679,10 @@ def test_agent_replay(agent_dir, test_file, monkeypatch):
     mocks_data = session_data.get("mocks", {})
     if mocks_data:
       if "random.random" in mocks_data:
-        random_values = list(mocks_data["random.random"])
+        # The fixture records the values random.random() returned.
+        random_values: list[float] = list(mocks_data["random.random"])
 
-        def mock_random():
+        def mock_random() -> float:
           if random_values:
             return random_values.pop(0)
           return 0.8
@@ -654,9 +690,10 @@ def test_agent_replay(agent_dir, test_file, monkeypatch):
         monkeypatch.setattr(random, "random", mock_random)
 
       if "random.randint" in mocks_data:
-        randint_values = list(mocks_data["random.randint"])
+        # The fixture records the values random.randint() returned.
+        randint_values: list[int] = list(mocks_data["random.randint"])
 
-        def mock_randint(a, b):
+        def mock_randint(a: int, b: int) -> int:
           if randint_values:
             return randint_values.pop(0)
           return b
@@ -681,6 +718,9 @@ def test_agent_replay(agent_dir, test_file, monkeypatch):
       if event.get("author") == "user":
         content = _extract_user_content(event)
         if content:
+          has_unmapped_function_response = _has_unmapped_function_response(
+              content, orig_to_new_id
+          )
           # Update function response IDs if mapped
           if content.parts:
             for part in content.parts:
@@ -696,8 +736,11 @@ def test_agent_replay(agent_dir, test_file, monkeypatch):
               AdkEvent(
                   author="user",
                   content=content,
+                  branch=event.get("branch"),
               )
           )
+          if has_unmapped_function_response:
+            continue
           next_run_events = runner.run(content)
 
           # Post-process events to inject deterministic function IDs
@@ -724,8 +767,9 @@ def test_agent_replay(agent_dir, test_file, monkeypatch):
     sys.path = sys_path_saved
 
 
-def rebuild_tests(path: str):
+def rebuild_tests(path: str) -> None:
   """Discovers test files and rebuilds them by running the agent live."""
+  import asyncio
   import json
   import sys
 
@@ -746,7 +790,8 @@ def rebuild_tests(path: str):
     return
 
   for item in test_files:
-    agent_dir, test_file = item.values
+    # get_test_files builds every param from (agent_dir, test_file).
+    agent_dir, test_file = cast("tuple[Path, Path]", item.values)
     if expected_name and test_file.name != expected_name:
       continue
     print(f"Rebuilding {test_file}...")
@@ -754,6 +799,7 @@ def rebuild_tests(path: str):
     # Add agent_dir.parent to sys.path so relative imports work
     sys_path_saved = list(sys.path)
     sys.path.insert(0, str(agent_dir.parent))
+    rebuild_loop = None
 
     try:
       import random
@@ -769,7 +815,7 @@ def rebuild_tests(path: str):
       )
       _make_nodes_sequential(root_agent)
 
-      with open(test_file, "r") as f:
+      with open(test_file, "r", encoding="utf-8") as f:
         session_data = json.load(f)
 
       events_data = session_data.get("events", [])
@@ -780,9 +826,9 @@ def rebuild_tests(path: str):
       # Extract user messages
       user_messages = []
       for event in events_data:
-        content = _extract_user_content(event)
-        if content:
-          user_messages.append(content)
+        user_content = _extract_user_content(event)
+        if user_content:
+          user_messages.append(user_content)
 
       if not user_messages:
         print(f"No user messages found in {test_file}, skipping.")
@@ -794,10 +840,35 @@ def rebuild_tests(path: str):
           else InMemoryRunner(root_agent=agent_or_app)
       )
 
+      # Drive every turn of this fixture on a single, persistent event loop.
+      # The sync Runner.run() spins up a fresh loop per call via asyncio.run()
+      # and closes it afterwards. For multi-turn fixtures that closes the loop
+      # the model's cached async api_client was bound to, so subsequent turns
+      # raise "Event loop is closed" (e.g. with the Interactions API). Reusing
+      # one loop for all turns keeps the client valid across the conversation.
+      rebuild_loop = asyncio.new_event_loop()
+
+      def run_turn(content: types.Content) -> list[AdkEvent]:
+        session = runner.session
+        if session is None:
+          raise ValueError(f"Session {runner.session_id} not found.")
+
+        async def _collect() -> list[AdkEvent]:
+          events = []
+          async for event in runner.runner.run_async(
+              user_id=session.user_id,
+              session_id=session.id,
+              new_message=content,
+          ):
+            events.append(event)
+          return events
+
+        return rebuild_loop.run_until_complete(_collect())
+
       new_events = []
       inv_counter = 1
 
-      def mock_inv_id():
+      def mock_inv_id() -> str:
         nonlocal inv_counter
         res = f"i-{inv_counter}"
         inv_counter += 1
@@ -805,14 +876,14 @@ def rebuild_tests(path: str):
 
       ev_counter = 1
 
-      def mock_ev_id():
+      def mock_ev_id() -> str:
         nonlocal ev_counter
         res = f"e-{ev_counter}"
         ev_counter += 1
         return res
 
       fc_counter = 0
-      orig_to_new_id = {}
+      orig_to_new_id: dict[str, str | None] = {}
 
       # Extract all function call IDs and response IDs from old events
       old_fc_ids = []
@@ -831,7 +902,7 @@ def rebuild_tests(path: str):
               if isinstance(fr, dict) and "id" in fr:
                 old_fr_ids.append(fr["id"])
 
-      def get_next_fc_id():
+      def get_next_fc_id() -> str:
         nonlocal fc_counter
         fc_counter += 1
         new_id = f"fc-{fc_counter}"
@@ -877,7 +948,7 @@ def rebuild_tests(path: str):
               content=msg,
           )
 
-          run_events = runner.run(msg)
+          run_events = run_turn(msg)
 
           # Build mapping from old IDs to new agent IDs
           for e in run_events:
@@ -911,6 +982,10 @@ def rebuild_tests(path: str):
                   "cache_metadata",
                   "logprobs_result",
                   "citation_metadata",
+                  # Volatile/non-replayable Interactions API state; keeping
+                  # these out keeps rebuilt fixtures deterministic.
+                  "interaction_id",
+                  "turn_complete",
               },
           )
           for e in new_events
@@ -942,8 +1017,8 @@ def rebuild_tests(path: str):
       session_data.pop("lastUpdateTime", None)
 
       # Write back to file
-      with open(test_file, "w") as f:
-        json.dump(session_data, f, indent=2, sort_keys=True)
+      with open(test_file, "w", encoding="utf-8") as f:
+        json.dump(session_data, f, indent=2, sort_keys=True, ensure_ascii=False)
         f.write("\n")
 
       print(f"Successfully rebuilt {test_file}")
@@ -951,6 +1026,10 @@ def rebuild_tests(path: str):
     except Exception as e:
       print(f"Error rebuilding {test_file}: {e}")
     finally:
+      # Always close the per-fixture event loop, even if a turn raised, so we
+      # don't leak unclosed loops and emit resource warnings.
+      if rebuild_loop is not None:
+        rebuild_loop.close()
       sys.path = sys_path_saved
 
 

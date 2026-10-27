@@ -1,0 +1,465 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Fresh-process checks for ADK's public import-loading contract."""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+import types
+from unittest import mock
+
+from click.testing import CliRunner
+import pytest
+
+from . import isolated_import_utils
+from .isolated_import_utils import assert_modules_unloaded
+from .isolated_import_utils import loaded_top_level_packages
+from .isolated_import_utils import run_isolated
+
+pytestmark = pytest.mark.skipif(
+    not isolated_import_utils.SOURCE_ROOT.is_dir(),
+    reason='Import-loading checks need the source checkout layout.',
+)
+
+# Every package whose exports go through google.adk.utils._lazy.accessors.
+_LAZY_PACKAGES = (
+    'google.adk',
+    'google.adk.agents',
+    'google.adk.auth',
+    'google.adk.cli',
+    'google.adk.cli.utils',
+    'google.adk.flows.llm_flows',
+    'google.adk.flows.llm_flows.prompt',
+    'google.adk.telemetry',
+    'google.adk.workflow',
+)
+
+# The statements almost every ADK program starts with, and therefore the two
+# import graphs whose cost every user pays.
+_ENTRY_POINTS = (
+    'from google.adk.agents import Agent',
+    'from google.adk.runners import Runner',
+)
+
+# Third-party top-level packages an entry point may load. The forbidden lists
+# above pin individual deferrals on the lazy package inits; this one bounds the
+# whole graph, because the cost that reaches users arrives as a package nobody
+# noticed rather than as one somebody predicted.
+_ENTRY_POINT_PACKAGE_ALLOWLIST = frozenset({
+    # Declared requirements that ADK imports at module scope.
+    'click',
+    'google',
+    'httpx',
+    'packaging',
+    'pydantic',
+    'tenacity',
+    'websockets',
+    # Reached through pydantic and httpx rather than through ADK.
+    'annotated_doc',
+    'annotated_types',
+    'anyio',
+    'certifi',
+    'idna',
+    'orjson',
+    'pydantic_core',
+    'pygments',
+    'rich',
+    'sniffio',
+    'typing_extensions',
+    'typing_inspection',
+    'zstandard',
+    # google.genai.types annotates optional fields with aiohttp, Pillow and
+    # httpx2 types, and imports whichever of them the environment happens to
+    # have. No ADK module imports any of them, so these are absent in some
+    # installs and present in others depending on what else is installed.
+    'PIL',
+    'aiohappyeyeballs',
+    'aiohttp',
+    'aiosignal',
+    'attr',
+    'defusedxml',
+    'frozenlist',
+    'httpx2',
+    'multidict',
+    'propcache',
+    'yarl',
+    # Stand-ins the packages above import below Python 3.11, where the
+    # standard library has no equivalent yet: aiohttp takes async_timeout for
+    # asyncio.timeout, and anyio takes exceptiongroup for ExceptionGroup.
+    'async_timeout',
+    'exceptiongroup',
+})
+
+
+@pytest.mark.parametrize(
+    ('module_name', 'forbidden'),
+    [
+        (
+            'google.adk',
+            (
+                'a2a',
+                'fastapi',
+                'google.adk.agents.llm_agent',
+                'google.adk.runners',
+                'google.cloud.aiplatform',
+                'google.genai',
+                'mcp',
+                'opentelemetry.sdk',
+                'pydantic',
+                'sqlalchemy',
+                'uvicorn',
+            ),
+        ),
+        (
+            'google.adk.agents',
+            (
+                'google.adk.agents.base_agent',
+                'google.adk.agents.llm_agent',
+                'google.genai',
+                'mcp',
+            ),
+        ),
+        (
+            'google.adk.auth',
+            (
+                'fastapi',
+                'google.adk.auth.auth_handler',
+                'google.adk.auth.auth_schemes',
+                'google.adk.auth.auth_tool',
+                'starlette',
+            ),
+        ),
+        (
+            'google.adk.telemetry',
+            (
+                'google.adk.telemetry.tracing',
+                'google.genai',
+            ),
+        ),
+        (
+            'google.adk.agents.llm_agent',
+            (
+                'google.adk.flows.llm_flows.base_llm_flow',
+                'google.adk.telemetry.tracing',
+            ),
+        ),
+        (
+            'google.adk.flows.llm_flows.base_llm_flow',
+            ('google.adk.live._live_llm_flow',),
+        ),
+        (
+            'google.adk.code_executors',
+            ('google.genai',),
+        ),
+        (
+            'google.adk.code_executors.built_in_code_executor',
+            ('google.genai',),
+        ),
+        (
+            'google.adk.workflow',
+            (
+                'google.adk.workflow._function_node',
+                'google.adk.workflow._join_node',
+                'google.adk.workflow._node',
+                'google.adk.workflow._workflow',
+            ),
+        ),
+        (
+            'google.adk.cli.cli_tools_click',
+            (
+                'fastapi',
+                'google.adk.agents.run_config',
+                'google.adk.cli.cli',
+                'google.adk.evaluation.agent_evaluator',
+                'google.genai',
+                'mcp',
+                'uvicorn',
+            ),
+        ),
+        (
+            # Only the catalog search tool talks to Dataplex, so the toolset
+            # has to import without google-cloud-dataplex installed.
+            'google.adk.integrations.bigquery.bigquery_toolset',
+            ('google.cloud.dataplex_v1',),
+        ),
+        (
+            'google.adk.evaluation.vertex_ai_eval_facade',
+            ('vertexai.preview.rag',),
+        ),
+        # These integrations ship only in the `gcp` extra, so their packages
+        # have to import without the google-cloud client libraries installed
+        # and name the extra to install on first use instead.
+        (
+            'google.adk.integrations.gcs',
+            ('google.api_core', 'google.cloud.storage'),
+        ),
+        (
+            'google.adk.integrations.secret_manager',
+            ('google.api_core', 'google.cloud.secretmanager'),
+        ),
+        (
+            'google.adk.integrations.parameter_manager',
+            ('google.api_core', 'google.cloud.parametermanager_v1'),
+        ),
+    ],
+    ids=(
+        'root',
+        'agents',
+        'auth',
+        'telemetry',
+        'llm_agent',
+        'base_llm_flow',
+        'code_executors',
+        'built_in_code_executor',
+        'workflow',
+        'cli_commands',
+        'bigquery_toolset',
+        'vertex_ai_eval_facade',
+        'gcs',
+        'secret_manager',
+        'parameter_manager',
+    ),
+)
+def test_package_import_defers_unrelated_runtime(
+    module_name: str, forbidden: tuple[str, ...]
+) -> None:
+  """Importing a lightweight package leaves unrelated runtime stacks alone."""
+  assert_modules_unloaded(
+      f'import importlib\nimportlib.import_module({module_name!r})', forbidden
+  )
+
+
+@pytest.mark.parametrize('statement', _ENTRY_POINTS, ids=('agent', 'runner'))
+def test_entry_point_loads_only_allowlisted_packages(statement: str) -> None:
+  """The two entry points every program uses load a reviewed set of packages.
+
+  The lazy package inits are already cheap, so a new eager dependency shows up
+  here first: as a package nobody agreed to pay for on every ADK start.
+
+  The unit is the top-level import name, so a new eager dependency arriving
+  under the `google` namespace, which ADK loads either way, does not show up
+  here.
+  """
+  unexpected = sorted(
+      loaded_top_level_packages(statement) - _ENTRY_POINT_PACKAGE_ALLOWLIST
+  )
+
+  assert not unexpected, (
+      f'{statement!r} now loads {", ".join(unexpected)}, which every ADK'
+      ' process would pay for at startup. Move the import into the function'
+      ' that needs it, or add the package to the allowlist together with the'
+      ' reason it has to be eager.'
+  )
+
+
+@pytest.fixture
+def preloaded_startup_package(tmp_path, monkeypatch):
+  package = tmp_path / 'startup_package'
+  package.mkdir()
+  (package / '__init__.py').write_text('value = 1\n')
+  (package / 'extra.py').write_text('value = 2\n')
+  (tmp_path / 'sitecustomize.py').write_text('import startup_package\n')
+  monkeypatch.setenv('PYTHONPATH', str(tmp_path))
+  return tmp_path
+
+
+def test_import_measurement_excludes_interpreter_startup(
+    preloaded_startup_package,
+):
+  assert (
+      loaded_top_level_packages("assert 'startup_package' in sys.modules")
+      == frozenset()
+  )
+
+
+def test_import_measurement_detects_new_package_after_startup(
+    preloaded_startup_package,
+):
+  (preloaded_startup_package / 'new_package.py').write_text('value = 3\n')
+  assert loaded_top_level_packages(
+      "assert 'startup_package' in sys.modules\nimport new_package"
+  ) == frozenset({'new_package'})
+
+
+def test_import_measurement_detects_new_submodule_of_preloaded_package(
+    preloaded_startup_package,
+):
+  assert loaded_top_level_packages(
+      "assert 'startup_package' in sys.modules\nimport startup_package.extra"
+  ) == frozenset({'startup_package'})
+
+
+def test_constructing_agent_defers_optional_mcp_server_stack():
+  """A normal Agent does not import MCP just because its extra is installed."""
+  if importlib.util.find_spec('mcp') is None:
+    pytest.skip('MCP import-boundary check requires the declared test extra.')
+
+  assert_modules_unloaded(
+      """
+from google.adk import Agent
+
+Agent(name='agent', model='gemini-2.5-flash')
+""",
+      ('mcp', 'sse_starlette', 'uvicorn'),
+  )
+
+
+def test_lazy_packages_support_star_imports():
+  """Every lazy package still resolves through Python's public import syntax."""
+  result = run_isolated(f"""
+import importlib
+
+for module_name in {_LAZY_PACKAGES!r}:
+  package = importlib.import_module(module_name)
+  namespace = {{}}
+  exec(f'from {{module_name}} import *', namespace)
+  assert set(package.__all__).issubset(dir(package)), module_name
+  for name in package.__all__:
+    assert namespace[name] is getattr(package, name), (module_name, name)
+""")
+
+  assert result.returncode == 0, result.stderr
+
+
+def test_lazy_packages_resolve_subpackages_as_attributes():
+  """A subpackage stays reachable on its parent, as eager imports left it."""
+  result = run_isolated("""
+import types
+
+import google.adk
+
+for name in ('agents', 'events', 'runners', 'sessions', 'tools'):
+  assert isinstance(getattr(google.adk, name), types.ModuleType), name
+""")
+
+  assert result.returncode == 0, result.stderr
+
+
+def test_lazy_packages_reject_unknown_attributes():
+  """The lazy hook raises AttributeError rather than masking typos."""
+  result = run_isolated(f"""
+import importlib
+
+for module_name in {_LAZY_PACKAGES!r}:
+  package = importlib.import_module(module_name)
+  try:
+    package.NotAnExport
+  except AttributeError:
+    continue
+  raise AssertionError(module_name)
+""")
+
+  assert result.returncode == 0, result.stderr
+
+
+def test_deferred_module_imports_stay_reachable_as_attributes():
+  """Names a module stopped importing eagerly still resolve on that module."""
+  result = run_isolated("""
+from google.adk import runners
+from google.adk.agents import llm_agent
+from google.adk.agents.llm_agent import BaseLlmFlow
+from google.adk.flows import llm_flows
+from google.adk.telemetry import tracing
+
+assert llm_agent.AutoFlow is llm_flows.auto_flow.AutoFlow
+assert llm_agent.SingleFlow is llm_flows.single_flow.SingleFlow
+assert BaseLlmFlow is llm_flows.base_llm_flow.BaseLlmFlow
+assert runners.tracer is tracing.tracer
+""")
+
+  assert result.returncode == 0, result.stderr
+
+
+def test_flow_submodules_load_when_read_as_package_attributes():
+  """llm_flows imports a submodule the first time it is read as an attribute."""
+  result = run_isolated("""
+import sys
+
+from google.adk.flows import llm_flows
+
+assert 'google.adk.flows.llm_flows.base_llm_flow' not in sys.modules
+assert llm_flows.base_llm_flow.BaseLlmFlow
+assert llm_flows.single_flow.SingleFlow
+""")
+
+  assert result.returncode == 0, result.stderr
+
+
+def test_patched_flow_classes_are_used_by_llm_agent():
+  """Patching llm_agent.AutoFlow or SingleFlow changes the flow an agent runs."""
+  result = run_isolated("""
+from unittest import mock
+
+from google.adk.agents import llm_agent
+
+
+class PatchedAutoFlow(llm_agent.AutoFlow):
+  pass
+
+
+class PatchedSingleFlow(llm_agent.SingleFlow):
+  pass
+
+
+with mock.patch.object(llm_agent, 'AutoFlow', PatchedAutoFlow):
+  agent = llm_agent.LlmAgent(name='auto')
+  assert isinstance(agent._llm_flow, PatchedAutoFlow)
+
+with mock.patch.object(llm_agent, 'SingleFlow', PatchedSingleFlow):
+  agent = llm_agent.LlmAgent(
+      name='single',
+      disallow_transfer_to_parent=True,
+      disallow_transfer_to_peers=True,
+  )
+  assert isinstance(agent._llm_flow, PatchedSingleFlow)
+""")
+
+  assert result.returncode == 0, result.stderr
+
+
+def test_conformance_help_keeps_streaming_mode_choices():
+  """Conformance help retains the public streaming-mode choices."""
+  from google.adk.agents.run_config import StreamingMode
+  from google.adk.cli.cli_tools_click import main
+
+  result = CliRunner().invoke(main, ['conformance', 'record', '--help'])
+  expected_choices = (
+      '{' + '|'.join(str(mode.value).lower() for mode in StreamingMode) + '}'
+  )
+
+  assert result.exit_code == 0
+  assert expected_choices in result.output.lower()
+
+
+def test_conformance_record_converts_streaming_mode_at_execution():
+  """Conformance execution still receives the runtime streaming enum."""
+  from google.adk.agents.run_config import StreamingMode
+  from google.adk.cli.cli_tools_click import main
+
+  observed_modes = []
+
+  async def run_conformance_record(_paths, streaming_mode):
+    observed_modes.append(streaming_mode)
+
+  module_name = 'google.adk.cli.conformance.cli_record'
+  fake_module = types.ModuleType(module_name)
+  fake_module.run_conformance_record = run_conformance_record
+
+  with mock.patch.dict(sys.modules, {module_name: fake_module}):
+    result = CliRunner().invoke(main, ['conformance', 'record', 'sse'])
+
+  assert result.exit_code == 0, result.exception
+  assert observed_modes == [StreamingMode.SSE]

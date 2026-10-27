@@ -23,7 +23,7 @@ from ..apps.app import validate_app_name
 from .utils import _onboarding
 
 _INIT_PY_TEMPLATE = """\
-from . import agent
+from . import agent as agent
 """
 
 _AGENT_PY_TEMPLATE = """\
@@ -65,35 +65,50 @@ _SUCCESS_MSG_CONFIG = """
 Agent created in {agent_folder}:
 - .env
 - .gitignore
-- __init__.py
 - root_agent.yaml
 
 ⚠️  WARNING: Secrets (like GOOGLE_API_KEY) are stored in .env.
 """
 
+_NEXT_STEPS_MSG = """\
+Next steps:
+- Chat with your agent in the terminal: adk run {agent_path}
+- Or in the browser: adk web {agents_dir}
+- Have your coding agent evaluate and deploy it: uvx google-agents-cli setup
+  (other install options: https://adk.dev/get-started/agents-cli/)
+"""
+
+
+_GENERATED_GITIGNORE_ENTRIES = (".env", ".adk/")
+
 
 def _ensure_dotenv_gitignored(agent_folder: str) -> None:
-  """Ensures generated secrets are excluded from version control."""
+  """Ensures generated secrets and local runtime data are excluded from
+  version control."""
   gitignore_file_path = os.path.join(agent_folder, ".gitignore")
-  dotenv_entry = ".env"
 
   if not os.path.exists(gitignore_file_path):
     with open(gitignore_file_path, "w", encoding="utf-8") as f:
-      f.write(f"{dotenv_entry}\n")
+      f.write("".join(f"{entry}\n" for entry in _GENERATED_GITIGNORE_ENTRIES))
     return
 
   with open(gitignore_file_path, "r", encoding="utf-8") as f:
     content = f.read()
 
   existing_lines = content.splitlines()
-  if dotenv_entry in existing_lines:
+  missing_entries = [
+      entry
+      for entry in _GENERATED_GITIGNORE_ENTRIES
+      if entry not in existing_lines
+  ]
+  if not missing_entries:
     return
 
-  # Append .env, ensuring proper newline separation.
+  # Append missing entries, ensuring proper newline separation.
   with open(gitignore_file_path, "a", encoding="utf-8") as f:
     if content and not content.endswith("\n"):
       f.write("\n")
-    f.write(f"{dotenv_entry}\n")
+    f.write("".join(f"{entry}\n" for entry in missing_entries))
 
 
 def _generate_files(
@@ -104,7 +119,7 @@ def _generate_files(
     google_cloud_region: Optional[str] = None,
     model: Optional[str] = None,
     type: str,
-):
+) -> None:
   """Generates a folder name for the agent."""
   os.makedirs(agent_folder, exist_ok=True)
 
@@ -131,8 +146,9 @@ def _generate_files(
   if type == "config":
     with open(agent_config_file_path, "w", encoding="utf-8") as f:
       f.write(_AGENT_CONFIG_TEMPLATE.format(model_name=model))
-    with open(init_file_path, "w", encoding="utf-8") as f:
-      f.write("")
+    # Config agents are loaded from root_agent.yaml; they are not Python
+    # packages. Matching existing config samples, do not emit an empty
+    # __init__.py.
     click.secho(
         _SUCCESS_MSG_CONFIG.format(agent_folder=agent_folder),
         fg="green",
@@ -154,12 +170,15 @@ def _prompt_for_model() -> str:
       """\
 Choose a model for the root agent:
 1. gemini-3.5-flash
-2. Other models (fill later)
+2. gemini-3.8-flash
+3. Other models (fill later)
 Choose model""",
-      type=click.Choice(["1", "2"]),
+      type=click.Choice(["1", "2", "3"]),
   )
   if model_choice == "1":
     return "gemini-3.5-flash"
+  elif model_choice == "2":
+    return "gemini-3.8-flash"
   else:
     click.secho(_OTHER_MODEL_MSG, fg="green")
     return "<FILL_IN_MODEL>"
@@ -189,7 +208,7 @@ def run_cmd(
     google_cloud_project: Optional[str],
     google_cloud_region: Optional[str],
     type: Optional[str],
-):
+) -> None:
   """Runs `adk create` command to create agent template.
 
   Args:
@@ -247,4 +266,11 @@ def run_cmd(
       google_cloud_region=google_cloud_region,
       model=model,
       type=type.lower(),
+  )
+  agents_dir = os.path.dirname(os.path.normpath(agent_name))
+  click.echo(
+      _NEXT_STEPS_MSG.format(
+          agent_path=agent_name,
+          agents_dir=agents_dir or ".",
+      )
   )

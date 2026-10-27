@@ -19,6 +19,7 @@ import logging
 import ssl
 from typing import Any
 from typing import Callable
+from typing import cast
 from typing import Dict
 from typing import Final
 from typing import List
@@ -36,6 +37,7 @@ from ....auth.auth_tool import AuthConfig
 from ...base_toolset import BaseToolset
 from ...base_toolset import ToolPredicate
 from .openapi_spec_parser import OpenApiSpecParser
+from .operation_parser import _MAX_TOOL_NAME_LENGTH
 from .rest_api_tool import HttpxClientFactory
 from .rest_api_tool import RestApiTool
 
@@ -80,7 +82,8 @@ class OpenAPIToolset(BaseToolset):
       ] = None,
       httpx_client_factory: Optional[HttpxClientFactory] = None,
       preserve_property_names: bool = False,
-  ):
+      allow_private_network_access: bool = False,
+  ) -> None:
     """Initializes the OpenAPIToolset.
 
     Usage::
@@ -147,6 +150,11 @@ class OpenAPIToolset(BaseToolset):
         useful when calling APIs that expect camelCase or other non-snake_case
         parameter names in the request. Defaults to False for backward
         compatibility.
+      allow_private_network_access: By default, generated tools refuse loopback,
+        private, link-local (including cloud metadata), and ``*.internal`` /
+        ``*.local`` targets and return an error response. Set this to ``True``
+        to allow requests to private networks, localhost, and custom non-DNS
+        transports.
     """
     super().__init__(tool_filter=tool_filter, tool_name_prefix=tool_name_prefix)
     self._header_provider = header_provider
@@ -165,9 +173,11 @@ class OpenAPIToolset(BaseToolset):
         else None
     )
     if not spec_dict:
-      spec_dict = self._load_spec(spec_str, spec_str_type)
+      # One of spec_dict or spec_str has to be provided by the caller.
+      spec_dict = self._load_spec(cast(str, spec_str), spec_str_type)
     self._ssl_verify = ssl_verify
     self._httpx_client_factory = httpx_client_factory
+    self._allow_private_network_access = allow_private_network_access
     self._tools: Final[List[RestApiTool]] = list(self._parse(spec_dict))
     if auth_scheme or auth_credential:
       self._configure_auth_all(auth_scheme, auth_credential)
@@ -175,8 +185,10 @@ class OpenAPIToolset(BaseToolset):
       self._configure_credential_key_all(credential_key)
 
   def _configure_auth_all(
-      self, auth_scheme: AuthScheme, auth_credential: AuthCredential
-  ):
+      self,
+      auth_scheme: Optional[AuthScheme],
+      auth_credential: Optional[AuthCredential],
+  ) -> None:
     """Configure auth scheme and credential for all tools."""
 
     for tool in self._tools:
@@ -185,14 +197,14 @@ class OpenAPIToolset(BaseToolset):
       if auth_credential:
         tool.configure_auth_credential(auth_credential)
 
-  def _configure_credential_key_all(self, credential_key: str):
+  def _configure_credential_key_all(self, credential_key: str) -> None:
     """Configure credential key for all tools."""
     for tool in self._tools:
       tool.configure_credential_key(credential_key)
 
   def configure_ssl_verify_all(
       self, ssl_verify: Optional[Union[bool, str, ssl.SSLContext]] = None
-  ):
+  ) -> None:
     """Configure SSL certificate verification for all tools.
 
     This is useful for enterprise environments where requests go through a
@@ -211,7 +223,9 @@ class OpenAPIToolset(BaseToolset):
       tool.configure_ssl_verify(ssl_verify)
 
   @override
-  async def get_tools(
+  # list is invariant, so the narrower element type is not a compatible
+  # override; widening it to BaseTool would change this public signature.
+  async def get_tools(  # type: ignore[override]
       self, readonly_context: Optional[ReadonlyContext] = None
   ) -> List[RestApiTool]:
     """Get all tools in the toolset."""
@@ -231,11 +245,16 @@ class OpenAPIToolset(BaseToolset):
   ) -> Dict[str, Any]:
     """Loads the OpenAPI spec string into a dictionary."""
     if spec_type == "json":
-      return json.loads(spec_str)
+      loaded_spec: object = json.loads(spec_str)
     elif spec_type == "yaml":
-      return yaml.safe_load(spec_str)
+      loaded_spec = yaml.safe_load(spec_str)
     else:
       raise ValueError(f"Unsupported spec type: {spec_type}")
+
+    if not isinstance(loaded_spec, dict):
+      raise ValueError("The OpenAPI specification must be an object")
+
+    return cast(Dict[str, Any], loaded_spec)
 
   def _parse(self, openapi_spec_dict: Dict[str, Any]) -> List[RestApiTool]:
     """Parse OpenAPI spec into a list of RestApiTool."""
@@ -244,18 +263,33 @@ class OpenAPIToolset(BaseToolset):
     )
     operations = parser.parse(openapi_spec_dict)
 
-    tools = []
-    for o in operations:
-      tool = RestApiTool.from_parsed_operation(
-          o,
-          ssl_verify=self._ssl_verify,
-          header_provider=self._header_provider,
-          httpx_client_factory=self._httpx_client_factory,
-      )
+    # operationIds that share a long common prefix collapse to the same
+    # truncated name (RestApiTool.__init__ caps it at _MAX_TOOL_NAME_LENGTH
+    # chars); disambiguate so each operation still gets its own callable tool.
+    tools = [
+        RestApiTool.from_parsed_operation(
+            o,
+            ssl_verify=self._ssl_verify,
+            header_provider=self._header_provider,
+            httpx_client_factory=self._httpx_client_factory,
+            allow_private_network_access=self._allow_private_network_access,
+        )
+        for o in operations
+    ]
+    reserved_names = {t.name for t in tools}
+    assigned_names: set[str] = set()
+    for tool in tools:
+      if tool.name in assigned_names:
+        base_name = tool.name
+        n = 2
+        while tool.name in assigned_names or tool.name in reserved_names:
+          suffix = f"_{n}"
+          tool.name = base_name[: _MAX_TOOL_NAME_LENGTH - len(suffix)] + suffix
+          n += 1
+      assigned_names.add(tool.name)
       logger.info("Parsed tool: %s", tool.name)
-      tools.append(tool)
     return tools
 
   @override
-  async def close(self):
+  async def close(self) -> None:
     pass

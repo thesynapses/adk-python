@@ -23,6 +23,7 @@ from google.adk.features._feature_registry import temporary_feature_override
 from google.adk.tools.application_integration_tool.integration_connector_tool import IntegrationConnectorTool
 from google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool import RestApiTool
 from google.adk.tools.openapi_tool.openapi_spec_parser.tool_auth_handler import AuthPreparationResult
+from google.adk.tools.openapi_tool.openapi_spec_parser.tool_auth_handler import ToolAuthHandler
 from google.genai.types import FunctionDeclaration
 from google.genai.types import Schema
 from google.genai.types import Type
@@ -96,6 +97,7 @@ def integration_tool_with_auth(mock_rest_api_tool):
               credentials=HttpCredentials(token="mocked_token"),
           ),
       ),
+      credential_key="test-key",
   )
 
 
@@ -190,8 +192,8 @@ async def test_run_with_auth_async_none_token(
       "sortByColumns": ["a", "b"],
   }
 
-  with mock.patch(
-      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  with mock.patch.object(
+      ToolAuthHandler, "from_tool_context", autospec=True
   ) as mock_from_tool_context:
     mock_tool_auth_handler_instance = mock.MagicMock()
     # Simulate an AuthCredential that would cause _prepare_dynamic_euc to return None
@@ -213,6 +215,12 @@ async def test_run_with_auth_async_none_token(
 
     result = await integration_tool_with_auth.run_async(
         args=input_args, tool_context={}
+    )
+    mock_from_tool_context.assert_called_once_with(
+        {},
+        None,
+        integration_tool_with_auth._auth_credential,
+        credential_key="test-key",
     )
 
     mock_rest_api_tool.call.assert_called_once_with(
@@ -241,8 +249,8 @@ async def test_run_with_auth_async(
       "action": "TestAction",
   }
 
-  with mock.patch(
-      "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool.ToolAuthHandler.from_tool_context"
+  with mock.patch.object(
+      ToolAuthHandler, "from_tool_context", autospec=True
   ) as mock_from_tool_context:
     mock_tool_auth_handler_instance = mock.MagicMock()
 
@@ -262,10 +270,57 @@ async def test_run_with_auth_async(
     result = await integration_tool_with_auth.run_async(
         args=input_args, tool_context={}
     )
+    mock_from_tool_context.assert_called_once_with(
+        {},
+        None,
+        integration_tool_with_auth._auth_credential,
+        credential_key="test-key",
+    )
     mock_rest_api_tool.call.assert_called_once_with(
         args=expected_call_args, tool_context={}
     )
     assert result == {"status": "success", "data": "mock_data"}
+
+
+@pytest.mark.asyncio
+async def test_run_with_auth_async_keeps_token_out_of_caller_args_and_logs(
+    integration_tool_with_auth, mock_rest_api_tool, caplog
+):
+  """The caller's args also feed after-tool callbacks and the tool span."""
+  input_args = {"user_id": "user123"}
+
+  with mock.patch.object(
+      ToolAuthHandler, "from_tool_context", autospec=True
+  ) as mock_from_tool_context:
+    mock_from_tool_context.return_value.prepare_auth_credentials = (
+        mock.AsyncMock(
+            return_value=AuthPreparationResult(
+                state="done",
+                auth_credential=AuthCredential(
+                    auth_type=AuthCredentialTypes.HTTP,
+                    http=HttpAuth(
+                        scheme="bearer",
+                        credentials=HttpCredentials(token="secret-token"),
+                    ),
+                ),
+            )
+        )
+    )
+    with caplog.at_level("INFO"):
+      await integration_tool_with_auth.run_async(
+          args=input_args, tool_context={}
+      )
+
+  assert input_args == {"user_id": "user123"}
+  sent_args = mock_rest_api_tool.call.call_args.kwargs["args"]
+  assert sent_args["dynamic_auth_config"] == {
+      "oauth2_auth_code_flow.access_token": "secret-token"
+  }
+  assert any(
+      "test_integration_tool" in record.getMessage()
+      for record in caplog.records
+  )
+  assert "secret-token" not in caplog.text
 
 
 class TestIntegrationConnectorToolWithJsonSchema:

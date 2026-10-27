@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from google.adk.agents.llm_agent import Agent
 from google.adk.agents.loop_agent import LoopAgent
 from google.adk.agents.loop_agent import LoopAgentState
@@ -26,6 +28,8 @@ from google.adk.apps.app import ResumabilityConfig
 from google.adk.runners import Runner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.adk.tools.exit_loop_tool import exit_loop
+from google.adk.tools.tool_context import ToolContext
+from google.genai import errors
 from google.genai.types import Part
 import pytest
 
@@ -42,7 +46,28 @@ TRANSFER_RESPONSE_PART = Part.from_function_response(
     name='transfer_to_agent', response={'result': None}
 )
 
+FORCED_TRANSFER_CALL_PART = Part.from_function_call(
+    name='force_transfer', args={}
+)
+
+FORCED_TRANSFER_RESPONSE_PART = Part.from_function_response(
+    name='force_transfer', response={'status': 'ok'}
+)
+
+
 END_OF_AGENT = testing_utils.END_OF_AGENT
+
+
+def force_transfer_tool(
+    target_name: str,
+) -> Callable[[ToolContext], dict[str, str]]:
+  """Builds a tool that requests a transfer without going through the transfer tool."""
+
+  def force_transfer(tool_context: ToolContext) -> dict[str, str]:
+    tool_context.actions.transfer_to_agent = target_name
+    return {'status': 'ok'}
+
+  return force_transfer
 
 
 @pytest.mark.parametrize('is_resumable', [True, False])
@@ -803,6 +828,139 @@ async def test_transfer_to_unrelated_agent_raises_error():
       pass
 
 
+@pytest.mark.asyncio
+async def test_tool_driven_transfer_to_parent_refused_when_disallowed():
+  """A tool setting the transfer action cannot reach a disallowed parent."""
+  # Arrange
+  response = [
+      transfer_call_part('sub_agent_1'),
+      FORCED_TRANSFER_CALL_PART,
+  ]
+  mock_model = testing_utils.MockModel.create(responses=response)
+
+  sub_agent_1 = Agent(
+      name='sub_agent_1',
+      model=mock_model,
+      disallow_transfer_to_parent=True,
+      tools=[force_transfer_tool('root_agent')],
+  )
+  root_agent = Agent(
+      name='root_agent',
+      model=mock_model,
+      sub_agents=[sub_agent_1],
+  )
+
+  session_service = InMemorySessionService()
+  await session_service.create_session(
+      app_name='test_app', user_id='test_user', session_id='test_session'
+  )
+  runner = Runner(
+      app_name='test_app',
+      agent=root_agent,
+      session_service=session_service,
+  )
+
+  msg = testing_utils.types.Content(
+      role='user', parts=[testing_utils.types.Part(text='start')]
+  )
+
+  # Act & Assert
+  with pytest.raises(
+      ValueError,
+      match="Cannot transfer from 'sub_agent_1' to parent agent 'root_agent'",
+  ):
+    async for _ in runner.run_async(
+        user_id='test_user',
+        session_id='test_session',
+        new_message=msg,
+    ):
+      pass
+
+
+@pytest.mark.asyncio
+async def test_tool_driven_transfer_to_peer_refused_when_disallowed():
+  """A tool setting the transfer action cannot reach a disallowed peer."""
+  # Arrange
+  response = [
+      transfer_call_part('sub_agent_1'),
+      FORCED_TRANSFER_CALL_PART,
+  ]
+  mock_model = testing_utils.MockModel.create(responses=response)
+
+  sub_agent_1 = Agent(
+      name='sub_agent_1',
+      model=mock_model,
+      disallow_transfer_to_peers=True,
+      tools=[force_transfer_tool('sub_agent_2')],
+  )
+  sub_agent_2 = Agent(name='sub_agent_2', model=mock_model)
+  root_agent = Agent(
+      name='root_agent',
+      model=mock_model,
+      sub_agents=[sub_agent_1, sub_agent_2],
+  )
+
+  session_service = InMemorySessionService()
+  await session_service.create_session(
+      app_name='test_app', user_id='test_user', session_id='test_session'
+  )
+  runner = Runner(
+      app_name='test_app',
+      agent=root_agent,
+      session_service=session_service,
+  )
+
+  msg = testing_utils.types.Content(
+      role='user', parts=[testing_utils.types.Part(text='start')]
+  )
+
+  # Act & Assert
+  with pytest.raises(
+      ValueError,
+      match="Cannot transfer from 'sub_agent_1' to peer agent 'sub_agent_2'",
+  ):
+    async for _ in runner.run_async(
+        user_id='test_user',
+        session_id='test_session',
+        new_message=msg,
+    ):
+      pass
+
+
+def test_tool_driven_transfer_to_peer_runs_when_allowed():
+  """A tool-driven transfer to a peer still runs when nothing forbids it."""
+  # Arrange
+  response = [
+      transfer_call_part('sub_agent_1'),
+      FORCED_TRANSFER_CALL_PART,
+      'response1',
+  ]
+  mock_model = testing_utils.MockModel.create(responses=response)
+
+  sub_agent_1 = Agent(
+      name='sub_agent_1',
+      model=mock_model,
+      tools=[force_transfer_tool('sub_agent_2')],
+  )
+  sub_agent_2 = Agent(name='sub_agent_2', model=mock_model)
+  root_agent = Agent(
+      name='root_agent',
+      model=mock_model,
+      sub_agents=[sub_agent_1, sub_agent_2],
+  )
+  app = App(name='test_app', root_agent=root_agent)
+  runner = testing_utils.InMemoryRunner(app=app)
+
+  # Act & Assert
+  assert testing_utils.simplify_events(runner.run('test1')) == [
+      ('root_agent', transfer_call_part('sub_agent_1')),
+      ('root_agent', TRANSFER_RESPONSE_PART),
+      ('sub_agent_1', FORCED_TRANSFER_CALL_PART),
+      ('sub_agent_1', FORCED_TRANSFER_RESPONSE_PART),
+      ('sub_agent_2', 'response1'),
+  ]
+
+
 @pytest.mark.parametrize('is_resumable', [True, False])
 def test_transfer_cyclic_loop(is_resumable: bool):
   """Verify multi-stage cyclic loop transfer (Root -> SubA -> SubB -> Root) and resumption."""
@@ -865,6 +1023,154 @@ def test_transfer_cyclic_loop(is_resumable: bool):
     assert testing_utils.simplify_resumable_app_events(runner.run('test2')) == [
         ('root_agent', 'response_from_root_2'),
         ('root_agent', END_OF_AGENT),
+    ]
+
+
+@pytest.mark.parametrize('is_resumable', [True, False])
+def test_transfer_to_parent_and_back_in_turn_started_by_sub_agent(
+    is_resumable: bool,
+):
+  """Verify a turn started in a sub-agent can transfer to the parent and back.
+
+  Turn 2 starts in sub_agent_1, which replied last. When root_agent transfers
+  back to it, sub_agent_1 must run again instead of having its first run of the
+  turn replayed.
+  """
+  # Arrange
+  response = [
+      transfer_call_part('sub_agent_1'),
+      'response1',
+      transfer_call_part('root_agent'),
+      transfer_call_part('sub_agent_1'),
+      'response2',
+  ]
+  mock_model = testing_utils.MockModel.create(responses=response)
+
+  sub_agent_1 = Agent(name='sub_agent_1', model=mock_model)
+  root_agent = Agent(
+      name='root_agent',
+      model=mock_model,
+      sub_agents=[sub_agent_1],
+  )
+  app = App(
+      name='test_app',
+      root_agent=root_agent,
+      resumability_config=ResumabilityConfig(is_resumable=is_resumable),
+  )
+  runner = testing_utils.InMemoryRunner(app=app)
+
+  # Act & Assert
+  if not is_resumable:
+    assert testing_utils.simplify_events(runner.run('test1')) == [
+        ('root_agent', transfer_call_part('sub_agent_1')),
+        ('root_agent', TRANSFER_RESPONSE_PART),
+        ('sub_agent_1', 'response1'),
+    ]
+
+    # Turn 2: starts at sub_agent_1, goes to root_agent and comes back
+    assert testing_utils.simplify_events(runner.run('test2')) == [
+        ('sub_agent_1', transfer_call_part('root_agent')),
+        ('sub_agent_1', TRANSFER_RESPONSE_PART),
+        ('root_agent', transfer_call_part('sub_agent_1')),
+        ('root_agent', TRANSFER_RESPONSE_PART),
+        ('sub_agent_1', 'response2'),
+    ]
+  else:
+    assert testing_utils.simplify_resumable_app_events(runner.run('test1')) == [
+        ('root_agent', transfer_call_part('sub_agent_1')),
+        ('root_agent', TRANSFER_RESPONSE_PART),
+        ('root_agent', END_OF_AGENT),
+        ('sub_agent_1', 'response1'),
+        ('sub_agent_1', END_OF_AGENT),
+    ]
+
+    # Turn 2: starts at sub_agent_1, goes to root_agent and comes back
+    assert testing_utils.simplify_resumable_app_events(runner.run('test2')) == [
+        ('sub_agent_1', transfer_call_part('root_agent')),
+        ('sub_agent_1', TRANSFER_RESPONSE_PART),
+        ('sub_agent_1', END_OF_AGENT),
+        ('root_agent', transfer_call_part('sub_agent_1')),
+        ('root_agent', TRANSFER_RESPONSE_PART),
+        ('root_agent', END_OF_AGENT),
+        ('sub_agent_1', 'response2'),
+        ('sub_agent_1', END_OF_AGENT),
+    ]
+
+
+@pytest.mark.parametrize('is_resumable', [True, False])
+def test_transfer_to_parent_and_back_in_turn_started_by_grandchild(
+    is_resumable: bool,
+):
+  """Verify a turn that starts two levels down can transfer up and back.
+
+  Turn 2 starts in leaf_agent, which replied last, transfers to mid_agent, and
+  mid_agent transfers back. The transfer back is allocated under mid_agent's
+  path, so leaf_agent must get a new run there instead of having its first run
+  of the turn replayed.
+  """
+  # Arrange
+  response = [
+      transfer_call_part('mid_agent'),
+      transfer_call_part('leaf_agent'),
+      'response1',
+      transfer_call_part('mid_agent'),
+      transfer_call_part('leaf_agent'),
+      'response2',
+  ]
+  mock_model = testing_utils.MockModel.create(responses=response)
+
+  leaf_agent = Agent(name='leaf_agent', model=mock_model)
+  mid_agent = Agent(name='mid_agent', model=mock_model, sub_agents=[leaf_agent])
+  root_agent = Agent(
+      name='root_agent', model=mock_model, sub_agents=[mid_agent]
+  )
+  app = App(
+      name='test_app',
+      root_agent=root_agent,
+      resumability_config=ResumabilityConfig(is_resumable=is_resumable),
+  )
+  runner = testing_utils.InMemoryRunner(app=app)
+
+  # Act & Assert
+  if not is_resumable:
+    assert testing_utils.simplify_events(runner.run('test1')) == [
+        ('root_agent', transfer_call_part('mid_agent')),
+        ('root_agent', TRANSFER_RESPONSE_PART),
+        ('mid_agent', transfer_call_part('leaf_agent')),
+        ('mid_agent', TRANSFER_RESPONSE_PART),
+        ('leaf_agent', 'response1'),
+    ]
+
+    # Turn 2: starts at leaf_agent, goes to mid_agent and comes back
+    assert testing_utils.simplify_events(runner.run('test2')) == [
+        ('leaf_agent', transfer_call_part('mid_agent')),
+        ('leaf_agent', TRANSFER_RESPONSE_PART),
+        ('mid_agent', transfer_call_part('leaf_agent')),
+        ('mid_agent', TRANSFER_RESPONSE_PART),
+        ('leaf_agent', 'response2'),
+    ]
+  else:
+    assert testing_utils.simplify_resumable_app_events(runner.run('test1')) == [
+        ('root_agent', transfer_call_part('mid_agent')),
+        ('root_agent', TRANSFER_RESPONSE_PART),
+        ('root_agent', END_OF_AGENT),
+        ('mid_agent', transfer_call_part('leaf_agent')),
+        ('mid_agent', TRANSFER_RESPONSE_PART),
+        ('mid_agent', END_OF_AGENT),
+        ('leaf_agent', 'response1'),
+        ('leaf_agent', END_OF_AGENT),
+    ]
+
+    # Turn 2: starts at leaf_agent, goes to mid_agent and comes back
+    assert testing_utils.simplify_resumable_app_events(runner.run('test2')) == [
+        ('leaf_agent', transfer_call_part('mid_agent')),
+        ('leaf_agent', TRANSFER_RESPONSE_PART),
+        ('leaf_agent', END_OF_AGENT),
+        ('mid_agent', transfer_call_part('leaf_agent')),
+        ('mid_agent', TRANSFER_RESPONSE_PART),
+        ('mid_agent', END_OF_AGENT),
+        ('leaf_agent', 'response2'),
+        ('leaf_agent', END_OF_AGENT),
     ]
 
 
@@ -1097,3 +1403,50 @@ async def test_llm_agent_transfer_inside_custom_node():
   # Assert
   assert ('inner_agent', transfer_call_part('target_agent')) in simplified
   assert ('target_agent', 'hello from target') in simplified
+
+
+@pytest.mark.parametrize('is_resumable', [True, False])
+async def test_transfer_target_failing_before_first_event_owns_next_turn(
+    is_resumable: bool,
+):
+  """A target that fails before yielding still owns the next turn."""
+  # Arrange
+  root_model = testing_utils.MockModel.create(
+      responses=[transfer_call_part('sub_agent_1')]
+  )
+  sub_model = testing_utils.MockModel.create(responses=['response_sub'])
+  sub_model.error = errors.ServerError(
+      503, {'error': {'code': 503, 'status': 'UNAVAILABLE'}}
+  )
+
+  sub_agent_1 = Agent(name='sub_agent_1', model=sub_model)
+  root_agent = Agent(
+      name='root_agent',
+      model=root_model,
+      sub_agents=[sub_agent_1],
+  )
+  app = App(
+      name='test_app',
+      root_agent=root_agent,
+      resumability_config=ResumabilityConfig(is_resumable=is_resumable),
+  )
+  runner = testing_utils.InMemoryRunner(app=app)
+
+  # Act & Assert: Turn 1, the target's first model call fails
+  with pytest.raises(errors.ServerError):
+    await runner.run_async('test1')
+
+  # Turn 2: the model is healthy again and the target answers
+  sub_model.error = None
+  events = await runner.run_async('test2')
+
+  if not is_resumable:
+    assert testing_utils.simplify_events(events) == [
+        ('sub_agent_1', 'response_sub'),
+    ]
+  else:
+    assert testing_utils.simplify_resumable_app_events(events) == [
+        ('sub_agent_1', 'response_sub'),
+        ('sub_agent_1', END_OF_AGENT),
+    ]
+  assert len(root_model.requests) == 1

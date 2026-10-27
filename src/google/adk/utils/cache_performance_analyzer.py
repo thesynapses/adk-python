@@ -60,6 +60,8 @@ class CachePerformanceAnalyzer:
         app_name=app_name,
         user_id=user_id,
     )
+    if session is None:
+      raise ValueError(f"Session not found: {session_id}")
     cache_history = []
 
     for event in session.events:
@@ -111,6 +113,8 @@ class CachePerformanceAnalyzer:
         app_name=app_name,
         user_id=user_id,
     )
+    if session is None:
+      raise ValueError(f"Session not found: {session_id}")
 
     # Collect token metrics from events
     total_prompt_tokens = 0
@@ -144,11 +148,15 @@ class CachePerformanceAnalyzer:
         total_cached_tokens / total_requests if total_requests > 0 else 0.0
     )
 
-    invocations_used = [
-        c.invocations_used
-        for c in cache_history
-        if c.invocations_used is not None
-    ]
+    # Each response carries the cumulative counter for its cache, not an
+    # additional invocation count. Keep one total per cache instance.
+    cache_invocations: dict[str, int] = {}
+    for cache in cache_history:
+      if cache.cache_name is not None and cache.invocations_used is not None:
+        cache_invocations[cache.cache_name] = max(
+            cache_invocations.get(cache.cache_name, 0), cache.invocations_used
+        )
+    invocations_used = list(cache_invocations.values())
     total_invocations = sum(invocations_used)
 
     return {

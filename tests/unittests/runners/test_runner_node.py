@@ -26,8 +26,12 @@ from typing import AsyncGenerator
 
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.agents.context import Context
+from google.adk.agents.invocation_context import InvocationContext
 from google.adk.agents.llm_agent import LlmAgent
+from google.adk.agents.run_config import RunConfig
+from google.adk.apps.app import App
 from google.adk.events.event import Event
+from google.adk.plugins.base_plugin import BasePlugin
 from google.adk.runners import Runner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.adk.workflow import node
@@ -256,6 +260,30 @@ async def test_multiple_invocations_accumulate_events():
   assert outputs == ['Echo: first', 'Echo: second', 'Echo: third']
 
 
+@pytest.mark.asyncio
+async def test_run_config_custom_metadata_stamps_user_event():
+  """The node path stamps the user event with run-level custom_metadata."""
+  ss = InMemorySessionService()
+  runner = Runner(
+      app_name='test', node=_EchoNode(name='echo'), session_service=ss
+  )
+  session = await ss.create_session(app_name='test', user_id='u')
+
+  async for _ in runner.run_async(
+      user_id='u',
+      session_id=session.id,
+      new_message=_user_message('hi'),
+      run_config=RunConfig(custom_metadata={'turn_id': 't-1'}),
+  ):
+    pass
+
+  updated = await ss.get_session(
+      app_name='test', user_id='u', session_id=session.id
+  )
+  user_event = next(e for e in updated.events if e.author == 'user')
+  assert user_event.custom_metadata == {'turn_id': 't-1'}
+
+
 # ---------------------------------------------------------------------------
 # yield_user_message
 # ---------------------------------------------------------------------------
@@ -428,6 +456,7 @@ async def test_standalone_node_resume():
   """A standalone node resumes with resume_inputs from function response."""
 
   class _Node(BaseNode):
+    rerun_on_resume: bool = True
 
     async def _run_impl(
         self, *, ctx: Context, node_input: Any
@@ -453,6 +482,7 @@ async def test_resume_preserves_original_user_content():
   """On resume, Runner passes the original text as node_input, not the FR."""
 
   class _Node(BaseNode):
+    rerun_on_resume: bool = True
 
     async def _run_impl(
         self, *, ctx: Context, node_input: Any
@@ -483,6 +513,7 @@ async def test_resume_populates_invocation_user_content():
   seen: list[Any] = []
 
   class _Node(BaseNode):
+    rerun_on_resume: bool = True
 
     async def _run_impl(
         self, *, ctx: Context, node_input: Any
@@ -509,6 +540,7 @@ async def test_resume_by_invocation_id_populates_user_content():
   seen: list[Any] = []
 
   class _Node(BaseNode):
+    rerun_on_resume: bool = True
 
     async def _run_impl(
         self, *, ctx: Context, node_input: Any
@@ -536,7 +568,10 @@ async def test_resume_by_invocation_id_populates_user_content():
   invocation_id = updated.events[0].invocation_id
 
   async for _ in runner.run_async(
-      user_id='u', session_id=session.id, invocation_id=invocation_id
+      user_id='u',
+      session_id=session.id,
+      invocation_id=invocation_id,
+      new_message=_make_resume_message(fc_name='tool', response={'v': 1}),
   ):
     pass
 
@@ -1368,3 +1403,189 @@ async def test_run_node_isolation_across_invocations():
   assert call_counts['child'] == 2
   outputs2 = [e.output for e in events2 if e.output is not None]
   assert 'child_out_2' in outputs2
+
+
+# ---------------------------------------------------------------------------
+# Plugin lifecycle on the node path
+# ---------------------------------------------------------------------------
+
+
+class _AfterRunCountingPlugin(BasePlugin):
+  """Counts how many times after_run_callback is dispatched."""
+
+  def __init__(self) -> None:
+    super().__init__(name='after_run_counter')
+    self.after_run_calls = 0
+
+  async def after_run_callback(
+      self, *, invocation_context: InvocationContext
+  ) -> None:
+    self.after_run_calls += 1
+
+
+@pytest.mark.asyncio
+async def test_after_run_callback_dispatched_on_workflow_root():
+  """Runner dispatches plugin after_run_callback on a Workflow(BaseNode) root."""
+
+  def terminal(node_input: str) -> str:
+    return node_input.upper()
+
+  plugin = _AfterRunCountingPlugin()
+  workflow = Workflow(name='wf', edges=[(START, terminal)])
+  app = App(name='test', root_agent=workflow, plugins=[plugin])
+  ss = InMemorySessionService()
+  runner = Runner(app=app, session_service=ss)
+  session = await ss.create_session(app_name='test', user_id='u')
+
+  async for _ in runner.run_async(
+      user_id='u', session_id=session.id, new_message=_user_message('hi')
+  ):
+    pass
+
+  assert plugin.after_run_calls == 1
+
+
+@pytest.mark.parametrize(
+    'author, node_path',
+    [
+        ('sub_agent', ''),  # Legacy: author is the node name, no path.
+        (
+            'workflow_agent',
+            'workflow_agent/sub_agent',
+        ),  # Workflow: author is the workflow, path carries the node name.
+    ],
+)
+@pytest.mark.asyncio
+async def test_direct_sub_agent_resumption_restores_historical_branch(
+    author, node_path
+):
+  """Direct sub-agent resumption restores the historical branch context."""
+  from google.adk.events.event import NodeInfo
+  from pydantic import Field
+
+  class AssertBranchNode(BaseNode):
+
+    async def _run_impl(
+        self, *, ctx: Context, node_input: Any
+    ) -> AsyncGenerator[Any, None]:
+      assert ctx.branch == 'parent_branch.sub_branch'
+      yield 'ok'
+
+  sub_agent = AssertBranchNode(name='sub_agent')
+
+  class ParentNode(BaseNode):
+    child: BaseNode = Field(...)
+
+  root_agent = ParentNode(name=author if node_path else 'root', child=sub_agent)
+
+  ss = InMemorySessionService()
+  session = await ss.create_session(app_name='test', user_id='u')
+
+  fc_part = types.Part(
+      function_call=types.FunctionCall(name='get_input', id='fc-1', args={})
+  )
+  sub_agent_event = Event(
+      invocation_id='inv-1',
+      author=author,
+      content=types.Content(parts=[fc_part]),
+      branch='parent_branch.sub_branch',
+      node_info=NodeInfo(path=node_path) if node_path else NodeInfo(),
+  )
+  await ss.append_event(session, sub_agent_event)
+
+  resume_msg = _make_resume_message(fc_id='fc-1')
+  runner = Runner(app_name='test', node=root_agent, session_service=ss)
+
+  events = []
+  async for event in runner._run_node_async(
+      user_id='u',
+      session_id=session.id,
+      invocation_id='inv-1',
+      new_message=resume_msg,
+      node=sub_agent,
+  ):
+    events.append(event)
+
+  outputs = [e.output for e in events if e.output is not None]
+  assert 'ok' in outputs
+
+
+@pytest.mark.asyncio
+async def test_direct_sub_agent_resumption_with_name_collision_resolves_correctly():
+  """Direct sub-agent resumption with a name collision matches by full path."""
+  from google.adk.events.event import NodeInfo
+  from pydantic import Field
+
+  class AssertBranchNode(BaseNode):
+    expected_branch: str = Field(...)
+
+    async def _run_impl(
+        self, *, ctx: Context, node_input: Any
+    ) -> AsyncGenerator[Any, None]:
+      assert ctx.branch == self.expected_branch
+      yield 'ok'
+
+  # Two distinct nodes that share the name 'sub_agent'.
+  sub_agent_1 = AssertBranchNode(name='sub_agent', expected_branch='branch_1')
+  sub_agent_2 = AssertBranchNode(name='sub_agent', expected_branch='branch_2')
+
+  class Child1Node(BaseNode):
+    child: BaseNode = Field(...)
+
+  class Child2Node(BaseNode):
+    child: BaseNode = Field(...)
+
+  child1 = Child1Node(name='child1', child=sub_agent_1)
+  child2 = Child2Node(name='child2', child=sub_agent_2)
+
+  class WorkflowNode(BaseNode):
+    c1: BaseNode = Field(...)
+    c2: BaseNode = Field(...)
+
+  root_agent = WorkflowNode(name='workflow', c1=child1, c2=child2)
+
+  ss = InMemorySessionService()
+  session = await ss.create_session(app_name='test', user_id='u')
+
+  # Older event from child2 (the one we resume) on 'branch_2'.
+  fc_part_2 = types.Part(
+      function_call=types.FunctionCall(name='tool', id='fc-2', args={})
+  )
+  event_child2 = Event(
+      invocation_id='inv-1',
+      author='workflow',
+      content=types.Content(parts=[fc_part_2]),
+      branch='branch_2',
+      node_info=NodeInfo(path='workflow/child2/sub_agent'),
+  )
+  await ss.append_event(session, event_child2)
+
+  # Newer event from child1 on 'branch_1' (must be skipped despite being first
+  # in the reverse scan).
+  fc_part_1 = types.Part(
+      function_call=types.FunctionCall(name='tool', id='fc-1', args={})
+  )
+  event_child1 = Event(
+      invocation_id='inv-1',
+      author='workflow',
+      content=types.Content(parts=[fc_part_1]),
+      branch='branch_1',
+      node_info=NodeInfo(path='workflow/child1/sub_agent'),
+  )
+  await ss.append_event(session, event_child1)
+
+  resume_msg = _make_resume_message(fc_name='tool', fc_id='fc-2')
+  runner = Runner(app_name='test', node=root_agent, session_service=ss)
+
+  events = []
+  async for event in runner._run_node_async(
+      user_id='u',
+      session_id=session.id,
+      invocation_id='inv-1',
+      new_message=resume_msg,
+      node=sub_agent_2,
+  ):
+    events.append(event)
+
+  outputs = [e.output for e in events if e.output is not None]
+  assert 'ok' in outputs

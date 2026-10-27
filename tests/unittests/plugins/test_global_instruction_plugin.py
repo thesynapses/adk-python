@@ -206,3 +206,105 @@ async def test_global_instruction_plugin_prepends_to_list():
 
   expected = ["Global instruction.", "Existing instruction."]
   assert llm_request.config.system_instruction == expected
+
+
+@pytest.mark.asyncio
+async def test_global_instruction_plugin_prepends_to_content():
+  """A Content instruction keeps its parts instead of being flattened."""
+  plugin = GlobalInstructionPlugin(global_instruction="Global instruction.")
+
+  mock_session = Session(
+      app_name="test_app", user_id="test_user", id="test_session", state={}
+  )
+
+  mock_invocation_context = Mock(spec=InvocationContext)
+  mock_invocation_context.session = mock_session
+
+  mock_callback_context = Mock(spec=CallbackContext)
+  mock_callback_context._invocation_context = mock_invocation_context
+
+  llm_request = LlmRequest(
+      model="gemini-2.5-flash",
+      config=types.GenerateContentConfig(
+          system_instruction=types.Content(
+              parts=[types.Part.from_text(text="Existing instruction.")]
+          )
+      ),
+  )
+
+  await plugin.before_model_callback(
+      callback_context=mock_callback_context, llm_request=llm_request
+  )
+
+  result = llm_request.config.system_instruction
+  assert isinstance(result, types.Content)
+  assert [part.text for part in result.parts] == [
+      "Global instruction.",
+      "Existing instruction.",
+  ]
+
+
+def _callback_context() -> CallbackContext:
+  mock_invocation_context = Mock(spec=InvocationContext)
+  mock_invocation_context.session = Session(
+      app_name="test_app", user_id="test_user", id="test_session", state={}
+  )
+  mock_callback_context = Mock(spec=CallbackContext)
+  mock_callback_context._invocation_context = mock_invocation_context
+  return mock_callback_context
+
+
+@pytest.mark.asyncio
+async def test_global_instruction_plugin_fills_content_with_none_parts():
+  """A system_instruction Content with parts=None gets the global part."""
+  plugin = GlobalInstructionPlugin(global_instruction="Global instruction.")
+  llm_request = LlmRequest(
+      model="gemini-2.5-flash",
+      config=types.GenerateContentConfig(
+          system_instruction=types.Content(parts=None)
+      ),
+  )
+
+  await plugin.before_model_callback(
+      callback_context=_callback_context(), llm_request=llm_request
+  )
+
+  assert [p.text for p in llm_request.config.system_instruction.parts] == [
+      "Global instruction."
+  ]
+
+
+@pytest.mark.asyncio
+async def test_global_instruction_plugin_prepends_to_single_part():
+  """A single-Part system_instruction becomes [global, part]."""
+  plugin = GlobalInstructionPlugin(global_instruction="Global instruction.")
+  existing_part = types.Part.from_text(text="Part instruction.")
+  llm_request = LlmRequest(
+      model="gemini-2.5-flash",
+      config=types.GenerateContentConfig(system_instruction=existing_part),
+  )
+
+  await plugin.before_model_callback(
+      callback_context=_callback_context(), llm_request=llm_request
+  )
+
+  assert llm_request.config.system_instruction == [
+      "Global instruction.",
+      existing_part,
+  ]
+
+
+@pytest.mark.asyncio
+async def test_global_instruction_plugin_skips_when_provider_returns_empty():
+  """An instruction provider returning '' leaves the instruction untouched."""
+  plugin = GlobalInstructionPlugin(global_instruction=lambda ctx: "")
+  llm_request = LlmRequest(
+      model="gemini-2.5-flash",
+      config=types.GenerateContentConfig(system_instruction="Keep me."),
+  )
+
+  await plugin.before_model_callback(
+      callback_context=_callback_context(), llm_request=llm_request
+  )
+
+  assert llm_request.config.system_instruction == "Keep me."

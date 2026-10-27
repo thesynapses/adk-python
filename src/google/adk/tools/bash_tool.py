@@ -18,14 +18,17 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import importlib
 import logging
 import os
 import pathlib
-import resource
 import shlex
 import signal
 from typing import Any
+from typing import Callable
+from typing import cast
 from typing import Optional
+from typing import Protocol
 
 from google.genai import types
 
@@ -35,12 +38,40 @@ from .tool_context import ToolContext
 logger = logging.getLogger("google_adk." + __name__)
 
 
+class _ResourceModule(Protocol):
+  RLIMIT_CORE: int
+  RLIMIT_AS: int
+  RLIMIT_FSIZE: int
+  RLIMIT_NPROC: int
+
+  def setrlimit(self, resource: int, limits: tuple[int, int]) -> None:
+    ...
+
+
+def _load_resource_module() -> Optional[_ResourceModule]:
+  try:
+    module = importlib.import_module("resource")
+  except ModuleNotFoundError:
+    return None
+  return cast(_ResourceModule, module)
+
+
+_resource = _load_resource_module()
+
+
 @dataclasses.dataclass(frozen=True)
 class BashToolPolicy:
   """Configuration for allowed bash commands and resource limits.
 
   Set allowed_command_prefixes to ("*",) to allow all commands (default),
   or explicitly list allowed prefixes.
+
+  Entries are matched on whole shell tokens, so ("ls",) permits `ls -la` but
+  not `lsof`, `./ls` or `/bin/ls`. Use ("/bin/ls",) to permit exactly that
+  path, and ("git status",) to permit only that subcommand. Commands run
+  without a shell, so operators such as `|`, `;` and `$(` reach the program
+  as literal arguments; list them in `blocked_operators` (empty by default)
+  to reject them outright.
 
   Values for max_memory_bytes, max_file_size_bytes, and max_child_processes
   will be enforced upon the spawned subprocess.
@@ -52,6 +83,17 @@ class BashToolPolicy:
   max_memory_bytes: Optional[int] = None
   max_file_size_bytes: Optional[int] = None
   max_child_processes: Optional[int] = None
+
+  def __post_init__(self) -> None:
+    for prefix in self.allowed_command_prefixes:
+      try:
+        shlex.split(prefix)
+      except ValueError as e:
+        logger.warning(
+            "Ignoring unparsable allowed_command_prefixes entry %r: %s",
+            prefix,
+            e,
+        )
 
 
 def _validate_command(command: str, policy: BashToolPolicy) -> Optional[str]:
@@ -67,35 +109,64 @@ def _validate_command(command: str, policy: BashToolPolicy) -> Optional[str]:
   if "*" in policy.allowed_command_prefixes:
     return None
 
+  # Prefix match (`ls` -> `lsof`) is bypassable, and matching only the
+  # basename would accept a planted `./ls`. Parse both sides the same way and
+  # compare whole tokens, which also keeps a path entry meaningful.
+  try:
+    argv = shlex.split(stripped)
+  except ValueError:
+    return "Unable to parse command."
+  if not argv:
+    return "Command is required."
+
   for prefix in policy.allowed_command_prefixes:
-    if stripped.startswith(prefix):
+    try:
+      prefix_argv = shlex.split(prefix)
+    except ValueError:
+      continue
+    if prefix_argv and argv[: len(prefix_argv)] == prefix_argv:
       return None
 
-  allowed = ", ".join(policy.allowed_command_prefixes)
+  allowed = ", ".join(policy.allowed_command_prefixes) or "<none>"
   return f"Command blocked. Permitted prefixes are: {allowed}"
 
 
 def _set_resource_limits(policy: BashToolPolicy) -> None:
   """Sets resource limits for the subprocess based on the provided policy."""
+  if _resource is None:
+    return
   try:
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    _resource.setrlimit(_resource.RLIMIT_CORE, (0, 0))
     if policy.max_memory_bytes:
-      resource.setrlimit(
-          resource.RLIMIT_AS,
+      _resource.setrlimit(
+          _resource.RLIMIT_AS,
           (policy.max_memory_bytes, policy.max_memory_bytes),
       )
     if policy.max_file_size_bytes:
-      resource.setrlimit(
-          resource.RLIMIT_FSIZE,
+      _resource.setrlimit(
+          _resource.RLIMIT_FSIZE,
           (policy.max_file_size_bytes, policy.max_file_size_bytes),
       )
     if policy.max_child_processes:
-      resource.setrlimit(
-          resource.RLIMIT_NPROC,
+      _resource.setrlimit(
+          _resource.RLIMIT_NPROC,
           (policy.max_child_processes, policy.max_child_processes),
       )
   except (ValueError, OSError) as e:
     logger.warning("Failed to set resource limits: %s", e)
+
+
+def _kill_process_group(process: asyncio.subprocess.Process) -> None:
+  """Kills the subprocess group on POSIX and the process elsewhere."""
+  if process.pid is None:
+    return
+  killpg_candidate: object = getattr(os, "killpg", None)
+  sigkill: object = getattr(signal, "SIGKILL", None)
+  if callable(killpg_candidate) and isinstance(sigkill, int):
+    killpg = cast(Callable[[int, int], None], killpg_candidate)
+    killpg(process.pid, sigkill)
+  else:
+    process.kill()
 
 
 class ExecuteBashTool(BaseTool):
@@ -115,7 +186,7 @@ class ExecuteBashTool(BaseTool):
         if "*" in policy.allowed_command_prefixes
         else (
             "commands matching prefixes:"
-            f" {', '.join(policy.allowed_command_prefixes)}"
+            f" {', '.join(policy.allowed_command_prefixes) or '<none>'}"
         )
     )
     super().__init__(
@@ -149,7 +220,7 @@ class ExecuteBashTool(BaseTool):
       self, *, args: dict[str, Any], tool_context: ToolContext
   ) -> Any:
     command = args.get("command")
-    if not command:
+    if not isinstance(command, str) or not command:
       return {"error": "Command is required."}
 
     # Static validation.
@@ -171,6 +242,9 @@ class ExecuteBashTool(BaseTool):
     elif not tool_context.tool_confirmation.confirmed:
       return {"error": "This tool call is rejected."}
 
+    if os.name != "posix":
+      return {"error": "ExecuteBashTool is only supported on POSIX systems."}
+
     stdout = None
     stderr = None
     try:
@@ -190,7 +264,7 @@ class ExecuteBashTool(BaseTool):
       except asyncio.TimeoutError:
         try:
           if process.pid:
-            os.killpg(process.pid, signal.SIGKILL)
+            _kill_process_group(process)
         except ProcessLookupError:
           pass
         stdout, stderr = await process.communicate()
@@ -214,7 +288,7 @@ class ExecuteBashTool(BaseTool):
       finally:
         try:
           if process.pid:
-            os.killpg(process.pid, signal.SIGKILL)
+            _kill_process_group(process)
         except ProcessLookupError:
           pass
       return {

@@ -31,7 +31,6 @@ from ...utils.feature_decorator import experimental
 from .._retry_options_utils import add_default_retry_options_if_not_present
 from ..eval_case import ConversationScenario
 from ..eval_case import Invocation
-from ..eval_metrics import BaseCriterion
 from ..eval_metrics import EvalMetric
 from ..eval_metrics import EvalStatus
 from ..eval_metrics import LlmBackedUserSimulatorCriterion
@@ -39,6 +38,7 @@ from ..evaluator import EvaluationResult
 from ..evaluator import Evaluator
 from ..evaluator import PerInvocationResult
 from ..llm_as_judge import AutoRaterScore
+from ..llm_as_judge_utils import build_judge_request_config
 from ..llm_as_judge_utils import get_eval_status
 from ..llm_as_judge_utils import get_text_from_content
 from ..llm_as_judge_utils import Label
@@ -134,10 +134,18 @@ class PerTurnUserSimulatorQualityV1(Evaluator):
     self._criterion = self._deserialize_criterion(eval_metric)
 
     self._llm_options = self._criterion.judge_model_options
+    # Force AFC off on judge requests so google-genai does not log a
+    # per-request warning when the judge sends no tools; see
+    # build_judge_request_config.
+    self._llm_config = build_judge_request_config(
+        self._llm_options.judge_model_config
+    )
     self._stop_signal = self._criterion.stop_signal
     self._llm = self._setup_llm()
 
-  def _deserialize_criterion(self, eval_metric: EvalMetric) -> BaseCriterion:
+  def _deserialize_criterion(
+      self, eval_metric: EvalMetric
+  ) -> LlmBackedUserSimulatorCriterion:
     expected_criterion_type_error = ValueError(
         f"`{eval_metric.metric_name}` metric expects a criterion of type"
         f" `{self.criterion_type}`."
@@ -226,7 +234,9 @@ class PerTurnUserSimulatorQualityV1(Evaluator):
     return get_per_turn_user_simulator_quality_prompt(
         conversation_plan=conversation_scenario.conversation_plan,
         conversation_history=_format_conversation_history(previous_invocations),
-        generated_user_response=get_text_from_content(invocation.user_content),
+        generated_user_response=(
+            get_text_from_content(invocation.user_content) or ""
+        ),
         stop_signal=self._stop_signal,
         user_persona=conversation_scenario.user_persona,
     )
@@ -268,10 +278,10 @@ class PerTurnUserSimulatorQualityV1(Evaluator):
       self, per_invocation_results: list[PerInvocationResult]
   ) -> EvaluationResult:
     """Computes the fraction of results that resulted in a pass status."""
-    num_valid = 0
+    num_valid = 0.0
     num_evaluated = 0
     for result in per_invocation_results:
-      if result.eval_status == EvalStatus.PASSED:
+      if result.eval_status == EvalStatus.PASSED and result.score is not None:
         num_valid += result.score
 
       num_evaluated += 1
@@ -302,21 +312,27 @@ class PerTurnUserSimulatorQualityV1(Evaluator):
           eval_status=EvalStatus.NOT_EVALUATED,
       )
 
+    user_text = get_text_from_content(first_invocation.user_content)
+    if user_text is None:
+      return PerInvocationResult(
+          actual_invocation=first_invocation,
+          eval_status=EvalStatus.NOT_EVALUATED,
+      )
+
     score = int(
-        get_text_from_content(first_invocation.user_content).strip()
-        == conversation_scenario.starting_prompt.strip()
+        user_text.strip() == conversation_scenario.starting_prompt.strip()
     )
     return PerInvocationResult(
         actual_invocation=first_invocation,
         score=score,
-        eval_status=get_eval_status(score, self._eval_metric.threshold),
+        eval_status=get_eval_status(score, self._criterion.threshold),
     )
 
   async def _evaluate_intermediate_turn(
       self,
       invocation_at_step: Invocation,
       invocation_history: list[Invocation],
-      conversation_scenario: Optional[ConversationScenario],
+      conversation_scenario: ConversationScenario,
   ) -> PerInvocationResult:
 
     auto_rater_prompt = self._format_llm_prompt(
@@ -325,10 +341,6 @@ class PerTurnUserSimulatorQualityV1(Evaluator):
         previous_invocations=invocation_history,
     )
 
-    config = (
-        self._llm_options.judge_model_config
-        or genai_types.GenerateContentConfig()
-    )
     llm_request = LlmRequest(
         model=self._llm_options.judge_model,
         contents=[
@@ -337,7 +349,7 @@ class PerTurnUserSimulatorQualityV1(Evaluator):
                 role="user",
             )
         ],
-        config=config,
+        config=self._llm_config,
     )
     add_default_retry_options_if_not_present(llm_request)
     num_samples = self._llm_options.num_samples
@@ -347,7 +359,7 @@ class PerTurnUserSimulatorQualityV1(Evaluator):
       samples.append(
           PerInvocationResult(
               eval_status=get_eval_status(
-                  llm_score.score, self._eval_metric.threshold
+                  llm_score.score, self._criterion.threshold
               ),
               score=llm_score.score,
               actual_invocation=invocation_at_step,
@@ -377,3 +389,4 @@ class PerTurnUserSimulatorQualityV1(Evaluator):
       async for llm_response in agen:
         # Non-streaming call, so there is only one response content.
         return self._convert_llm_response_to_score(llm_response)
+    return AutoRaterScore()

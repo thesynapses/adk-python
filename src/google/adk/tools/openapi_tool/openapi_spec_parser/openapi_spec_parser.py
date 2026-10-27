@@ -28,6 +28,7 @@ from ....auth.auth_credential import AuthCredential
 from ....auth.auth_schemes import AuthScheme
 from ..._gemini_schema_util import _to_snake_case
 from ..common.common import ApiParameter
+from .operation_parser import _required_scheme_name
 from .operation_parser import OperationParser
 
 # Valid JSON Schema types as per OpenAPI 3.0/3.1 specification.
@@ -181,12 +182,8 @@ class OpenApiSpecParser:
     if openapi_spec.get("servers"):
       base_url = openapi_spec["servers"][0].get("url", "")
 
-    # Get global security scheme (if any)
-    global_scheme_name = None
-    if openapi_spec.get("security"):
-      # Use first scheme by default.
-      scheme_names = list(openapi_spec["security"][0].keys())
-      global_scheme_name = scheme_names[0] if scheme_names else None
+    # Get global security scheme (if any).
+    global_scheme_name = _required_scheme_name(openapi_spec.get("security"))
 
     auth_schemes = openapi_spec.get("components", {}).get("securitySchemes", {})
 
@@ -208,10 +205,21 @@ class OpenApiSpecParser:
         if operation_dict is None:
           continue
 
-        # Append path-level parameters
-        operation_dict["parameters"] = operation_dict.get(
-            "parameters", []
-        ) + path_item.get("parameters", [])
+        # Append path-level parameters. An operation-level parameter with the
+        # same name and location overrides the path-level one, so appending
+        # both would ask the model for the same value twice.
+        operation_parameters = operation_dict.get("parameters", [])
+        overridden = {
+            (parameter["name"], parameter.get("in"))
+            for parameter in operation_parameters
+            if isinstance(parameter, dict) and "name" in parameter
+        }
+        operation_dict["parameters"] = operation_parameters + [
+            parameter
+            for parameter in path_item.get("parameters", [])
+            if not isinstance(parameter, dict)
+            or (parameter.get("name"), parameter.get("in")) not in overridden
+        ]
 
         # If operation ID is missing, assign an operation id based on path
         # and method
@@ -226,11 +234,12 @@ class OpenApiSpecParser:
             preserve_property_names=self._preserve_property_names,
         )
 
-        # Check for operation-specific auth scheme
+        # Check for operation-specific auth scheme. An operation that declares
+        # security of its own overrides the global requirement, including when
+        # it declares that no auth is needed.
         auth_scheme_name = operation_parser.get_auth_scheme_name()
-        auth_scheme_name = (
-            auth_scheme_name if auth_scheme_name else global_scheme_name
-        )
+        if not auth_scheme_name and operation.security is None:
+          auth_scheme_name = global_scheme_name
         auth_scheme = (
             auth_schemes.get(auth_scheme_name) if auth_scheme_name else None
         )

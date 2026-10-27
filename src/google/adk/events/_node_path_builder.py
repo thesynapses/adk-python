@@ -56,6 +56,15 @@ class _NodePathBuilder:
     return self._segments[-1].rsplit('@', 1)[0]
 
   @property
+  def static_path(self) -> str:
+    """Returns the path with run ids stripped from every segment.
+
+    Example: ``'wf@1/node@2'`` -> ``'wf/node'``. Useful for comparing a node's
+    position in the tree across runs, where the run ids differ.
+    """
+    return '/'.join(segment.rsplit('@', 1)[0] for segment in self._segments)
+
+  @property
   def leaf_segment(self) -> str:
     """Returns the full leaf segment."""
     if not self._segments:
@@ -97,6 +106,13 @@ class _NodePathBuilder:
     if len(self._segments) != len(parent._segments) + 1:
       return False
     return self._segments[:-1] == parent._segments
+
+  def includes_node_path(self, node_path: str | None) -> bool:
+    """Checks if an event's ``node_path`` is empty, equals self, or is in self's subtree."""
+    if not node_path:
+      return True
+    path = _NodePathBuilder.from_string(node_path)
+    return path == self or path.is_descendant_of(self)
 
   def get_direct_child(self, descendant: _NodePathBuilder) -> _NodePathBuilder:  # pylint: disable=protected-access
     """Returns a new _NodePathBuilder for the direct child towards the descendant."""

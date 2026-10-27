@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import functools
+import logging
 from typing import Any
 from typing import Optional
 
@@ -22,10 +24,13 @@ from a2a.server.agent_execution import RequestContext
 from google.genai import types as genai_types
 from pydantic import BaseModel
 
-from ...runners import RunConfig
+from .. import _compat
+from ...agents.run_config import RunConfig
 from ..experimental import a2a_experimental
 from .part_converter import A2APartToGenAIPartConverter
 from .part_converter import convert_a2a_part_to_genai_part
+
+logger = logging.getLogger('google_adk.' + __name__)
 
 A2A_METADATA_KEY = 'a2a_metadata'
 
@@ -64,16 +69,31 @@ Returns:
 
 
 def _get_user_id(request: RequestContext) -> str:
-  # Get user from call context if available (auth is enabled on a2a server)
-  if (
-      request.call_context
-      and request.call_context.user
-      and request.call_context.user.user_name
-  ):
-    return request.call_context.user.user_name
+  """Returns the ADK user id to run this request as.
 
-  # Get user from context id
+  The user id scopes the session, ``user:``-prefixed state, artifacts and
+  memory, so it is taken only from a principal the A2A server authenticated.
+  The name on an unauthenticated principal is a claim the caller made rather
+  than one the server checked, so it is ignored and the conversation is used as
+  an anonymous identity instead.
+  """
+  user = request.call_context.user if request.call_context else None
+  if user and user.user_name:
+    if user.is_authenticated:
+      return user.user_name
+    _warn_unauthenticated_user_name_once()
+
   return f'A2A_USER_{request.context_id}'
+
+
+@functools.lru_cache(maxsize=1)
+def _warn_unauthenticated_user_name_once() -> None:
+  logger.warning(
+      'Ignoring the user name of an unauthenticated A2A caller. Requests'
+      ' without an authenticated user run as A2A_USER_<context_id>, so'
+      ' sessions, state, artifacts and memory stored under an unverified name'
+      ' are no longer used.'
+  )
 
 
 @a2a_experimental
@@ -98,8 +118,9 @@ def convert_a2a_request_to_agent_run_request(
     raise ValueError('Request message cannot be None')
 
   custom_metadata = {}
-  if request.metadata:
-    custom_metadata[A2A_METADATA_KEY] = request.metadata
+  request_metadata = _compat.meta_to_dict(request.metadata)
+  if request_metadata:
+    custom_metadata[A2A_METADATA_KEY] = request_metadata
 
   output_parts = []
   for a2a_part in request.message.parts:

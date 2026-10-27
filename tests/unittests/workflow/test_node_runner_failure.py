@@ -15,22 +15,27 @@
 """Tests for NodeRunner retry logic on failures."""
 
 import asyncio
-import sys
 from typing import Any
 from typing import AsyncGenerator
 from unittest import mock
 
+from google.adk import platform as adk_platform
+from google.adk.agents.base_agent import BaseAgent
 from google.adk.agents.context import Context
+from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events.event import Event
-from google.adk.runners import Runner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from google.adk.sessions.session import Session
 from google.adk.workflow import BaseNode
 from google.adk.workflow import Edge
+from google.adk.workflow import FunctionNode
 from google.adk.workflow import START
+from google.adk.workflow._errors import DynamicNodeFailError
 from google.adk.workflow._errors import NodeTimeoutError
 from google.adk.workflow._graph import Graph
-from google.adk.workflow._node import node
 from google.adk.workflow._node import Node
+from google.adk.workflow._node import node
+from google.adk.workflow._node_runner import NodeRunner
 from google.adk.workflow._node_status import NodeStatus
 from google.adk.workflow._retry_config import RetryConfig
 from google.adk.workflow._workflow import Workflow
@@ -41,25 +46,12 @@ import pytest
 from typing_extensions import override
 
 from .workflow_testing_utils import _FlakyNode
-from .workflow_testing_utils import create_parent_invocation_context
+from .workflow_testing_utils import create_runner
 from .workflow_testing_utils import CustomNonRetryableError
 from .workflow_testing_utils import CustomRetryableError
+from .workflow_testing_utils import run_workflow as _run_workflow
 from .workflow_testing_utils import simplify_events_with_node
 from .workflow_testing_utils import TestingNode
-
-
-async def _run_workflow(wf, message='start'):
-  """Run a Workflow through Runner, return collected events."""
-  ss = InMemorySessionService()
-  runner = Runner(app_name=wf.name, node=wf, session_service=ss)
-  session = await ss.create_session(app_name=wf.name, user_id='u')
-  msg = types.Content(parts=[types.Part(text=message)], role='user')
-  events = []
-  async for event in runner.run_async(
-      user_id='u', session_id=session.id, new_message=msg
-  ):
-    events.append(event)
-  return events, ss, session
 
 
 @pytest.mark.asyncio
@@ -163,7 +155,7 @@ async def test_node_fails_immediately_on_unmatched_exception_string(
   )
 
   ss = InMemorySessionService()
-  runner = Runner(app_name=agent.name, node=agent, session_service=ss)
+  runner = create_runner(app_name=agent.name, node=agent, session_service=ss)
   session = await ss.create_session(app_name=agent.name, user_id='u')
   msg = types.Content(parts=[types.Part(text='start')], role='user')
   events = []
@@ -357,7 +349,7 @@ async def test_node_stops_retrying_after_max_attempts(
   )
 
   ss = InMemorySessionService()
-  runner = Runner(app_name=agent.name, node=agent, session_service=ss)
+  runner = create_runner(app_name=agent.name, node=agent, session_service=ss)
   session = await ss.create_session(app_name=agent.name, user_id='u')
   msg = types.Content(parts=[types.Part(text='start')], role='user')
   events = []
@@ -428,7 +420,7 @@ async def test_node_fails_immediately_without_retry_config(
   )
 
   ss = InMemorySessionService()
-  runner = Runner(app_name=agent.name, node=agent, session_service=ss)
+  runner = create_runner(app_name=agent.name, node=agent, session_service=ss)
   session = await ss.create_session(app_name=agent.name, user_id='u')
   msg = types.Content(parts=[types.Part(text='start')], role='user')
   events = []
@@ -556,7 +548,7 @@ async def test_node_waits_for_initial_delay_before_retry(
   )
 
   ss = InMemorySessionService()
-  runner = Runner(app_name=agent.name, node=agent, session_service=ss)
+  runner = create_runner(app_name=agent.name, node=agent, session_service=ss)
   session = await ss.create_session(app_name=agent.name, user_id='u')
   msg = types.Content(parts=[types.Part(text='start')], role='user')
 
@@ -632,7 +624,7 @@ async def test_retry_applies_backoff_strategy(request: pytest.FixtureRequest):
   )
 
   ss = InMemorySessionService()
-  runner = Runner(app_name=agent.name, node=agent, session_service=ss)
+  runner = create_runner(app_name=agent.name, node=agent, session_service=ss)
   session = await ss.create_session(app_name=agent.name, user_id='u')
   msg = types.Content(parts=[types.Part(text='start')], role='user')
 
@@ -711,24 +703,27 @@ async def test_retry_applies_random_jitter(request: pytest.FixtureRequest):
   )
 
   ss = InMemorySessionService()
-  runner = Runner(app_name=agent.name, node=agent, session_service=ss)
+  runner = create_runner(app_name=agent.name, node=agent, session_service=ss)
   session = await ss.create_session(app_name=agent.name, user_id='u')
   msg = types.Content(parts=[types.Part(text='start')], role='user')
 
-  with (
-      mock.patch('asyncio.sleep', new_callable=mock.AsyncMock) as mock_sleep,
-      mock.patch('random.uniform', return_value=-1.0) as mock_random,
-  ):
-    events = []
-    async for event in runner.run_async(
-        user_id='u', session_id=session.id, new_message=msg
-    ):
-      events.append(event)
+  mock_random = mock.Mock()
+  mock_random.uniform = mock.Mock(return_value=-1.0)
+  adk_platform.set_random_provider(lambda: mock_random)
+  try:
+    with mock.patch('asyncio.sleep', new_callable=mock.AsyncMock) as mock_sleep:
+      events = []
+      async for event in runner.run_async(
+          user_id='u', session_id=session.id, new_message=msg
+      ):
+        events.append(event)
 
-    # 4.0 + (-1.0) = 3.0
-    mock_sleep.assert_any_await(3.0)
-    # Called with -0.5 * 4.0, 0.5 * 4.0
-    mock_random.assert_called_once_with(-2.0, 2.0)
+      # 4.0 + (-1.0) = 3.0
+      mock_sleep.assert_any_await(3.0)
+      # Called with -0.5 * 4.0, 0.5 * 4.0
+      mock_random.uniform.assert_called_once_with(-2.0, 2.0)
+  finally:
+    adk_platform.reset_random_provider()
 
   results = simplify_events_with_node(events)
   filtered_results = [
@@ -916,7 +911,7 @@ async def test_node_fails_immediately_on_unmatched_exception_class(
   )
 
   ss = InMemorySessionService()
-  runner = Runner(app_name=agent.name, node=agent, session_service=ss)
+  runner = create_runner(app_name=agent.name, node=agent, session_service=ss)
   session = await ss.create_session(app_name=agent.name, user_id='u')
   msg = types.Content(parts=[types.Part(text='start')], role='user')
   events = []
@@ -985,7 +980,7 @@ async def test_error_event_emitted_on_failure(
   )
 
   ss = InMemorySessionService()
-  runner = Runner(app_name=agent.name, node=agent, session_service=ss)
+  runner = create_runner(app_name=agent.name, node=agent, session_service=ss)
   session = await ss.create_session(app_name=agent.name, user_id='u')
   msg = types.Content(parts=[types.Part(text='start')], role='user')
   events = []
@@ -1037,7 +1032,7 @@ async def test_error_event_emitted_on_each_retry(
   )
 
   ss = InMemorySessionService()
-  runner = Runner(app_name=agent.name, node=agent, session_service=ss)
+  runner = create_runner(app_name=agent.name, node=agent, session_service=ss)
   session = await ss.create_session(app_name=agent.name, user_id='u')
   msg = types.Content(parts=[types.Part(text='start')], role='user')
   events = []
@@ -1076,9 +1071,7 @@ async def test_error_event_emitted_on_each_retry(
   ]
 
 
-@pytest.mark.skipif(
-    sys.version_info < (3, 11), reason='asyncio.timeout requires Python 3.11+'
-)
+@pytest.mark.asyncio
 async def test_node_runner_timeout():
   async def slow_route(ctx, node_input):
     await asyncio.sleep(2)
@@ -1098,24 +1091,334 @@ async def test_node_runner_timeout():
   assert 'timed out' in str(exc_info.value)
 
 
-@pytest.mark.skip(
-    reason='Timeout is now supported in Python 3.10 via asyncio.wait_for',
-)
-async def test_node_runner_timeout_warning(caplog):
-  async def slow_route(ctx, node_input):
-    await asyncio.sleep(0.5)
-    return 'done'
+@pytest.mark.asyncio
+async def test_node_runner_prefers_api_status_for_error_code():
+  """NodeRunner uses the exception's canonical `.status` string as the error code.
 
-  node = TestingNode(name='SlowNode', route=slow_route, timeout=0.1)
+  A genai/Gatekeeper failure carries `.status` (e.g. "PERMISSION_DENIED") and
+  the human-readable message in `str(e)`; both should reach the emitted event.
+  """
 
-  agent = Workflow(
-      name='test_timeout_warning',
-      edges=[(START, node)],
+  class ClientError(Exception):
+
+    def __init__(self):
+      self.status = 'PERMISSION_DENIED'
+      self.code = 403
+      super().__init__(
+          '403 PERMISSION_DENIED. Egress request is not authorized'
+      )
+
+  async def failing_route(ctx, node_input):
+    raise ClientError()
+
+  err_node = TestingNode(name='ErrNode', route=failing_route)
+  enqueued: list[Event] = []
+
+  async def _capture(event):
+    enqueued.append(event)
+
+  ic = InvocationContext(
+      invocation_id='status_inv',
+      agent=mock.MagicMock(spec=BaseAgent),
+      session=Session(
+          id='test_session', app_name='test_app', user_id='test_user'
+      ),
+      session_service=InMemorySessionService(),
   )
+  object.__setattr__(ic, '_enqueue_event', mock.AsyncMock(side_effect=_capture))
+  parent_ctx = Context(invocation_context=ic, node_path='')
 
-  await _run_workflow(agent)
+  ctx = await NodeRunner(node=err_node, parent_ctx=parent_ctx).run()
 
+  assert isinstance(ctx.error, ClientError)
+  error_events = [e for e in enqueued if e.error_code]
+  assert error_events, 'expected an error event to be enqueued'
+  assert error_events[0].error_code == 'PERMISSION_DENIED'
+  assert 'Egress request is not authorized' in error_events[0].error_message
+
+
+@pytest.mark.asyncio
+async def test_node_runner_falls_back_to_class_name_without_status():
+  """Without a string `.status`, the error code is the exception class name."""
+
+  async def failing_route(ctx, node_input):
+    raise ValueError('boom')
+
+  err_node = TestingNode(name='ErrNode', route=failing_route)
+  enqueued: list[Event] = []
+
+  async def _capture(event):
+    enqueued.append(event)
+
+  ic = InvocationContext(
+      invocation_id='fallback_inv',
+      agent=mock.MagicMock(spec=BaseAgent),
+      session=Session(
+          id='test_session', app_name='test_app', user_id='test_user'
+      ),
+      session_service=InMemorySessionService(),
+  )
+  object.__setattr__(ic, '_enqueue_event', mock.AsyncMock(side_effect=_capture))
+  parent_ctx = Context(invocation_context=ic, node_path='')
+
+  await NodeRunner(node=err_node, parent_ctx=parent_ctx).run()
+
+  error_events = [e for e in enqueued if e.error_code]
+  assert error_events, 'expected an error event to be enqueued'
+  assert error_events[0].error_code == 'ValueError'
+
+
+def test_dynamic_node_fail_error_surfaces_wrapped_error_attrs():
+  """DynamicNodeFailError reads status/details off the wrapped error generically."""
+
+  # genai client exposes `.code` (not `.status_code`) and `.details`.
+  class GenaiClientError(Exception):
+
+    def __init__(self):
+      self.code = 403
+      self.details = 'Egress request is not authorized'
+      super().__init__('403 PERMISSION_DENIED')
+
+  genai_err = GenaiClientError()
+  dynamic_err = DynamicNodeFailError(
+      message='Dynamic node ChildNode failed',
+      error=genai_err,
+      error_node_path='parent/ChildNode',
+  )
+  assert dynamic_err.status_code == 403  # via `.code` fallback
+  assert dynamic_err.details == 'Egress request is not authorized'
+  assert dynamic_err.error is genai_err
+  # `.cause` was removed; Python's own `__cause__` chaining covers it.
+  assert not hasattr(dynamic_err, 'cause')
+
+  # Raw httpx-style error: body lives on `.response.text`.
+  class HttpxError(Exception):
+
+    def __init__(self):
+      self.status_code = 403
+
+      class _Resp:
+        text = 'forbidden body'
+
+      self.response = _Resp()
+      super().__init__('403 Forbidden')
+
+  httpx_err = HttpxError()
+  dynamic_err2 = DynamicNodeFailError(
+      message='x', error=httpx_err, error_node_path='p'
+  )
+  assert dynamic_err2.status_code == 403
   assert (
-      'timeout 0.10 seconds is ignored because Python version is < 3.11'
-      in caplog.text
+      dynamic_err2.details == 'forbidden body'
+  )  # via `.response.text` fallback
+
+
+@pytest.mark.asyncio
+async def test_parent_node_retries_on_dynamic_child_failure():
+  """A parent node with retry_config retries when a dynamic child node fails.
+
+  Earlier completed dynamic children under the parent are replayed from cache
+  without re-running, while the failing dynamic child is retried.
+  """
+  completed_runs = 0
+  flaky_runs = 0
+
+  @node
+  async def completed_child(ctx: Context):
+    nonlocal completed_runs
+    completed_runs += 1
+    return 'step1_ok'
+
+  @node
+  async def flaky_child(ctx: Context):
+    nonlocal flaky_runs
+    flaky_runs += 1
+    if flaky_runs < 3:
+      raise CustomRetryableError('Dynamic child failed')
+    return 'step2_recovered'
+
+  @node(
+      rerun_on_resume=True,
+      retry_config=RetryConfig(
+          max_attempts=3,
+          initial_delay=0.0,
+          jitter=0.0,
+          exceptions=[CustomRetryableError],
+      ),
   )
+  async def parent_node(ctx: Context):
+    r1 = await ctx.run_node(completed_child)
+    r2 = await ctx.run_node(flaky_child)
+    return f'{r1}:{r2}'
+
+  wf = Workflow(name='wf', edges=[(START, parent_node)])
+  events, _, _ = await _run_workflow(wf)
+
+  assert completed_runs == 1
+  assert flaky_runs == 3
+  outputs = [e.output for e in events if e.output is not None]
+  assert 'step1_ok:step2_recovered' in outputs
+
+
+@pytest.mark.asyncio
+async def test_parent_node_retries_on_dynamic_sub_workflow_failure():
+  """A parent node with retry_config retries when a dynamic Workflow child fails.
+
+  Completed nodes inside the dynamic sub-workflow are fast-forwarded from
+  session events while the failing child inside the sub-workflow re-executes.
+  """
+  inner_completed_runs = 0
+  inner_flaky_runs = 0
+
+  @node
+  async def inner_ok(ctx: Context):
+    nonlocal inner_completed_runs
+    inner_completed_runs += 1
+    return 'inner_ok'
+
+  @node
+  async def inner_flaky(ctx: Context, node_input: Any):
+    nonlocal inner_flaky_runs
+    inner_flaky_runs += 1
+    if inner_flaky_runs < 3:
+      raise CustomRetryableError('Inner sub-workflow node failed')
+    return f'{node_input}+inner_recovered'
+
+  sub_wf = Workflow(
+      name='sub_wf',
+      edges=[(START, inner_ok, inner_flaky)],
+  )
+
+  @node(
+      rerun_on_resume=True,
+      retry_config=RetryConfig(
+          max_attempts=3,
+          initial_delay=0.0,
+          jitter=0.0,
+          exceptions=[CustomRetryableError],
+      ),
+  )
+  async def parent_node(ctx: Context):
+    return await ctx.run_node(sub_wf)
+
+  wf = Workflow(name='wf', edges=[(START, parent_node)])
+  events, _, _ = await _run_workflow(wf)
+
+  assert inner_completed_runs == 1
+  assert inner_flaky_runs == 3
+  outputs = [e.output for e in events if e.output is not None]
+  assert 'inner_ok+inner_recovered' in outputs
+
+
+@pytest.mark.asyncio
+async def test_parent_node_plain_exception_retry_reruns_dynamic_children():
+  """A parent node retrying on its own exception re-runs its dynamic children."""
+  child_runs = 0
+  parent_runs = 0
+
+  @node
+  async def child_node(ctx: Context):
+    nonlocal child_runs
+    child_runs += 1
+    return f'child_run_{child_runs}'
+
+  @node(
+      rerun_on_resume=True,
+      retry_config=RetryConfig(
+          max_attempts=3,
+          initial_delay=0.0,
+          jitter=0.0,
+          exceptions=[CustomRetryableError],
+      ),
+  )
+  async def parent_node(ctx: Context):
+    nonlocal parent_runs
+    parent_runs += 1
+    res = await ctx.run_node(child_node)
+    if parent_runs < 3:
+      raise CustomRetryableError('Parent failed after child completed')
+    return res
+
+  wf = Workflow(name='wf', edges=[(START, parent_node)])
+  events, _, _ = await _run_workflow(wf)
+
+  assert parent_runs == 3
+  assert child_runs == 3
+  outputs = [e.output for e in events if e.output is not None]
+  assert 'child_run_3' in outputs
+
+
+@pytest.mark.asyncio
+async def test_parent_node_child_failure_retry_skips_rejected_child_result():
+  """A retry after a child failure does not replay a result the parent rejected.
+
+  Attempt 1 rejects the child's result by raising, attempt 2 fails inside the
+  child, and attempt 3 must run the child again instead of replaying the
+  result attempt 1 already rejected.
+  """
+  fetch_runs = 0
+
+  @node
+  async def fetch(ctx: Context):
+    nonlocal fetch_runs
+    fetch_runs += 1
+    if fetch_runs == 2:
+      raise CustomRetryableError('Fetch failed')
+    return f'fetch_{fetch_runs}'
+
+  @node(
+      rerun_on_resume=True,
+      retry_config=RetryConfig(
+          max_attempts=3,
+          initial_delay=0.0,
+          jitter=0.0,
+          exceptions=[CustomRetryableError],
+      ),
+  )
+  async def parent_node(ctx: Context):
+    res = await ctx.run_node(fetch)
+    if res == 'fetch_1':
+      raise CustomRetryableError('Parent rejected the first result')
+    return res
+
+  wf = Workflow(name='wf', edges=[(START, parent_node)])
+  events, _, _ = await _run_workflow(wf)
+
+  assert fetch_runs == 3
+  outputs = [e.output for e in events if e.output is not None]
+  assert 'fetch_3' in outputs
+
+
+@pytest.mark.asyncio
+async def test_dynamic_function_node_retry_gets_fresh_arguments():
+  """A retried dynamic FunctionNode does not see arguments mutated earlier."""
+  seen = []
+
+  def child(items: list[int]) -> int:
+    seen.append(list(items))
+    items.append(99)
+    if len(seen) == 1:
+      raise CustomRetryableError('Child failed after changing its input')
+    return len(items)
+
+  child_node = FunctionNode(
+      func=child,
+      parameter_binding='node_input',
+      retry_config=RetryConfig(
+          max_attempts=2,
+          initial_delay=0.0,
+          jitter=0.0,
+          exceptions=[CustomRetryableError],
+      ),
+  )
+
+  @node(rerun_on_resume=True)
+  async def parent_node(ctx: Context):
+    return await ctx.run_node(child_node, node_input={'items': [1, 2]})
+
+  wf = Workflow(name='wf', edges=[(START, parent_node)])
+  events, _, _ = await _run_workflow(wf)
+
+  assert seen == [[1, 2], [1, 2]]
+  outputs = [e.output for e in events if e.output is not None]
+  assert 3 in outputs

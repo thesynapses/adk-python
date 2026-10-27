@@ -182,7 +182,7 @@ def _get_field_details(
   path_parts = field_path.split(".")
   current = schema.get("properties", {})
 
-  result = {"field_path": field_path, "path_traversal": []}
+  result: Dict[str, Any] = {"field_path": field_path, "path_traversal": []}
 
   for i, part in enumerate(path_parts):
     if not isinstance(current, dict) or part not in current:
@@ -221,7 +221,7 @@ def _get_all_properties(schema: Dict[str, Any]) -> Dict[str, Any]:
   """Get a flat list of all properties in the schema."""
   properties = {}
 
-  def extract_properties(obj: Dict[str, Any], prefix: str = ""):
+  def extract_properties(obj: Dict[str, Any], prefix: str = "") -> None:
     if not isinstance(obj, dict):
       return
 

@@ -17,14 +17,16 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from google.genai import types
 from typing_extensions import override
 
 from . import _memory_entry_utils
+from ..utils import content_utils
 from .base_tool import BaseTool
 from .tool_context import ToolContext
 
 if TYPE_CHECKING:
-  from ..models import LlmRequest
+  from ..models.llm_request import LlmRequest
 
 logger = logging.getLogger('google_adk.' + __name__)
 
@@ -38,7 +40,7 @@ class PreloadMemoryTool(BaseTool):
   NOTE: Currently this tool only uses text part from the memory.
   """
 
-  def __init__(self):
+  def __init__(self) -> None:
     # Name and description are not used because this tool only
     # changes llm_request.
     super().__init__(name='preload_memory', description='preload_memory')
@@ -50,19 +52,20 @@ class PreloadMemoryTool(BaseTool):
       tool_context: ToolContext,
       llm_request: LlmRequest,
   ) -> None:
-    user_content = tool_context.user_content
-    if (
-        not user_content
-        or not user_content.parts
-        or not user_content.parts[0].text
-    ):
+    user_query = content_utils.extract_text_from_content(
+        tool_context.user_content, splitter=' '
+    )
+    if not user_query:
       return
 
-    user_query: str = user_content.parts[0].text
     try:
       response = await tool_context.search_memory(user_query)
     except Exception:
-      logging.warning('Failed to preload memory for query: %s', user_query)
+      logger.warning(
+          'Failed to preload memory (query length: %d)',
+          len(user_query),
+          exc_info=True,
+      )
       return
 
     if not response.memories:
@@ -80,13 +83,17 @@ class PreloadMemoryTool(BaseTool):
       return
 
     full_memory_text = '\n'.join(memory_text_lines)
-    si = f"""The following content is from your previous conversations with the user.
+    memory_context = f"""The following content is from your previous conversations with the user.
 They may be useful for answering the user's current query.
 <PAST_CONVERSATIONS>
 {full_memory_text}
 </PAST_CONVERSATIONS>
 """
-    llm_request.append_instructions([si])
+    llm_request._insert_transient_user_content([  # pylint: disable=protected-access
+        types.Content(
+            role='user', parts=[types.Part.from_text(text=memory_context)]
+        )
+    ])
 
 
 preload_memory_tool = PreloadMemoryTool()

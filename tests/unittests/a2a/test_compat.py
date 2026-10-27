@@ -1,0 +1,802 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for the a2a-sdk version shim.
+
+The shim's contract is that, for every SDK shape it claims to support, it
+returns the normalized form, and for a shape it does not recognize it fails
+loudly instead of silently returning ``None``.
+
+Only one a2a-sdk major is installed at a time, so the branch for the *other*
+major can only be exercised where the shim is duck-typed: those tests flip
+``_compat.IS_A2A_V1`` and feed the shim the protobuf objects that branch
+expects. Branches that import 1.x-only SDK symbols are not reachable here.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+
+from a2a.client.client import ClientConfig
+from a2a.client.client_factory import ClientFactory
+from a2a.types import AgentCapabilities
+from a2a.types import AgentProvider
+from a2a.types import AgentSkill
+from a2a.types import Artifact
+from a2a.types import TaskArtifactUpdateEvent
+from google.adk.a2a import _compat
+from google.protobuf import descriptor_pb2
+from google.protobuf import proto_builder
+from google.protobuf.json_format import ParseDict
+from google.protobuf.struct_pb2 import Struct
+import httpx
+import pytest
+
+v03_only = pytest.mark.skipif(
+    _compat.IS_A2A_V1, reason='0.3-only SDK object shapes'
+)
+
+
+def _struct(payload: dict) -> Struct:
+  return ParseDict(payload, Struct())
+
+
+class _FakeStreamResponse:
+  """Duck-typed stand-in for the 1.x ``StreamResponse`` proto.
+
+  ``stream_item_kind``'s 1.x branch only needs ``HasField`` plus attribute
+  access, so the oneof can be modelled without the 1.x SDK installed.
+  """
+
+  def __init__(self, field=None, payload=None):
+    self._field = field
+    if field is not None:
+      setattr(self, field, payload)
+
+  def HasField(self, name: str) -> bool:  # noqa: N802 - proto API name.
+    return name == self._field
+
+
+class _FakeStructEvent:
+  """Stand-in for a 1.x event whose ``metadata`` is a proto ``Struct``."""
+
+  def __init__(self):
+    self.metadata = Struct()
+
+
+def _task():
+  return _compat.make_task(
+      id='task-1',
+      context_id='ctx-1',
+      status=_compat.make_task_status(_compat.TS_WORKING),
+  )
+
+
+# -----------------------------------------------------------------------------
+# build_agent_card
+# -----------------------------------------------------------------------------
+def _build_card(**overrides):
+  kwargs = dict(
+      name='card-name',
+      description='card-description',
+      version='1.2.3',
+      url='https://agent.example/a2a',
+      protocol_binding=_compat.TP_JSONRPC,
+  )
+  kwargs.update(overrides)
+  return _compat.build_agent_card(**kwargs)
+
+
+@v03_only
+def test_build_agent_card_strips_trailing_slash_from_url():
+  # The RPC URL is concatenated with paths by callers, so the card must not
+  # carry a trailing separator.
+  assert _build_card(url='https://agent.example/a2a/').url == (
+      'https://agent.example/a2a'
+  )
+
+
+@v03_only
+def test_build_agent_card_without_protocol_version_uses_v03_default():
+  assert _build_card().protocol_version == '0.3.0'
+
+
+@v03_only
+def test_build_agent_card_with_protocol_version_keeps_caller_value():
+  assert _build_card(protocol_version='0.2.9').protocol_version == '0.2.9'
+
+
+@v03_only
+def test_build_agent_card_without_capabilities_claims_none():
+  capabilities = _build_card().capabilities
+  assert capabilities.streaming is False
+  assert capabilities.push_notifications is False
+
+
+@v03_only
+def test_build_agent_card_uses_the_capabilities_it_is_given():
+  card = _build_card(
+      capabilities=AgentCapabilities(streaming=True, push_notifications=True),
+  )
+  assert card.capabilities.streaming is True
+  assert card.capabilities.push_notifications is True
+
+
+@v03_only
+def test_build_agent_card_omits_optional_fields_when_not_supplied():
+  card = _build_card(provider=None, security_schemes=None, doc_url=None)
+  assert card.provider is None
+  assert card.security_schemes is None
+  assert card.documentation_url is None
+  assert card.supports_authenticated_extended_card is False
+
+
+@v03_only
+def test_build_agent_card_converts_model_arguments_to_card_fields():
+  card = _build_card(
+      protocol_binding=_compat.TP_HTTP_JSON,
+      skills=[
+          AgentSkill(id='skill-1', name='Skill One', description='d', tags=[])
+      ],
+      provider=AgentProvider(organization='acme', url='https://acme.example'),
+      security_schemes={'api': _compat.make_api_key_scheme(name='X-Api-Key')},
+      doc_url='https://agent.example/docs',
+      default_input_modes=('text/plain', 'application/json'),
+      supports_authenticated_extended_card=True,
+  )
+  assert card.preferred_transport == _compat.TP_HTTP_JSON
+  assert [skill.id for skill in card.skills] == ['skill-1']
+  assert card.provider.organization == 'acme'
+  assert card.security_schemes['api'].root.name == 'X-Api-Key'
+  assert card.documentation_url == 'https://agent.example/docs'
+  assert card.default_input_modes == ['text/plain', 'application/json']
+  assert card.supports_authenticated_extended_card is True
+
+
+# -----------------------------------------------------------------------------
+# build_agent_skill / get_skill_security
+# -----------------------------------------------------------------------------
+class _FakeStringList:
+
+  def __init__(self, values: list[str]):
+    self.list = values
+
+
+class _FakeSecurityRequirement:
+
+  def __init__(self, schemes: dict[str, list[str]]):
+    self.schemes = {k: _FakeStringList(v) for k, v in schemes.items()}
+
+
+class _FakeV1Skill:
+
+  def __init__(self, requirements: list[dict[str, list[str]]]):
+    self.security_requirements = [
+        _FakeSecurityRequirement(req) for req in requirements
+    ]
+
+
+def test_build_agent_skill_without_security_returns_none_from_get_skill_security():
+  skill = _compat.build_agent_skill(
+      id='skill-1',
+      name='Skill One',
+      description='Skill description',
+      tags=['tag-1'],
+      examples=['example input'],
+      input_modes=['text/plain'],
+      output_modes=['application/json'],
+  )
+  assert skill.id == 'skill-1'
+  assert skill.name == 'Skill One'
+  assert skill.description == 'Skill description'
+  assert list(skill.tags) == ['tag-1']
+  assert list(skill.examples) == ['example input']
+  assert list(skill.input_modes) == ['text/plain']
+  assert list(skill.output_modes) == ['application/json']
+  assert _compat.get_skill_security(skill) is None
+
+
+def test_build_agent_skill_with_security_round_trips_through_get_skill_security():
+  security = [{'oauth2': ['read', 'write']}, {'api_key': []}]
+  skill = _compat.build_agent_skill(
+      id='skill-1',
+      name='Skill One',
+      description='Skill description',
+      tags=['tag-1'],
+      security=security,
+  )
+  assert _compat.get_skill_security(skill) == security
+
+
+def test_get_skill_security_v1_returns_none_when_empty(monkeypatch):
+  monkeypatch.setattr(_compat, 'IS_A2A_V1', True)
+  assert _compat.get_skill_security(_FakeV1Skill([])) is None
+
+
+def test_get_skill_security_v1_extracts_scheme_scopes(monkeypatch):
+  monkeypatch.setattr(_compat, 'IS_A2A_V1', True)
+  security = [{'oauth2': ['read', 'write']}, {'api_key': []}]
+  assert _compat.get_skill_security(_FakeV1Skill(security)) == security
+
+
+# -----------------------------------------------------------------------------
+# rebind_client_factory_httpx
+# -----------------------------------------------------------------------------
+def _factory_with_custom_transport(httpx_client, consumers):
+  factory = ClientFactory(
+      _compat.make_client_config(httpx_client=httpx_client, streaming=True),
+      consumers=consumers,
+  )
+  factory.register('custom-transport', _custom_transport_producer)
+  return factory
+
+
+def _custom_transport_producer(*args, **kwargs):
+  raise AssertionError('the producer is only used as an identity marker')
+
+
+@v03_only
+def test_rebind_client_factory_httpx_returns_new_factory_on_new_client():
+  old_client, new_client = object(), object()
+  factory = _factory_with_custom_transport(old_client, consumers=[])
+
+  rebound = _compat.rebind_client_factory_httpx(factory, new_client)
+
+  assert rebound is not factory
+  assert rebound._config.httpx_client is new_client
+  # The caller may still be using the original factory; it must be untouched.
+  assert factory._config.httpx_client is old_client
+
+
+@v03_only
+def test_rebind_client_factory_httpx_preserves_config_consumers_transports():
+  consumer = lambda event, card: None
+  factory = _factory_with_custom_transport(object(), consumers=[consumer])
+
+  rebound = _compat.rebind_client_factory_httpx(factory, object())
+
+  # ``streaming=True`` is not the value ADK's config builder defaults to, so
+  # seeing it survive proves the rest of the config came along.
+  assert rebound._config.streaming is True
+  assert rebound._consumers == [consumer]
+  assert rebound._registry['custom-transport'] is _custom_transport_producer
+
+
+@pytest.mark.asyncio
+async def test_rebind_client_factory_httpx_preserves_subclass():
+  class CustomFactory(ClientFactory):
+    pass
+
+  old_client, new_client = httpx.AsyncClient(), httpx.AsyncClient()
+  factory = CustomFactory(_compat.make_client_config(httpx_client=old_client))
+  rebound = _compat.rebind_client_factory_httpx(factory, new_client)
+
+  try:
+    assert isinstance(rebound, CustomFactory)
+    assert rebound is not factory
+    assert rebound._config.httpx_client is new_client
+    assert factory._config.httpx_client is old_client
+  finally:
+    await old_client.aclose()
+    await new_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_rebind_client_factory_httpx_preserves_subclass_init_args():
+  class CustomFactoryWithArgs(ClientFactory):
+
+    def __init__(self, custom_arg: str, *, config: Any = None):
+      super().__init__(config=config)
+      self.custom_arg = custom_arg
+
+  old_client, new_client = httpx.AsyncClient(), httpx.AsyncClient()
+  factory = CustomFactoryWithArgs(
+      'custom_value',
+      config=_compat.make_client_config(httpx_client=old_client),
+  )
+  rebound = _compat.rebind_client_factory_httpx(factory, new_client)
+
+  try:
+    assert isinstance(rebound, CustomFactoryWithArgs)
+    assert rebound is not factory
+    assert rebound.custom_arg == 'custom_value'
+    assert rebound._config.httpx_client is new_client
+    assert factory._config.httpx_client is old_client
+  finally:
+    await old_client.aclose()
+    await new_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_rebind_client_factory_httpx_defaults_protocol_bindings():
+  if not _compat.IS_A2A_V1:
+    pytest.skip('supported_protocol_bindings defaulting is 1.x only')
+  old_client, new_client = httpx.AsyncClient(), httpx.AsyncClient()
+  factory = ClientFactory(ClientConfig(httpx_client=old_client))
+  rebound = _compat.rebind_client_factory_httpx(factory, new_client)
+
+  try:
+    assert _compat.TP_JSONRPC in rebound._config.supported_protocol_bindings
+    assert _compat.TP_HTTP_JSON in rebound._config.supported_protocol_bindings
+    assert _compat.TP_JSONRPC in rebound._registry
+    assert _compat.TP_HTTP_JSON in rebound._registry
+  finally:
+    await old_client.aclose()
+    await new_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_rebind_client_factory_httpx_preserves_protocol_bindings():
+  old_client, new_client = httpx.AsyncClient(), httpx.AsyncClient()
+  if _compat.IS_A2A_V1:
+    config = ClientConfig(
+        httpx_client=old_client,
+        supported_protocol_bindings=[_compat.TP_HTTP_JSON],
+    )
+  else:
+    config = ClientConfig(
+        httpx_client=old_client,
+        supported_transports=[_compat.TP_HTTP_JSON],
+    )
+  factory = ClientFactory(config)
+  rebound = _compat.rebind_client_factory_httpx(factory, new_client)
+
+  try:
+    if _compat.IS_A2A_V1:
+      assert rebound._config.supported_protocol_bindings == [
+          _compat.TP_HTTP_JSON
+      ]
+      assert _compat.TP_HTTP_JSON in rebound._registry
+      assert _compat.TP_JSONRPC not in rebound._registry
+    else:
+      assert rebound._config.supported_transports == [_compat.TP_HTTP_JSON]
+  finally:
+    await old_client.aclose()
+    await new_client.aclose()
+
+
+# -----------------------------------------------------------------------------
+# stream_item_kind
+# -----------------------------------------------------------------------------
+@v03_only
+def test_stream_item_kind_task_without_update_is_a_task_item():
+  task = _task()
+  assert _compat.stream_item_kind((task, None)) == ('task', task)
+
+
+@v03_only
+def test_stream_item_kind_status_update_tuple_returns_the_update():
+  update = _compat.make_task_status_update_event(
+      task_id='task-1',
+      context_id='ctx-1',
+      status=_compat.make_task_status(_compat.TS_WORKING),
+      final=False,
+  )
+  assert _compat.stream_item_kind((_task(), update)) == (
+      'status_update',
+      update,
+  )
+
+
+@v03_only
+def test_stream_item_kind_artifact_update_tuple_returns_the_update():
+  update = TaskArtifactUpdateEvent(
+      task_id='task-1',
+      context_id='ctx-1',
+      artifact=Artifact(
+          artifact_id='artifact-1', parts=[_compat.make_text_part('hi')]
+      ),
+  )
+  assert _compat.stream_item_kind((_task(), update)) == (
+      'artifact_update',
+      update,
+  )
+
+
+@v03_only
+def test_stream_item_kind_bare_message_is_a_message_item():
+  message = _compat.make_message(message_id='m-1', role='user')
+  assert _compat.stream_item_kind(message) == ('message', message)
+
+
+@v03_only
+def test_stream_item_kind_unknown_update_raises_rather_than_returning_none():
+  with pytest.raises(ValueError, match='Unknown v0.3 update event'):
+    _compat.stream_item_kind((_task(), 'not-an-update-event'))
+
+
+@pytest.mark.parametrize(
+    'field', ['task', 'message', 'status_update', 'artifact_update']
+)
+def test_stream_item_kind_v1_reports_the_set_oneof_field(monkeypatch, field):
+  monkeypatch.setattr(_compat, 'IS_A2A_V1', True)
+  payload = object()
+  assert _compat.stream_item_kind(_FakeStreamResponse(field, payload)) == (
+      field,
+      payload,
+  )
+
+
+def test_stream_item_kind_v1_without_payload_raises(monkeypatch):
+  monkeypatch.setattr(_compat, 'IS_A2A_V1', True)
+  with pytest.raises(ValueError, match='no known payload field'):
+    _compat.stream_item_kind(_FakeStreamResponse())
+
+
+# -----------------------------------------------------------------------------
+# send_message
+# -----------------------------------------------------------------------------
+class _ClientWithoutRequestMetadata:
+  """A 0.3.x client whose ``send_message`` predates ``request_metadata``."""
+
+  async def send_message(self, request, *, context=None):
+    yield (request, context)
+
+
+@v03_only
+@pytest.mark.parametrize('request_metadata', [None, {}])
+async def test_send_message_without_metadata_skips_the_kwarg(request_metadata):
+  message = _compat.make_message(message_id='m-1', role='user')
+  context = object()
+
+  items = [
+      item
+      async for item in _compat.send_message(
+          _ClientWithoutRequestMetadata(),
+          request=message,
+          request_metadata=request_metadata,
+          context=context,
+      )
+  ]
+
+  assert items == [(message, context)]
+
+
+# -----------------------------------------------------------------------------
+# data_part_blob_bytes / make_data_part_from_blob
+# -----------------------------------------------------------------------------
+@v03_only
+def test_data_part_blob_bytes_serializes_the_whole_data_part():
+  part = _compat.make_data_part(data={'a': 1}, metadata={'m': 'v'})
+
+  blob = json.loads(_compat.data_part_blob_bytes(part))
+
+  # 0.3.x embeds the metadata (and the discriminator) in the blob; only the
+  # data dict would survive on 1.x.
+  assert blob == {'data': {'a': 1}, 'metadata': {'m': 'v'}, 'kind': 'data'}
+
+
+@v03_only
+def test_data_part_blob_bytes_omits_unset_fields():
+  blob = json.loads(
+      _compat.data_part_blob_bytes(_compat.make_data_part(data={'a': 1}))
+  )
+  assert 'metadata' not in blob
+
+
+@v03_only
+def test_make_data_part_from_blob_restores_data_and_embedded_metadata():
+  # ``DataPart`` only exists on 0.3.x, so it is imported where the shim does:
+  # inside the branch that needs it, not at module scope.
+  from a2a.types import DataPart
+
+  original = _compat.make_data_part(data={'a': 1}, metadata={'m': 'v'})
+
+  restored = _compat.make_data_part_from_blob(
+      _compat.data_part_blob_bytes(original)
+  )
+
+  assert isinstance(restored.root, DataPart)
+  assert restored.root.data == {'a': 1}
+  assert restored.root.metadata == {'m': 'v'}
+
+
+@v03_only
+def test_make_data_part_from_blob_merges_extra_metadata():
+  blob = _compat.data_part_blob_bytes(
+      _compat.make_data_part(data={'a': 1}, metadata={'m': 'v', 'keep': 'yes'})
+  )
+
+  restored = _compat.make_data_part_from_blob(
+      blob, extra_metadata={'m': 'overridden', 'extra': 'e'}
+  )
+
+  assert restored.root.metadata == {
+      'm': 'overridden',
+      'keep': 'yes',
+      'extra': 'e',
+  }
+
+
+@v03_only
+def test_make_data_part_from_blob_adds_metadata_when_blob_has_none():
+  blob = _compat.data_part_blob_bytes(_compat.make_data_part(data={'a': 1}))
+
+  restored = _compat.make_data_part_from_blob(
+      blob, extra_metadata={'extra': 'e'}
+  )
+
+  assert restored.root.metadata == {'extra': 'e'}
+
+
+# -----------------------------------------------------------------------------
+# metadata_get
+# -----------------------------------------------------------------------------
+@pytest.mark.parametrize('metadata', [None, {}])
+def test_metadata_get_empty_metadata_returns_default(metadata):
+  assert _compat.metadata_get(metadata, 'k', 'fallback') == 'fallback'
+
+
+def test_metadata_get_reads_and_defaults_on_a_dict():
+  assert _compat.metadata_get({'k': 'v'}, 'k', 'fallback') == 'v'
+  assert _compat.metadata_get({'k': 'v'}, 'other', 'fallback') == 'fallback'
+  assert _compat.metadata_get({'k': 'v'}, 'other') is None
+
+
+def test_metadata_get_v1_reads_and_defaults_on_a_struct(monkeypatch):
+  monkeypatch.setattr(_compat, 'IS_A2A_V1', True)
+  metadata = _struct({'k': 'v'})
+  assert _compat.metadata_get(metadata, 'k', 'fallback') == 'v'
+  assert _compat.metadata_get(metadata, 'other', 'fallback') == 'fallback'
+
+
+def test_metadata_get_v1_unusable_key_returns_default(monkeypatch):
+  # A proto Struct raises on a non-string key; the shim must degrade to the
+  # default rather than propagate that to the caller.
+  monkeypatch.setattr(_compat, 'IS_A2A_V1', True)
+  assert _compat.metadata_get(_struct({'k': 'v'}), 5, 'fallback') == 'fallback'
+
+
+# -----------------------------------------------------------------------------
+# set_event_metadata
+# -----------------------------------------------------------------------------
+@v03_only
+def test_set_event_metadata_assigns_the_given_keys():
+  event = _compat.make_task_status_update_event(
+      task_id='task-1',
+      context_id='ctx-1',
+      status=_compat.make_task_status(_compat.TS_WORKING),
+  )
+
+  _compat.set_event_metadata(event, {'a': 'b'})
+
+  assert event.metadata == {'a': 'b'}
+
+
+@pytest.mark.parametrize('metadata', [None, {}])
+@v03_only
+def test_set_event_metadata_empty_leaves_existing_metadata_intact(metadata):
+  event = _compat.make_task_status_update_event(
+      task_id='task-1',
+      context_id='ctx-1',
+      status=_compat.make_task_status(_compat.TS_WORKING),
+      metadata={'already': 'here'},
+  )
+
+  _compat.set_event_metadata(event, metadata)
+
+  assert event.metadata == {'already': 'here'}
+
+
+def test_set_event_metadata_v1_copies_into_the_struct_field():
+  event = _FakeStructEvent()
+
+  _compat.set_event_metadata(event, {'a': 'b'})
+
+  assert dict(event.metadata) == {'a': 'b'}
+
+
+# -----------------------------------------------------------------------------
+# meta_to_dict
+# -----------------------------------------------------------------------------
+def test_meta_to_dict_none_returns_empty_dict():
+  assert _compat.meta_to_dict(None) == {}
+
+
+def test_meta_to_dict_dict_is_returned_unchanged():
+  assert _compat.meta_to_dict({'a': 1}) == {'a': 1}
+
+
+def test_meta_to_dict_unsupported_shape_returns_empty_dict():
+  # Callers json.dumps() the result, so anything unrecognized must normalize
+  # to an empty dict rather than leak through.
+  assert _compat.meta_to_dict('not-metadata') == {}
+
+
+def test_meta_to_dict_v1_converts_a_struct(monkeypatch):
+  monkeypatch.setattr(_compat, 'IS_A2A_V1', True)
+  assert _compat.meta_to_dict(_struct({'a': 'b'})) == {'a': 'b'}
+
+
+# -----------------------------------------------------------------------------
+# role_to_str / part_kind_label
+# -----------------------------------------------------------------------------
+def test_role_to_str_maps_user_role_to_user():
+  assert _compat.role_to_str(_compat.ROLE_USER) == 'user'
+
+
+@pytest.mark.parametrize('role', [_compat.ROLE_AGENT, None, 'nonsense'])
+def test_role_to_str_maps_every_other_role_to_model(role):
+  assert _compat.role_to_str(role) == 'model'
+
+
+def test_part_kind_label_is_fixed_on_v03_and_concrete_on_v1(monkeypatch):
+  file_part = _compat.make_file_part_with_uri(uri='gs://bucket/object')
+
+  # 0.3.x wraps every file payload as a FilePart, so the log label is fixed
+  # even though the object handed in is a ``Part``.
+  monkeypatch.setattr(_compat, 'IS_A2A_V1', False)
+  assert _compat.part_kind_label(file_part) == 'FilePart'
+
+  # 1.x has no wrapper type, so the label is the concrete class name.
+  monkeypatch.setattr(_compat, 'IS_A2A_V1', True)
+  assert _compat.part_kind_label(file_part) == 'Part'
+
+
+# -----------------------------------------------------------------------------
+# a2a_to_dict
+# -----------------------------------------------------------------------------
+_FILE_PAYLOAD = b'attachment-payload-bytes' * 20
+_ENCODED_PAYLOAD = base64.b64encode(_FILE_PAYLOAD).decode('utf-8')
+
+
+def _v1_file_part():
+  """A real proto message shaped like the flat 1.x file Part.
+
+  The 1.x ``Part`` is not importable here, but ``a2a_to_dict``'s 1.x branch
+  only runs ``MessageToDict``, so any message carrying the same field names
+  exercises it.
+  """
+  field = descriptor_pb2.FieldDescriptorProto
+  part_type = proto_builder.MakeSimpleProtoClass(
+      {
+          'raw': field.TYPE_BYTES,
+          'media_type': field.TYPE_STRING,
+          'filename': field.TYPE_STRING,
+      },
+      full_name='google.adk.tests.a2a.FlatFilePart',
+  )
+  return part_type(
+      raw=_FILE_PAYLOAD, media_type='application/pdf', filename='invoice.pdf'
+  )
+
+
+@v03_only
+def test_a2a_to_dict_v03_excludes_the_nested_file_bytes():
+  part = _compat.make_file_part_with_bytes(
+      data=_FILE_PAYLOAD, mime_type='application/pdf', name='invoice.pdf'
+  )
+
+  dumped = _compat.a2a_to_dict(part, exclude_file_bytes=True)
+
+  assert _ENCODED_PAYLOAD not in json.dumps(dumped)
+  assert dumped['file'] == {
+      'mimeType': 'application/pdf',
+      'name': 'invoice.pdf',
+  }
+
+
+@v03_only
+def test_a2a_to_dict_v03_keeps_the_file_bytes_by_default():
+  part = _compat.make_file_part_with_bytes(data=_FILE_PAYLOAD)
+
+  assert _compat.a2a_to_dict(part)['file']['bytes'] == _ENCODED_PAYLOAD
+
+
+def test_a2a_to_dict_v1_excludes_the_flat_raw_field(monkeypatch):
+  # 1.x holds the payload in a flat ``raw`` field, so a caller naming the
+  # 0.3.x ``file.bytes`` path itself would drop nothing and leak it here.
+  monkeypatch.setattr(_compat, 'IS_A2A_V1', True)
+
+  dumped = _compat.a2a_to_dict(_v1_file_part(), exclude_file_bytes=True)
+
+  assert dumped == {'mediaType': 'application/pdf', 'filename': 'invoice.pdf'}
+
+
+def test_a2a_to_dict_v1_keeps_the_flat_raw_field_by_default(monkeypatch):
+  monkeypatch.setattr(_compat, 'IS_A2A_V1', True)
+
+  assert _compat.a2a_to_dict(_v1_file_part())['raw'] == _ENCODED_PAYLOAD
+
+
+# --------------------------------------------------------------------------
+# make_stream_normalizer
+# --------------------------------------------------------------------------
+v1_only = pytest.mark.skipif(
+    not _compat.IS_A2A_V1, reason='1.x StreamResponse shapes'
+)
+
+
+def _v1_artifact_chunk(artifact_id: str, text: str, *, append: bool):
+  from a2a.types import Artifact
+  from a2a.types import StreamResponse
+  from a2a.types import TaskArtifactUpdateEvent
+
+  return StreamResponse(
+      artifact_update=TaskArtifactUpdateEvent(
+          task_id='task-1',
+          context_id='ctx-1',
+          append=append,
+          last_chunk=False,
+          artifact=Artifact(
+              artifact_id=artifact_id, parts=[_compat.make_text_part(text)]
+          ),
+      )
+  )
+
+
+def _v1_task_snapshot():
+  from a2a.types import StreamResponse
+  from a2a.types import Task
+  from a2a.types import TaskState
+  from a2a.types import TaskStatus
+
+  # What a server or proxy emits as the running task's state: status only.
+  return StreamResponse(
+      task=Task(
+          id='task-1',
+          context_id='ctx-1',
+          status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+      )
+  )
+
+
+@v1_only
+def test_stream_normalizer_task_snapshot_keeps_streamed_artifacts():
+  """A running-Task snapshot arriving between chunks must not discard artifacts from aggregate state."""
+  normalize = _compat.make_stream_normalizer()
+
+  normalize(_v1_artifact_chunk('art-1', 'The', append=False))
+  task, _ = normalize(_v1_task_snapshot())
+  assert not task.artifacts
+
+  task, _ = normalize(_v1_artifact_chunk('art-1', ' sky', append=True))
+
+  assert len(task.artifacts) == 1
+  assert [p.text for p in task.artifacts[0].parts] == ['The', ' sky']
+
+
+@v1_only
+def test_stream_normalizer_task_snapshot_with_artifacts_is_authoritative():
+  """A snapshot that carries an artifact wins for that id in the aggregate."""
+  from a2a.types import Artifact
+  from a2a.types import StreamResponse
+  from a2a.types import Task
+  from a2a.types import TaskState
+  from a2a.types import TaskStatus
+
+  normalize = _compat.make_stream_normalizer()
+  normalize(_v1_artifact_chunk('art-1', 'stale', append=False))
+  normalize(_v1_artifact_chunk('art-2', 'other', append=False))
+
+  snapshot = StreamResponse(
+      task=Task(
+          id='task-1',
+          context_id='ctx-1',
+          status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+          artifacts=[
+              Artifact(
+                  artifact_id='art-1', parts=[_compat.make_text_part('fresh')]
+              )
+          ],
+      )
+  )
+  task, _ = normalize(snapshot)
+  assert [a.artifact_id for a in task.artifacts] == ['art-1']
+  assert [p.text for p in task.artifacts[0].parts] == ['fresh']
+
+  task, _ = normalize(_v1_artifact_chunk('art-2', ' appended', append=True))
+  by_id = {a.artifact_id: [p.text for p in a.parts] for a in task.artifacts}
+  assert by_id == {'art-1': ['fresh'], 'art-2': ['other', ' appended']}

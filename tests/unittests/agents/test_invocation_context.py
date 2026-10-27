@@ -12,18 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import time
+from unittest.mock import MagicMock
 from unittest.mock import Mock
 
 from google.adk.agents.base_agent import BaseAgent
 from google.adk.agents.base_agent import BaseAgentState
 from google.adk.agents.invocation_context import InvocationContext
+from google.adk.agents.invocation_context import LlmCallsLimitExceededError
+from google.adk.agents.run_config import RunConfig
 from google.adk.apps import ResumabilityConfig
+from google.adk.events._internal_metadata import INTERNAL_METADATA_PREFIX
 from google.adk.events.event import Event
 from google.adk.events.event_actions import EventActions
+from google.adk.live import LiveRequestQueue
+from google.adk.live._active_background_tool import ActiveBackgroundTool
+from google.adk.live._active_streaming_tool import ActiveStreamingTool
+from google.adk.live._flow_utils import stop_background_tool_tasks
+from google.adk.platform.thread import create_thread
 from google.adk.sessions.base_session_service import BaseSessionService
 from google.adk.sessions.session import Session
+from google.adk.utils._function_call_names import REQUEST_INPUT_FUNCTION_CALL_NAME
 from google.genai.types import Content
 from google.genai.types import FunctionCall
+from google.genai.types import FunctionResponse
 from google.genai.types import Part
 import pytest
 
@@ -126,6 +139,409 @@ class TestInvocationContext:
     )
     assert not events
 
+  def test_abort_without_external_signal_trips_internal_signal(self):
+    """Calling abort() without an explicit signal sets is_aborted and trips internal signal."""
+    ctx = InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_1',
+        session=Mock(spec=Session, events=[]),
+    )
+    assert ctx.is_aborted is False
+    assert ctx._abort_signal.is_set() is False
+
+    ctx.abort()
+
+    assert ctx.is_aborted is True
+    assert ctx._abort_signal.is_set() is True
+
+  async def test_abort_same_tick_immediacy(self):
+    """Calling abort() on the event loop thread sets is_aborted and trips signal on the same tick."""
+    abort_signal = asyncio.Event()
+    ctx = InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_1',
+        session=Mock(spec=Session, events=[]),
+    )
+    ctx._attach_abort_signal(abort_signal)
+    assert ctx.is_aborted is False
+    assert abort_signal.is_set() is False
+
+    ctx.abort()
+
+    assert ctx.is_aborted is True
+    assert abort_signal.is_set() is True
+
+  async def test_abort_cross_thread_wakeup(self):
+    """Calling abort() from a worker thread wakes a coroutine awaiting the attached signal."""
+    abort_signal = asyncio.Event()
+    ctx = InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_1',
+        session=Mock(spec=Session, events=[]),
+    )
+    ctx._attach_abort_signal(abort_signal)
+
+    woke = asyncio.Event()
+
+    async def parked_waiter():
+      await abort_signal.wait()
+      woke.set()
+
+    waiter_task = asyncio.create_task(parked_waiter())
+    await asyncio.sleep(0.05)
+
+    def foreign_worker():
+      time.sleep(0.05)
+      ctx.abort()
+
+    worker_thread = create_thread(target=foreign_worker)
+    worker_thread.start()
+
+    await asyncio.wait_for(woke.wait(), timeout=2.0)
+    worker_thread.join()
+    await waiter_task
+
+    assert ctx.is_aborted is True
+    assert abort_signal.is_set() is True
+
+  async def test_abort_initialized_outside_loop_cross_thread_wakeup(self):
+    """Attaching an abort signal inside a running loop enables cross-thread wakeup even if context was created synchronously."""
+    loop_holder = []
+
+    def create_ctx_sync():
+      loop_holder.append(
+          InvocationContext(
+              session_service=Mock(spec=BaseSessionService),
+              agent=Mock(spec=BaseAgent),
+              invocation_id='inv_outside_loop',
+              session=Mock(spec=Session, events=[]),
+          )
+      )
+
+    init_thread = create_thread(target=create_ctx_sync)
+    init_thread.start()
+    init_thread.join()
+    ctx = loop_holder[0]
+
+    abort_signal = asyncio.Event()
+    ctx._attach_abort_signal(abort_signal)
+
+    woke = asyncio.Event()
+
+    async def parked_waiter():
+      await abort_signal.wait()
+      woke.set()
+
+    waiter_task = asyncio.create_task(parked_waiter())
+    await asyncio.sleep(0.05)
+
+    def foreign_worker():
+      time.sleep(0.05)
+      ctx.abort()
+
+    worker_thread = create_thread(target=foreign_worker)
+    worker_thread.start()
+
+    await asyncio.wait_for(woke.wait(), timeout=2.0)
+    worker_thread.join()
+    await waiter_task
+
+    assert ctx.is_aborted is True
+    assert abort_signal.is_set() is True
+
+  async def test_abort_signal_captures_loop_and_wakes_on_cross_thread_abort(
+      self,
+  ):
+    """Awaiting _abort_signal.wait() captures the running loop and wakes when abort() is called from another thread."""
+    ctx_holder = []
+
+    def create_ctx_sync():
+      ctx_holder.append(
+          InvocationContext(
+              session_service=Mock(spec=BaseSessionService),
+              agent=Mock(spec=BaseAgent),
+              invocation_id='inv_abort_signal_wait',
+              session=Mock(spec=Session, events=[]),
+          )
+      )
+
+    init_thread = create_thread(target=create_ctx_sync)
+    init_thread.start()
+    init_thread.join()
+    ctx = ctx_holder[0]
+    assert ctx._abort_state.loop is None
+
+    woke = asyncio.Event()
+
+    async def parked_waiter():
+      await ctx._abort_signal.wait()
+      woke.set()
+
+    waiter_task = asyncio.create_task(parked_waiter())
+    await asyncio.sleep(0.05)
+
+    def foreign_worker():
+      time.sleep(0.05)
+      ctx.abort()
+
+    worker_thread = create_thread(target=foreign_worker)
+    worker_thread.start()
+
+    await asyncio.wait_for(woke.wait(), timeout=2.0)
+    worker_thread.join()
+    await waiter_task
+
+    assert ctx.is_aborted is True
+
+  def test_abort_with_closed_loop_falls_back_to_direct_set(self):
+    """Calling abort() after its event loop closes still sets is_aborted without raising RuntimeError."""
+    loop = asyncio.new_event_loop()
+
+    async def init_on_loop():
+      ctx = InvocationContext(
+          session_service=Mock(spec=BaseSessionService),
+          agent=Mock(spec=BaseAgent),
+          invocation_id='inv_closed_loop',
+          session=Mock(spec=Session, events=[]),
+      )
+      ctx._attach_abort_signal(asyncio.Event())
+      return ctx
+
+    ctx = loop.run_until_complete(init_on_loop())
+    loop.close()
+
+    ctx.abort()
+
+    assert ctx.is_aborted is True
+    assert ctx._abort_signal.is_set() is True
+
+  def test_abort_signal_not_in_model_fields(self):
+    """The abort signal is private and excluded from Pydantic model fields."""
+    ctx = InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_priv_attr',
+        session=Mock(spec=Session, events=[]),
+    )
+    assert 'abort_signal' not in InvocationContext.model_fields
+    assert '_abort_signal' not in InvocationContext.model_fields
+    assert not hasattr(ctx, 'abort_signal')
+    assert isinstance(ctx._abort_signal, asyncio.Event)
+    assert ctx._abort_signal.is_set() is False
+
+  def test_attach_abort_signal(self):
+    """Attaching a caller-owned abort signal shares it across model_copy() instances."""
+    custom_signal = asyncio.Event()
+    ctx = InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_signal',
+        session=Mock(spec=Session, events=[]),
+    )
+    ctx._attach_abort_signal(custom_signal)
+
+    assert ctx._abort_signal is custom_signal
+    assert ctx.model_copy()._abort_signal is custom_signal
+
+  def test_abort_signal_propagates_across_model_copy(self):
+    """Calling abort() on a copied context immediately sets is_aborted on the parent context."""
+    ctx = InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_parent',
+        session=Mock(spec=Session, events=[]),
+    )
+    copied = ctx.model_copy()
+    assert ctx.is_aborted is False
+    assert copied.is_aborted is False
+
+    copied.abort()
+
+    assert copied.is_aborted is True
+    assert ctx.is_aborted is True
+    assert ctx._abort_signal.is_set() is True
+
+  def test_abort_state_deepcopy_shares_instance(self):
+    """Deepcopying InvocationContext preserves shared _abort_state instance."""
+    ctx = InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_deep',
+        session=Mock(spec=Session, events=[]),
+    )
+    copied = ctx.model_copy(deep=True)
+    assert copied._abort_state is ctx._abort_state
+
+    copied.abort()
+    assert copied.is_aborted is True
+    assert ctx.is_aborted is True
+
+  async def test_model_copy_deep_with_running_async_generator(self):
+    """Calling model_copy(deep=True) inside a running event loop with active async generators does not raise."""
+    ctx = InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_deep_running_loop',
+        session=Mock(spec=Session, events=[]),
+    )
+
+    async def sample_generator():
+      yield 1
+
+    gen = sample_generator()
+    try:
+      copied = ctx.model_copy(deep=True)
+      assert copied._abort_state is ctx._abort_state
+    finally:
+      await gen.aclose()
+
+  async def test_abort_signal_on_model_copy_wakes_when_parent_aborts_from_thread(
+      self,
+  ):
+    """A coroutine awaiting _abort_signal.wait() on a copied context wakes when the parent aborts from a worker thread."""
+    ctx_holder = []
+
+    def create_ctx_sync():
+      ctx_holder.append(
+          InvocationContext(
+              session_service=Mock(spec=BaseSessionService),
+              agent=Mock(spec=BaseAgent),
+              invocation_id='inv_parent',
+              session=Mock(spec=Session, events=[]),
+          )
+      )
+
+    init_thread = create_thread(target=create_ctx_sync)
+    init_thread.start()
+    init_thread.join()
+    ctx = ctx_holder[0]
+    copied = ctx.model_copy()
+
+    woke = asyncio.Event()
+
+    async def parked_waiter():
+      await copied._abort_signal.wait()
+      woke.set()
+
+    waiter_task = asyncio.create_task(parked_waiter())
+    await asyncio.sleep(0.05)
+
+    def foreign_worker():
+      time.sleep(0.05)
+      ctx.abort()
+
+    worker_thread = create_thread(target=foreign_worker)
+    worker_thread.start()
+
+    await asyncio.wait_for(woke.wait(), timeout=2.0)
+    worker_thread.join()
+    await waiter_task
+
+    assert copied.is_aborted is True
+    assert ctx.is_aborted is True
+
+  def test_abort_foreign_thread_sets_is_aborted_immediately(self):
+    """Calling abort() from a worker thread sets is_aborted synchronously before the loop processes callbacks."""
+    loop = Mock(spec=asyncio.AbstractEventLoop)
+    loop.call_soon_threadsafe = Mock()
+
+    ctx = InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_foreign',
+        session=Mock(spec=Session, events=[]),
+    )
+    ctx._abort_state.loop = loop
+
+    worker_exc = None
+
+    def foreign_worker():
+      nonlocal worker_exc
+      try:
+        ctx.abort()
+        assert ctx.is_aborted is True
+      except BaseException as e:
+        worker_exc = e
+
+    worker = create_thread(target=foreign_worker)
+    worker.start()
+    worker.join()
+
+    if worker_exc is not None:
+      raise worker_exc
+
+    assert ctx.is_aborted is True
+    loop.call_soon_threadsafe.assert_called_once()
+
+
+class TestInvocationContextInitialization:
+  """Test suite for InvocationContext initialization."""
+
+  def test_custom_metadata_propagation(self):
+    """Tests that custom_metadata from RunConfig is propagated to InvocationContext."""
+    run_cfg = RunConfig(custom_metadata={'test_key': 'test_value'})
+    inv_ctx = InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_1',
+        session=Mock(spec=Session, events=[]),
+        run_config=run_cfg,
+    )
+    # Access private attribute to verify
+    assert inv_ctx._custom_metadata == {'test_key': 'test_value'}
+
+  def test_custom_metadata_drops_internal_keys(self):
+    """Callers cannot set ADK-internal keys in the context's custom_metadata."""
+    run_cfg = RunConfig(
+        custom_metadata={
+            'test_key': 'test_value',
+            INTERNAL_METADATA_PREFIX + 'planted': 'x',
+        }
+    )
+    inv_ctx = InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_1',
+        session=Mock(spec=Session, events=[]),
+        run_config=run_cfg,
+    )
+    assert inv_ctx._custom_metadata == {'test_key': 'test_value'}
+
+  def test_custom_metadata_default_empty(self):
+    """Tests that _custom_metadata is empty by default when no RunConfig is provided."""
+    inv_ctx = InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_1',
+        session=Mock(spec=Session, events=[]),
+    )
+    assert inv_ctx._custom_metadata == {}
+
+  def test_private_metadata_default_empty(self):
+    """Tests that _private_metadata is empty by default."""
+    inv_ctx = InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_1',
+        session=Mock(spec=Session, events=[]),
+    )
+    assert inv_ctx._private_metadata == {}
+
+  def test_custom_metadata_empty_run_config(self):
+    """Tests that _custom_metadata is empty when RunConfig has no custom_metadata."""
+    run_cfg = RunConfig()
+    inv_ctx = InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_1',
+        session=Mock(spec=Session, events=[]),
+        run_config=run_cfg,
+    )
+    assert inv_ctx._custom_metadata == {}
+
 
 class TestInvocationContextWithAppResumablity:
   """Test suite for InvocationContext regarding app resumability."""
@@ -152,14 +568,14 @@ class TestInvocationContextWithAppResumablity:
     )
 
   def _create_test_invocation_context(
-      self, resumability_config
+      self, resumability_config: ResumabilityConfig | None = None
   ) -> InvocationContext:
     """Create a mock invocation context for testing."""
     ctx = InvocationContext(
         session_service=Mock(spec=BaseSessionService),
         agent=Mock(spec=BaseAgent),
         invocation_id='inv_1',
-        session=Mock(spec=Session),
+        session=Mock(spec=Session, events=[]),
         resumability_config=resumability_config,
     )
     return ctx
@@ -193,6 +609,30 @@ class TestInvocationContextWithAppResumablity:
 
     assert not invocation_context.should_pause_invocation(nonpausable_event)
 
+  def test_should_pause_on_legacy_request_input_call_without_lro_ids(
+      self, event_to_pause
+  ):
+    """A legacy HITL call with no long_running_tool_ids still pauses."""
+    invocation_context = self._create_test_invocation_context(
+        ResumabilityConfig(is_resumable=True)
+    )
+    legacy_event = event_to_pause.model_copy(
+        update={
+            'long_running_tool_ids': None,
+            'content': testing_utils.ModelContent([
+                Part(
+                    function_call=FunctionCall(
+                        id='req_1',
+                        name=REQUEST_INPUT_FUNCTION_CALL_NAME,
+                        args={},
+                    )
+                )
+            ]),
+        }
+    )
+
+    assert invocation_context.should_pause_invocation(legacy_event)
+
   def test_should_not_pause_invocation_with_no_function_calls(
       self, event_to_pause
   ):
@@ -207,6 +647,69 @@ class TestInvocationContextWithAppResumablity:
     assert not mock_invocation_context.should_pause_invocation(
         nonpausable_event
     )
+
+  def test_should_not_pause_when_user_resumes_in_sub_branch(
+      self, event_to_pause, long_running_function_call
+  ):
+    """We do not pause the invocation if a subsequent user event belongs to a sub-branch."""
+    # Arrange
+    mock_invocation_context = self._create_test_invocation_context()
+    user_event = Event(
+        invocation_id='inv_1',
+        author='user',
+        branch=f'agent@{long_running_function_call.id}.child',
+    )
+    mock_invocation_context.session.events = [event_to_pause, user_event]
+
+    # Act
+    should_pause = mock_invocation_context.should_pause_invocation(
+        event_to_pause
+    )
+
+    # Assert
+    assert not should_pause
+
+  def test_should_not_pause_when_user_resumes_in_deeply_nested_sub_branch(
+      self, event_to_pause, long_running_function_call
+  ):
+    """We do not pause if the user resumes in a deeply nested sub-branch containing the tool call."""
+    # Arrange
+    mock_invocation_context = self._create_test_invocation_context()
+    user_event = Event(
+        invocation_id='inv_1',
+        author='user',
+        branch=f'parent@other.child@{long_running_function_call.id}.grandchild',
+    )
+    mock_invocation_context.session.events = [event_to_pause, user_event]
+
+    # Act
+    should_pause = mock_invocation_context.should_pause_invocation(
+        event_to_pause
+    )
+
+    # Assert
+    assert not should_pause
+
+  def test_should_pause_when_user_resumes_in_different_branch(
+      self, event_to_pause
+  ):
+    """We still pause the invocation if the subsequent user event belongs to a different branch."""
+    # Arrange
+    mock_invocation_context = self._create_test_invocation_context()
+    user_event = Event(
+        invocation_id='inv_1',
+        author='user',
+        branch='parent@different_id.child',
+    )
+    mock_invocation_context.session.events = [event_to_pause, user_event]
+
+    # Act
+    should_pause = mock_invocation_context.should_pause_invocation(
+        event_to_pause
+    )
+
+    # Assert
+    assert should_pause
 
   def test_is_resumable_true(self):
     """Tests that is_resumable is True when resumability is enabled."""
@@ -424,113 +927,808 @@ class TestInvocationContextWithAppResumablity:
     assert 'sub_sub_agent_1' not in invocation_context.agent_states
     assert 'sub_sub_agent_1' not in invocation_context.end_of_agents
 
+  def test_set_and_load_agent_state_keyed_by_node_path(self):
+    """Parallel workflow branches sharing an agent name isolate state by node_path."""
 
-class TestFindMatchingFunctionCall:
-  """Test suite for find_matching_function_call."""
+    class _StepState(BaseAgentState):
+      step: int = 0
 
-  @pytest.fixture
-  def test_invocation_context(self):
-    """Create a mock invocation context for testing."""
+    helper = BaseAgent(name='helper')
+    base_ctx = self._create_test_invocation_context(
+        ResumabilityConfig(is_resumable=True)
+    )
+    branch1_ctx = base_ctx.model_copy(
+        update={'agent': helper, 'node_path': 'wf@1/helper@1'}
+    )
+    branch2_ctx = base_ctx.model_copy(
+        update={'agent': helper, 'node_path': 'wf@1/helper@2'}
+    )
 
-    def _create_invocation_context(events):
-      return InvocationContext(
-          session_service=Mock(spec=BaseSessionService),
-          agent=Mock(spec=BaseAgent, name='agent'),
-          invocation_id='inv_1',
-          session=Mock(spec=Session, events=events),
+    branch1_ctx.set_agent_state('helper', agent_state=_StepState(step=1))
+    branch2_ctx.set_agent_state('helper', end_of_agent=True)
+
+    assert base_ctx.agent_states == {'wf@1/helper@1': {'step': 1}}
+    assert base_ctx.end_of_agents == {
+        'wf@1/helper@1': False,
+        'wf@1/helper@2': True,
+    }
+    loaded_branch1 = helper._load_agent_state(branch1_ctx, _StepState)
+    assert loaded_branch1 is not None
+    assert loaded_branch1.step == 1
+    assert helper._load_agent_state(branch2_ctx, _StepState) is None
+
+    ev1 = helper._create_agent_state_event(branch1_ctx)
+    ev2 = helper._create_agent_state_event(branch2_ctx)
+    assert ev1.actions.agent_state == {'step': 1}
+    assert not ev1.actions.end_of_agent
+    assert ev2.actions.agent_state is None
+    assert ev2.actions.end_of_agent is True
+
+    # A stale True under self.name must not override an explicit False under
+    # node_path.
+    base_ctx.end_of_agents['helper'] = True
+    ev1_with_stale_name = helper._create_agent_state_event(branch1_ctx)
+    assert not ev1_with_stale_name.actions.end_of_agent
+
+    # When node_path has ended, stale state under self.name must not be loaded
+    # or emitted in the state event.
+    base_ctx.agent_states['helper'] = {'step': 999}
+    assert helper._load_agent_state(branch2_ctx, _StepState) is None
+    ev2_with_stale_name = helper._create_agent_state_event(branch2_ctx)
+    assert ev2_with_stale_name.actions.agent_state is None
+    assert ev2_with_stale_name.actions.end_of_agent is True
+
+  def test_load_agent_state_mock_context_compatibility(self):
+    """Loading agent state from unconfigured or mock context returns None safely."""
+
+    class _StepState(BaseAgentState):
+      step: int = 0
+
+    helper = BaseAgent(name='helper')
+
+    # MagicMock context without agent_states explicitly set
+    magic_ctx = MagicMock()
+    assert helper._load_agent_state(magic_ctx, _StepState) is None
+
+    # Mock context with empty agent_states and mock end_of_agents (not a container)
+    plain_ctx = Mock()
+    plain_ctx.agent_states = {}
+    plain_ctx.end_of_agents = Mock()
+    plain_ctx.invocation_id = 'test_inv'
+    plain_ctx.branch = 'main'
+    assert helper._load_agent_state(plain_ctx, _StepState) is None
+    ev = helper._create_agent_state_event(plain_ctx)
+    assert ev.actions.agent_state is None
+
+    # Mock(spec=InvocationContext) where Pydantic model field node_path is unset
+    spec_ctx = Mock(spec=InvocationContext)
+    spec_ctx.agent_states = {}
+    spec_ctx.end_of_agents = {'helper': True}
+    spec_ctx.invocation_id = 'test_inv'
+    spec_ctx.branch = 'main'
+    assert helper._load_agent_state(spec_ctx, _StepState) is None
+    spec_ev = helper._create_agent_state_event(spec_ctx)
+    assert spec_ev.actions.end_of_agent is True
+
+
+class TestIncrementLlmCallCount:
+  """Test suite for InvocationContext.increment_llm_call_count."""
+
+  def _context(self, run_config=None):
+    kwargs = {} if run_config is None else {'run_config': run_config}
+    return InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
+        agent=Mock(spec=BaseAgent),
+        invocation_id='inv_1',
+        session=Mock(spec=Session, events=[]),
+        **kwargs,
+    )
+
+  def test_allows_exactly_max_llm_calls_then_raises(self):
+    """The limit is the number of calls allowed, not the count before it."""
+    ctx = self._context(RunConfig(max_llm_calls=2))
+
+    ctx.increment_llm_call_count()
+    ctx.increment_llm_call_count()
+
+    with pytest.raises(LlmCallsLimitExceededError, match='limit of `2`'):
+      ctx.increment_llm_call_count()
+
+  def test_keeps_raising_once_the_limit_is_passed(self):
+    """The limit latches: a caller cannot swallow one error and carry on."""
+    ctx = self._context(RunConfig(max_llm_calls=1))
+    ctx.increment_llm_call_count()
+
+    with pytest.raises(LlmCallsLimitExceededError):
+      ctx.increment_llm_call_count()
+    with pytest.raises(LlmCallsLimitExceededError):
+      ctx.increment_llm_call_count()
+
+  @pytest.mark.parametrize('max_llm_calls', [0, -1])
+  def test_non_positive_limit_is_not_enforced(self, max_llm_calls: int):
+    """A non-positive limit documents 'no enforcement', not 'no calls'."""
+    ctx = self._context(RunConfig(max_llm_calls=max_llm_calls))
+
+    for _ in range(5):
+      ctx.increment_llm_call_count()
+
+  def test_without_run_config_the_limit_is_not_enforced(self):
+    """run_config is optional, so counting must tolerate its absence."""
+    ctx = self._context()
+    assert ctx.run_config is None
+
+    for _ in range(5):
+      ctx.increment_llm_call_count()
+
+  def test_count_is_per_invocation_context(self):
+    """Two invocations must not share a budget."""
+    first = self._context(RunConfig(max_llm_calls=1))
+    second = self._context(RunConfig(max_llm_calls=1))
+
+    first.increment_llm_call_count()
+    second.increment_llm_call_count()
+
+    with pytest.raises(LlmCallsLimitExceededError):
+      second.increment_llm_call_count()
+
+
+def _ctx_on_branch(branch, events):
+  """An InvocationContext on `branch` over a session holding `events`."""
+  return InvocationContext(
+      session_service=Mock(spec=BaseSessionService),
+      agent=Mock(spec=BaseAgent),
+      invocation_id='inv_1',
+      branch=branch,
+      session=Mock(spec=Session, events=events),
+  )
+
+
+def test_get_events_current_branch_includes_user_event_on_sub_branch():
+  """A user event from a descendant sub-branch belongs to this subtree."""
+  user_on_child = Event(
+      invocation_id='inv_1', author='user', branch='agent_1.child'
+  )
+  ctx = _ctx_on_branch('agent_1', [user_on_child])
+
+  assert ctx._get_events(current_branch=True) == [user_on_child]
+
+
+def test_get_events_current_branch_excludes_agent_event_on_sub_branch():
+  """A non-user event from a descendant sub-branch is not returned.
+
+  This is asymmetric with the user case above on purpose: widening it would
+  hand every caller a descendant's internal events. Pinned here so the
+  asymmetry is a stated contract rather than an accident.
+  """
+  agent_on_child = Event(
+      invocation_id='inv_1', author='some_agent', branch='agent_1.child'
+  )
+  ctx = _ctx_on_branch('agent_1', [agent_on_child])
+
+  assert ctx._get_events(current_branch=True) == []
+
+
+def test_get_events_current_branch_excludes_sibling_branch():
+  """A sibling branch is never part of this subtree."""
+  user_on_sibling = Event(
+      invocation_id='inv_1', author='user', branch='agent_2'
+  )
+  ctx = _ctx_on_branch('agent_1', [user_on_sibling])
+
+  assert ctx._get_events(current_branch=True) == []
+
+
+def test_get_events_empty_branch_does_not_match_every_branched_event():
+  """An empty branch must not behave like "match everything".
+
+  An empty string is a real branch value in the workflow code, and a bare
+  descendant test would treat every branched event as its descendant.
+  """
+  user_on_branch = Event(invocation_id='inv_1', author='user', branch='agent_1')
+  ctx = _ctx_on_branch('', [user_on_branch])
+
+  assert ctx._get_events(current_branch=True) == []
+
+
+def _call_event(branch, call_id):
+  """A non-user event issuing function call `call_id` on `branch`."""
+  return Event(
+      invocation_id='inv_1',
+      author='some_agent',
+      branch=branch,
+      content=Content(
+          parts=[Part(function_call=FunctionCall(id=call_id, name='t'))]
+      ),
+  )
+
+
+def _user_response_event(branch, call_id):
+  """A user event answering function call `call_id` on `branch`."""
+  return Event(
+      invocation_id='inv_1',
+      author='user',
+      branch=branch,
+      content=Content(
+          parts=[
+              Part(
+                  function_response=FunctionResponse(
+                      id=call_id, name='t', response={}
+                  )
+              )
+          ]
+      ),
+  )
+
+
+def test_get_events_current_branch_keeps_user_response_to_a_call_here():
+  """A reply answering a call issued in this subtree is returned."""
+  call_here = _call_event('agent_1.child', 'fc_1')
+  reply = _user_response_event('agent_1', 'fc_1')
+  ctx = _ctx_on_branch('agent_1', [call_here, reply])
+
+  assert ctx._get_events(current_branch=True) == [reply]
+
+
+def test_get_events_current_branch_drops_user_response_to_a_call_elsewhere():
+  """Sitting on this branch is not enough for a reply to a foreign call.
+
+  The function-response gate is the only difference from the test above, so a
+  reply that answers a parallel tree's call is dropped even though its own
+  branch matches exactly.
+  """
+  call_elsewhere = _call_event('agent_2', 'fc_1')
+  reply = _user_response_event('agent_1', 'fc_1')
+  ctx = _ctx_on_branch('agent_1', [call_elsewhere, reply])
+
+  assert ctx._get_events(current_branch=True) == []
+
+
+def test_get_events_current_branch_drops_user_response_to_a_lookalike_call():
+  """A branch that merely shares a prefix does not count as a sub-branch.
+
+  `agent_10` starts with `agent_1`, so a plain prefix test would read the call
+  as issued in this subtree and let the reply through.
+  """
+  call_on_lookalike = _call_event('agent_10', 'fc_1')
+  reply = _user_response_event('agent_1', 'fc_1')
+  ctx = _ctx_on_branch('agent_1', [call_on_lookalike, reply])
+
+  assert ctx._get_events(current_branch=True) == []
+
+
+def test_get_events_without_a_branch_matches_every_user_event():
+  """A context with no branch sees user events wherever they sit.
+
+  Non-user events stay on the strict rule, so this also pins the asymmetry:
+  the agent event beside it is not returned.
+  """
+  user_elsewhere = Event(
+      invocation_id='inv_1', author='user', branch='agent_2.child'
+  )
+  agent_elsewhere = Event(
+      invocation_id='inv_1', author='some_agent', branch='agent_2.child'
+  )
+  ctx = _ctx_on_branch(None, [user_elsewhere, agent_elsewhere])
+
+  assert ctx._get_events(current_branch=True) == [user_elsewhere]
+
+
+def test_get_events_current_branch_filters_each_response_independently():
+  """Several replies on one branch are each judged against their own call.
+
+  The set of calls issued in this subtree is the same for every event, so it
+  is built once per call rather than rescanned per reply. This pins that the
+  shared set still discriminates: the reply to a foreign call is dropped while
+  the replies around it are kept.
+  """
+  call_here = _call_event('agent_1', 'fc_here')
+  call_on_child = _call_event('agent_1.child', 'fc_child')
+  call_elsewhere = _call_event('agent_2', 'fc_far')
+  reply_here = _user_response_event('agent_1', 'fc_here')
+  reply_far = _user_response_event('agent_1', 'fc_far')
+  reply_child = _user_response_event('agent_1', 'fc_child')
+  ctx = _ctx_on_branch(
+      'agent_1',
+      [
+          call_here,
+          call_on_child,
+          call_elsewhere,
+          reply_here,
+          reply_far,
+          reply_child,
+      ],
+  )
+
+  # `call_here` sits on exactly this branch, so the non-user rule returns it
+  # too; the two sub-branch calls do not.
+  assert ctx._get_events(current_branch=True) == [
+      call_here,
+      reply_here,
+      reply_child,
+  ]
+
+
+def test_get_events_current_branch_filters_by_node_path_for_single_turn_agent():
+  """A branched single_turn agent drops events from sibling node_paths on the same branch."""
+  from google.adk.events.event import NodeInfo
+  from google.adk.utils._agent_mode import AgentMode
+
+  agent = Mock(spec=BaseAgent)
+  agent.mode = AgentMode.SINGLE_TURN
+
+  unscoped_user = Event(invocation_id='inv_1', author='user', branch=None)
+  sibling_node_event = Event(
+      invocation_id='inv_1',
+      author='node_a',
+      branch='agent_1',
+      node_info=NodeInfo(id='node_a', path='wf@1/node_a@1'),
+  )
+  sibling_user_event = Event(
+      invocation_id='inv_1',
+      author='user',
+      branch='agent_1',
+      node_info=NodeInfo(id='node_a', path='wf@1/node_a@1'),
+  )
+  own_node_event = Event(
+      invocation_id='inv_1',
+      author='node_b',
+      branch='agent_1',
+      node_info=NodeInfo(id='node_b', path='wf@1/node_b@1'),
+  )
+  descendant_node_event = Event(
+      invocation_id='inv_1',
+      author='child',
+      branch='agent_1',
+      node_info=NodeInfo(id='child', path='wf@1/node_b@1/child@1'),
+  )
+
+  ctx = InvocationContext(
+      session_service=Mock(spec=BaseSessionService),
+      agent=agent,
+      invocation_id='inv_1',
+      branch='agent_1',
+      node_path='wf@1/node_b@1',
+      session=Mock(
+          spec=Session,
+          events=[
+              unscoped_user,
+              sibling_node_event,
+              sibling_user_event,
+              own_node_event,
+              descendant_node_event,
+          ],
+      ),
+  )
+
+  assert ctx._get_events(current_branch=True) == [
+      unscoped_user,
+      own_node_event,
+      descendant_node_event,
+  ]
+
+
+def _background_ctx() -> InvocationContext:
+  return InvocationContext(
+      session_service=Mock(spec=BaseSessionService),
+      agent=Mock(spec=BaseAgent),
+      invocation_id='inv_1',
+      session=Mock(spec=Session, events=[]),
+  )
+
+
+async def _sleep_forever() -> None:
+  await asyncio.sleep(100)
+
+
+@pytest.fixture(name='background_tasks')
+async def _background_tasks_fixture():
+  """Two running tasks, cancelled when the test ends."""
+  tasks = [asyncio.create_task(_sleep_forever()) for _ in range(2)]
+  yield tasks
+  for task in tasks:
+    task.cancel()
+  await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_parallel_calls_to_one_tool_are_registered_separately(
+    background_tasks,
+):
+  """Parallel calls to the same tool are registered side by side."""
+  ctx = _background_ctx()
+  first, second = background_tasks
+
+  ctx._add_background_tool(
+      ActiveBackgroundTool(
+          tool_name='monitor', function_call_id='fc_1', task=first
       )
+  )
+  ctx._add_background_tool(
+      ActiveBackgroundTool(
+          tool_name='monitor', function_call_id='fc_2', task=second
+      )
+  )
 
-    return _create_invocation_context
+  assert ctx._active_background_tools['fc_1'].task is first
+  assert ctx._active_background_tools['fc_2'].task is second
 
-  def test_find_matching_function_call_found(self, test_invocation_context):
-    """Tests that a matching function call is found."""
-    fc = Part.from_function_call(name='some_tool', args={})
-    fc.function_call.id = 'test_function_call_id'
-    fc_event = Event(
-        invocation_id='inv_1',
-        author='agent',
-        content=testing_utils.ModelContent([fc]),
-    )
-    fr = Part.from_function_response(
-        name='some_tool', response={'result': 'ok'}
-    )
-    fr.function_response.id = 'test_function_call_id'
-    fr_event = Event(
-        invocation_id='inv_1',
-        author='agent',
-        content=Content(role='user', parts=[fr]),
-    )
-    invocation_context = test_invocation_context([fc_event, fr_event])
-    matching_fc_event = invocation_context._find_matching_function_call(
-        fr_event
-    )
-    assert testing_utils.simplify_content(
-        matching_fc_event.content
-    ) == testing_utils.simplify_content(fc_event.content)
 
-  def test_find_matching_function_call_not_found(self, test_invocation_context):
-    """Tests that no matching function call is returned if id doesn't match."""
-    fc = Part.from_function_call(name='some_tool', args={})
-    fc.function_call.id = 'another_function_call_id'
-    fc_event = Event(
-        invocation_id='inv_1',
-        author='agent',
-        content=testing_utils.ModelContent([fc]),
-    )
-    fr = Part.from_function_response(
-        name='some_tool', response={'result': 'ok'}
-    )
-    fr.function_response.id = 'test_function_call_id'
-    fr_event = Event(
-        invocation_id='inv_1',
-        author='agent',
-        content=Content(role='user', parts=[fr]),
-    )
-    invocation_context = test_invocation_context([fc_event, fr_event])
-    match = invocation_context._find_matching_function_call(fr_event)
-    assert match is None
+async def test_copy_made_before_first_registration_has_its_own_tools(
+    background_tasks,
+):
+  """A sibling agent's context does not see this agent's background tools."""
+  parent = _background_ctx()
+  sibling = parent.model_copy()
 
-  def test_find_matching_function_call_no_call_events(
-      self, test_invocation_context
-  ):
-    """Tests that no matching function call is returned if there are no call events."""
-    fr = Part.from_function_response(
-        name='some_tool', response={'result': 'ok'}
-    )
-    fr.function_response.id = 'test_function_call_id'
-    fr_event = Event(
-        invocation_id='inv_1',
-        author='agent',
-        content=Content(role='user', parts=[fr]),
-    )
-    invocation_context = test_invocation_context([fr_event])
-    match = invocation_context._find_matching_function_call(fr_event)
-    assert match is None
+  parent._add_background_tool(
+      ActiveBackgroundTool(
+          tool_name='monitor', function_call_id='fc_1', task=background_tasks[0]
+      )
+  )
 
-  def test_find_matching_function_call_no_response_in_event(
-      self, test_invocation_context
-  ):
-    """Tests result is None if function_response_event has no function response."""
-    fr_event_no_fr = Event(
-        author='agent',
-        content=Content(role='user', parts=[Part(text='user message')]),
+  assert not sibling._active_background_tools
+
+
+async def test_deprecated_active_streaming_tools_view(background_tasks):
+  """The deprecated view lists streaming calls by tool name, latest call wins."""
+  ctx = _background_ctx()
+  first, second = background_tasks
+  stream = LiveRequestQueue()
+  ctx._add_background_tool(
+      ActiveBackgroundTool(
+          tool_name='monitor',
+          function_call_id='fc_1',
+          task=first,
+          is_generator=True,
+      )
+  )
+  ctx._add_background_tool(
+      ActiveBackgroundTool(
+          tool_name='monitor',
+          function_call_id='fc_2',
+          task=second,
+          input_stream=stream,
+          is_generator=True,
+      )
+  )
+  ctx._add_background_tool(
+      ActiveBackgroundTool(
+          tool_name='lookup', function_call_id='fc_3', task=first
+      )
+  )
+
+  with pytest.warns(DeprecationWarning, match='active_streaming_tools'):
+    view = ctx.active_streaming_tools
+
+  assert list(view) == ['monitor']
+  assert view['monitor'].task is second
+  assert view['monitor'].stream is stream
+
+
+async def test_deprecated_active_non_blocking_tool_tasks_view(
+    background_tasks,
+):
+  """The deprecated view lists non-blocking calls under their old keys."""
+  ctx = _background_ctx()
+  first, second = background_tasks
+  ctx._add_background_tool(
+      ActiveBackgroundTool(
+          tool_name='lookup', function_call_id='fc_1', task=first
+      )
+  )
+  ctx._add_background_tool(
+      ActiveBackgroundTool(
+          tool_name='monitor',
+          function_call_id='fc_2',
+          task=second,
+          is_generator=True,
+      )
+  )
+
+  with pytest.warns(DeprecationWarning, match='active_non_blocking_tool_tasks'):
+    view = ctx.active_non_blocking_tool_tasks
+
+  assert view == {'lookup_fc_1': first}
+
+
+def test_deprecated_views_are_none_before_any_registration():
+  """Like the fields they replace, the views are None until a tool runs."""
+  ctx = _background_ctx()
+
+  with pytest.warns(DeprecationWarning):
+    assert ctx.active_streaming_tools is None
+  with pytest.warns(DeprecationWarning):
+    assert ctx.active_non_blocking_tool_tasks is None
+
+
+async def test_deprecated_active_streaming_tools_writes_reach_registry(
+    background_tasks,
+):
+  """Code written against the old dict still drives the framework."""
+  ctx = _background_ctx()
+  first, second = background_tasks
+  stream = LiveRequestQueue()
+
+  with pytest.warns(DeprecationWarning):
+    if ctx.active_streaming_tools is None:
+      ctx.active_streaming_tools = {}
+  with pytest.warns(DeprecationWarning):
+    ctx.active_streaming_tools['monitor'] = ActiveStreamingTool(
+        task=first, stream=stream
     )
-    fc = Part.from_function_call(name='some_tool', args={})
-    fc.function_call.id = 'test_function_call_id'
-    fc_event = Event(
+
+  (entry,) = ctx._active_background_tools.values()
+  assert entry.tool_name == 'monitor'
+  assert entry.task is first
+  assert entry.input_stream is stream
+  assert entry.is_generator
+
+  with pytest.warns(DeprecationWarning):
+    ctx.active_streaming_tools['monitor'].task = second
+  with pytest.warns(DeprecationWarning):
+    ctx.active_streaming_tools['monitor'].stream = None
+  assert entry.task is second
+  assert entry.input_stream is None
+
+  with pytest.warns(DeprecationWarning):
+    del ctx.active_streaming_tools['monitor']
+  assert not ctx._active_background_tools
+  assert not second.done()
+
+
+async def test_deprecated_active_streaming_tools_assignment_replaces_calls(
+    background_tasks,
+):
+  """Assigning a tool replaces all its calls, and other kinds are untouched."""
+  ctx = _background_ctx()
+  first, second = background_tasks
+  for function_call_id in ('fc_1', 'fc_2'):
+    ctx._add_background_tool(
+        ActiveBackgroundTool(
+            tool_name='monitor',
+            function_call_id=function_call_id,
+            task=first,
+            is_generator=True,
+        )
+    )
+  ctx._add_background_tool(
+      ActiveBackgroundTool(
+          tool_name='lookup', function_call_id='fc_3', task=first
+      )
+  )
+
+  with pytest.warns(DeprecationWarning):
+    ctx.active_streaming_tools['monitor'] = ActiveStreamingTool(task=second)
+
+  with pytest.warns(DeprecationWarning):
+    view = ctx.active_streaming_tools
+  assert len(view) == 1
+  assert view['monitor'].task is second
+  assert 'fc_3' in ctx._active_background_tools
+
+  with pytest.warns(DeprecationWarning):
+    ctx.active_streaming_tools = None
+  assert list(ctx._active_background_tools) == ['fc_3']
+
+
+async def test_deprecated_active_non_blocking_tool_tasks_writes_reach_registry(
+    background_tasks,
+):
+  """Tasks added or removed through the old dict are tracked accordingly."""
+  ctx = _background_ctx()
+  first, second = background_tasks
+  ctx._add_background_tool(
+      ActiveBackgroundTool(
+          tool_name='lookup', function_call_id='fc_1', task=first
+      )
+  )
+
+  with pytest.warns(DeprecationWarning):
+    ctx.active_non_blocking_tool_tasks['my_task'] = second
+  with pytest.warns(DeprecationWarning):
+    assert ctx.active_non_blocking_tool_tasks == {
+        'lookup_fc_1': first,
+        'my_task': second,
+    }
+
+  with pytest.warns(DeprecationWarning):
+    del ctx.active_non_blocking_tool_tasks['lookup_fc_1']
+  (entry,) = ctx._active_background_tools.values()
+  assert entry.task is second
+  assert not first.done()
+
+  with pytest.warns(DeprecationWarning):
+    ctx.active_non_blocking_tool_tasks.clear()
+  assert not ctx._active_background_tools
+
+
+async def test_tasks_written_through_deprecated_fields_are_stopped(
+    background_tasks,
+):
+  """The framework cancels tasks registered through the deprecated fields."""
+  ctx = _background_ctx()
+  first, second = background_tasks
+  with pytest.warns(DeprecationWarning):
+    ctx.active_streaming_tools = {'monitor': ActiveStreamingTool(task=first)}
+  with pytest.warns(DeprecationWarning):
+    ctx.active_non_blocking_tool_tasks = {'lookup_fc_1': second}
+
+  await stop_background_tool_tasks(ctx)
+
+  assert first.cancelled()
+  assert second.cancelled()
+  assert not ctx._active_background_tools
+
+
+@pytest.mark.parametrize(
+    'field', ['active_streaming_tools', 'active_non_blocking_tool_tasks']
+)
+def test_deprecated_constructor_arguments_are_applied(field):
+  """Passing a deprecated field to the constructor registers its entries."""
+  task = Mock(spec=asyncio.Task)
+  value = (
+      {'monitor': ActiveStreamingTool(task=task)}
+      if field == 'active_streaming_tools'
+      else {'lookup_fc_1': task}
+  )
+  with pytest.warns(DeprecationWarning, match=field):
+    ctx = InvocationContext(
+        session_service=Mock(spec=BaseSessionService),
         invocation_id='inv_1',
-        author='agent',
-        content=testing_utils.ModelContent([fc]),
+        session=Mock(spec=Session, events=[]),
+        **{field: value},
     )
-    fr = Part.from_function_response(
-        name='some_tool', response={'result': 'ok'}
-    )
-    fr.function_response.id = 'test_function_call_id'
-    fr_event = Event(
-        invocation_id='inv_1',
-        author='agent',
-        content=Content(role='user', parts=[Part(text='user message')]),
-    )
-    invocation_context = test_invocation_context([fc_event, fr_event])
-    match = invocation_context._find_matching_function_call(fr_event_no_fr)
-    assert match is None
+
+  (entry,) = ctx._active_background_tools.values()
+  assert entry.task is task
+  with pytest.warns(DeprecationWarning):
+    assert list(getattr(ctx, field)) == list(value)
+
+
+def test_deprecated_model_validate_applies_fields():
+  """model_validate accepts the deprecated fields like the constructor does."""
+  task = Mock(spec=asyncio.Task)
+
+  with pytest.warns(DeprecationWarning, match='active_non_blocking_tool_tasks'):
+    ctx = InvocationContext.model_validate({
+        'session_service': Mock(spec=BaseSessionService),
+        'invocation_id': 'inv_1',
+        'session': Mock(spec=Session, events=[]),
+        'active_non_blocking_tool_tasks': {'lookup_fc_1': task},
+    })
+
+  (entry,) = ctx._active_background_tools.values()
+  assert entry.task is task
+
+
+async def test_deprecated_views_raise_key_error_for_missing_keys(
+    background_tasks,
+):
+  """Missing keys raise KeyError, like the dicts the views replace."""
+  ctx = _background_ctx()
+  ctx._add_background_tool(
+      ActiveBackgroundTool(
+          tool_name='monitor',
+          function_call_id='fc_1',
+          task=background_tasks[0],
+          is_generator=True,
+      )
+  )
+
+  with pytest.warns(DeprecationWarning):
+    streaming = ctx.active_streaming_tools
+  with pytest.warns(DeprecationWarning):
+    non_blocking = ctx.active_non_blocking_tool_tasks
+  for view in (streaming, non_blocking):
+    with pytest.raises(KeyError):
+      _ = view['lookup']
+    with pytest.raises(KeyError):
+      del view['lookup']
+  assert 'monitor' in streaming
+  assert not non_blocking
+
+
+async def test_deprecated_active_non_blocking_tool_tasks_overwrites_key(
+    background_tasks,
+):
+  """Writing an existing key replaces that call's task in place."""
+  ctx = _background_ctx()
+  first, second = background_tasks
+  ctx._add_background_tool(
+      ActiveBackgroundTool(
+          tool_name='lookup', function_call_id='fc_1', task=first
+      )
+  )
+
+  with pytest.warns(DeprecationWarning):
+    ctx.active_non_blocking_tool_tasks['lookup_fc_1'] = second
+
+  assert list(ctx._active_background_tools) == ['fc_1']
+  assert ctx._active_background_tools['fc_1'].task is second
+
+
+async def test_deprecated_active_non_blocking_tool_tasks_assignment_replaces(
+    background_tasks,
+):
+  """Assigning the field replaces the non-blocking calls only."""
+  ctx = _background_ctx()
+  first, second = background_tasks
+  ctx._add_background_tool(
+      ActiveBackgroundTool(
+          tool_name='lookup', function_call_id='fc_1', task=first
+      )
+  )
+  ctx._add_background_tool(
+      ActiveBackgroundTool(
+          tool_name='monitor',
+          function_call_id='fc_2',
+          task=first,
+          is_generator=True,
+      )
+  )
+
+  with pytest.warns(DeprecationWarning):
+    ctx.active_non_blocking_tool_tasks = {'other_fc_3': second}
+
+  with pytest.warns(DeprecationWarning):
+    assert ctx.active_non_blocking_tool_tasks == {'other_fc_3': second}
+  assert 'fc_1' not in ctx._active_background_tools
+  assert 'fc_2' in ctx._active_background_tools
+
+
+@pytest.mark.parametrize(
+    'field', ['active_streaming_tools', 'active_non_blocking_tool_tasks']
+)
+async def test_deprecated_field_self_assignment_keeps_entries(
+    background_tasks, field
+):
+  """Assigning a field its own view keeps every entry."""
+  ctx = _background_ctx()
+  ctx._add_background_tool(
+      ActiveBackgroundTool(
+          tool_name='tool',
+          function_call_id='fc_1',
+          task=background_tasks[0],
+          is_generator=field == 'active_streaming_tools',
+      )
+  )
+
+  with pytest.warns(DeprecationWarning):
+    setattr(ctx, field, getattr(ctx, field))
+
+  (entry,) = ctx._active_background_tools.values()
+  assert entry.task is background_tasks[0]
+
+
+async def test_deprecated_views_repr_like_a_dict(background_tasks):
+  """The views print as the dicts they stand in for."""
+  ctx = _background_ctx()
+  ctx._add_background_tool(
+      ActiveBackgroundTool(
+          tool_name='lookup', function_call_id='fc_1', task=background_tasks[0]
+      )
+  )
+
+  with pytest.warns(DeprecationWarning):
+    non_blocking = ctx.active_non_blocking_tool_tasks
+  with pytest.warns(DeprecationWarning):
+    streaming = ctx.active_streaming_tools
+
+  assert repr(non_blocking) == repr({'lookup_fc_1': background_tasks[0]})
+  assert repr(streaming) == '{}'
+
+
+async def test_deprecated_views_keep_same_named_entries_apart(background_tasks):
+  """The same name written to both deprecated fields makes two entries."""
+  ctx = _background_ctx()
+  first, second = background_tasks
+
+  with pytest.warns(DeprecationWarning):
+    ctx.active_streaming_tools = {'lookup': ActiveStreamingTool(task=first)}
+  with pytest.warns(DeprecationWarning):
+    ctx.active_non_blocking_tool_tasks = {'lookup': second}
+
+  with pytest.warns(DeprecationWarning):
+    assert ctx.active_streaming_tools['lookup'].task is first
+  with pytest.warns(DeprecationWarning):
+    assert ctx.active_non_blocking_tool_tasks == {'lookup': second}
+  assert len(ctx._active_background_tools) == 2

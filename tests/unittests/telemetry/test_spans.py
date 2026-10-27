@@ -21,35 +21,64 @@ from unittest import mock
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.agents.llm_agent import LlmAgent
 from google.adk.agents.run_config import RunConfig
+from google.adk.auth.auth_credential import AuthCredential
+from google.adk.auth.auth_credential import AuthCredentialTypes
+from google.adk.auth.auth_credential import OAuth2Auth
 from google.adk.errors.tool_execution_error import ToolErrorType
 from google.adk.errors.tool_execution_error import ToolExecutionError
+from google.adk.events.event import Event
+from google.adk.models.cache_metadata import CacheMetadata
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from google.adk.telemetry import _adk_attributes
+from google.adk.telemetry import ContentCapturingMode
+from google.adk.telemetry import TelemetryConfig
+from google.adk.telemetry import tracing
+from google.adk.telemetry._adk_attributes import ADK_EXPERIMENTAL_CONTEXT_CACHE_CONTENTS_COUNT
+from google.adk.telemetry._adk_attributes import ADK_EXPERIMENTAL_CONTEXT_CACHE_FINGERPRINT
+from google.adk.telemetry._adk_attributes import ADK_EXPERIMENTAL_CONTEXT_CACHE_HIT
+from google.adk.telemetry._adk_attributes import ADK_EXPERIMENTAL_CONTEXT_CACHE_INVOCATIONS_USED
 from google.adk.telemetry._experimental_semconv import _safe_json_serialize_no_whitespaces
+from google.adk.telemetry._stable_semconv import USER_CONTENT_ELIDED
+from google.adk.telemetry.context import ADK_EXPERIMENTAL_TELEMETRY
+from google.adk.telemetry.tracing import _ADK_CAPTURE_MCP_HTTP_BODIES
+from google.adk.telemetry.tracing import _HTTP_REQUEST_BODY_CONTENT
+from google.adk.telemetry.tracing import _HTTP_RESPONSE_BODY_CONTENT
+from google.adk.telemetry.tracing import _OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_CLIENT_REQUEST
+from google.adk.telemetry.tracing import _OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_CLIENT_RESPONSE
+from google.adk.telemetry.tracing import _should_report_mcp_http_exchanges
+from google.adk.telemetry.tracing import _trace_mcp_http_exchange
 from google.adk.telemetry.tracing import _use_extra_generate_content_attributes
 from google.adk.telemetry.tracing import ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS
 from google.adk.telemetry.tracing import GCP_MCP_SERVER_DESTINATION_ID
+from google.adk.telemetry.tracing import GenerateContentSpan
+from google.adk.telemetry.tracing import MCP_PROTOCOL_VERSION
+from google.adk.telemetry.tracing import MCP_SESSION_ID
+from google.adk.telemetry.tracing import resolve_error_type
 from google.adk.telemetry.tracing import safe_json_serialize
 from google.adk.telemetry.tracing import trace_agent_invocation
 from google.adk.telemetry.tracing import trace_call_llm
+from google.adk.telemetry.tracing import trace_generate_content_result
 from google.adk.telemetry.tracing import trace_inference_result
 from google.adk.telemetry.tracing import trace_merged_tool_calls
 from google.adk.telemetry.tracing import trace_send_data
 from google.adk.telemetry.tracing import trace_tool_call
+from google.adk.telemetry.tracing import use_generate_content_span
 from google.adk.telemetry.tracing import use_inference_span
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.tool_context import ToolContext
+from google.genai import errors as genai_errors
 from google.genai import types
-from mcp import ClientSession as McpClientSession
-from mcp import ListToolsResult as McpListToolsResult
 from mcp import Tool as McpTool
 from opentelemetry._logs import LogRecord
+from opentelemetry._logs import SeverityNumber
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_AGENT_NAME
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_CONVERSATION_ID
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_INPUT_MESSAGES
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_OPERATION_NAME
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_OUTPUT_MESSAGES
+from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_PROVIDER_NAME
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_REQUEST_MODEL
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_RESPONSE_FINISH_REASONS
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_SYSTEM
@@ -57,23 +86,20 @@ from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_A
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_USAGE_INPUT_TOKENS
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_USAGE_OUTPUT_TOKENS
 from opentelemetry.semconv._incubating.attributes.user_attributes import USER_ID
+from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
+from opentelemetry.semconv.attributes.http_attributes import HTTP_REQUEST_METHOD
+from opentelemetry.semconv.attributes.http_attributes import HTTP_RESPONSE_STATUS_CODE
+from opentelemetry.semconv.attributes.server_attributes import SERVER_ADDRESS
+from opentelemetry.semconv.attributes.server_attributes import SERVER_PORT
+from opentelemetry.semconv.attributes.url_attributes import URL_FULL
+from opentelemetry.trace import StatusCode
+from pydantic import BaseModel
 import pytest
 
 try:
   from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_TOOL_DEFINITIONS
 except ImportError:
   GEN_AI_TOOL_DEFINITIONS = 'gen_ai.tool.definitions'
-
-
-class Event:
-
-  def __init__(self, event_id: str, event_content: object):
-    self.id = event_id
-    self.content = event_content
-
-  def model_dumps_json(self, exclude_none: bool = False) -> str:
-    # This is just a stub for the spec. The mock will provide behavior.
-    return ''
 
 
 # Create a minimal concrete BaseTool for testing
@@ -83,6 +109,12 @@ class SimpleTestTool(BaseTool):
       self, *, args: dict[str, object], tool_context: ToolContext
   ) -> object:
     return 'SimpleTestTool result'
+
+
+@pytest.fixture(autouse=True)
+def _legacy_schema(monkeypatch: pytest.MonkeyPatch) -> None:
+  """Most tests here cover schema v1; v2 tests set the env var themselves."""
+  monkeypatch.setenv('ADK_TELEMETRY_SCHEMA_VERSION_OPT_IN', '1')
 
 
 @pytest.fixture
@@ -100,18 +132,13 @@ def mock_tool_fixture():
 
 @pytest.fixture
 def mock_event_fixture():
-  event_mock = mock.create_autospec(Event, instance=True)
-  event_mock.id = 'test_event_id'
-  event_mock.model_dumps_json.return_value = (
-      '{"default_event_key": "default_event_value"}'
-  )
-  event_mock.content = mock.MagicMock()
-  event_mock.content.parts = []
-  return event_mock
+  return Event(id='test_event_id', author='test_agent')
 
 
 async def _create_invocation_context(
-    agent: LlmAgent, state: Optional[dict[str, object]] = None
+    agent: LlmAgent,
+    state: Optional[dict[str, object]] = None,
+    run_config: Optional[RunConfig] = None,
 ) -> InvocationContext:
   session_service = InMemorySessionService()
   session = await session_service.create_session(
@@ -122,7 +149,7 @@ async def _create_invocation_context(
       agent=agent,
       session=session,
       session_service=session_service,
-      run_config=RunConfig(),
+      run_config=run_config or RunConfig(),
   )
   return invocation_context
 
@@ -222,6 +249,60 @@ async def test_trace_call_llm(monkeypatch, mock_span_fixture):
 
 
 @pytest.mark.asyncio
+async def test_trace_call_llm_skips_non_recording_span(monkeypatch):
+  agent = LlmAgent(name='test_agent')
+  invocation_context = await _create_invocation_context(agent)
+  llm_request = LlmRequest(model='gemini-pro')
+  llm_response = LlmResponse(turn_complete=True)
+  span = mock.MagicMock()
+  span.is_recording.return_value = False
+  get_telemetry_config = mock.Mock()
+  serialize_request = mock.Mock(return_value='{}')
+  monkeypatch.setattr(
+      'google.adk.telemetry.tracing._telemetry_config_from_invocation_context',
+      get_telemetry_config,
+  )
+  monkeypatch.setattr(
+      'google.adk.telemetry.tracing.safe_json_serialize', serialize_request
+  )
+
+  trace_call_llm(
+      invocation_context,
+      'test_event_id',
+      llm_request,
+      llm_response,
+      span=span,
+  )
+
+  get_telemetry_config.assert_not_called()
+  serialize_request.assert_not_called()
+  span.set_attribute.assert_not_called()
+  span.set_attributes.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_trace_call_llm_records_nothing_under_schema_v2(
+    monkeypatch, mock_span_fixture
+):
+  monkeypatch.setenv('ADK_TELEMETRY_SCHEMA_VERSION_OPT_IN', '2')
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+  agent = LlmAgent(name='test_agent')
+  invocation_context = await _create_invocation_context(agent)
+
+  trace_call_llm(
+      invocation_context,
+      'test_event_id',
+      LlmRequest(model='gemini-pro'),
+      LlmResponse(turn_complete=True),
+  )
+
+  mock_span_fixture.set_attribute.assert_not_called()
+  mock_span_fixture.set_attributes.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_trace_call_llm_with_no_usage_metadata(
     monkeypatch, mock_span_fixture
 ):
@@ -262,6 +343,693 @@ async def test_trace_call_llm_with_no_usage_metadata(
   assert mock_span_fixture.set_attribute.call_count == 10
   mock_span_fixture.set_attribute.assert_has_calls(
       expected_calls, any_order=True
+  )
+
+
+_EXPERIMENTAL_TELEMETRY_ON = RunConfig(
+    telemetry=TelemetryConfig(adk_experimental_telemetry_opt_in=True)
+)
+
+
+@pytest.mark.asyncio
+async def test_trace_call_llm_with_active_context_cache(
+    monkeypatch, mock_span_fixture
+):
+  """Test trace_call_llm records the state of an active context cache."""
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+
+  agent = LlmAgent(name='test_agent')
+  invocation_context = await _create_invocation_context(
+      agent, run_config=_EXPERIMENTAL_TELEMETRY_ON
+  )
+  llm_request = LlmRequest(
+      model='gemini-pro',
+      contents=[
+          types.Content(role='user', parts=[types.Part(text='Hello')]),
+      ],
+  )
+  llm_response = LlmResponse(
+      turn_complete=True,
+      finish_reason=types.FinishReason.STOP,
+      cache_metadata=CacheMetadata(
+          cache_name='projects/p/locations/l/cachedContents/c',
+          expire_time=1893456000.0,
+          fingerprint='fp-123',
+          invocations_used=3,
+          contents_count=5,
+      ),
+  )
+
+  trace_call_llm(invocation_context, 'test_event_id', llm_request, llm_response)
+
+  mock_span_fixture.set_attributes.assert_any_call({
+      ADK_EXPERIMENTAL_CONTEXT_CACHE_HIT: True,
+      ADK_EXPERIMENTAL_CONTEXT_CACHE_FINGERPRINT: 'fp-123',
+      ADK_EXPERIMENTAL_CONTEXT_CACHE_CONTENTS_COUNT: 5,
+      ADK_EXPERIMENTAL_CONTEXT_CACHE_INVOCATIONS_USED: 3,
+  })
+
+
+@pytest.mark.asyncio
+async def test_trace_call_llm_with_fingerprint_only_context_cache(
+    monkeypatch, mock_span_fixture
+):
+  """Test trace_call_llm records a miss when no cache is active."""
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+
+  agent = LlmAgent(name='test_agent')
+  invocation_context = await _create_invocation_context(
+      agent, run_config=_EXPERIMENTAL_TELEMETRY_ON
+  )
+  llm_request = LlmRequest(
+      model='gemini-pro',
+      contents=[
+          types.Content(role='user', parts=[types.Part(text='Hello')]),
+      ],
+  )
+  llm_response = LlmResponse(
+      turn_complete=True,
+      finish_reason=types.FinishReason.STOP,
+      cache_metadata=CacheMetadata(fingerprint='fp-123', contents_count=8),
+  )
+
+  trace_call_llm(invocation_context, 'test_event_id', llm_request, llm_response)
+
+  # The exact dict also pins that invocations_used is left out when unset.
+  mock_span_fixture.set_attributes.assert_any_call({
+      ADK_EXPERIMENTAL_CONTEXT_CACHE_HIT: False,
+      ADK_EXPERIMENTAL_CONTEXT_CACHE_FINGERPRINT: 'fp-123',
+      ADK_EXPERIMENTAL_CONTEXT_CACHE_CONTENTS_COUNT: 8,
+  })
+
+
+@pytest.mark.asyncio
+async def test_trace_call_llm_omits_context_cache_without_opt_in(
+    monkeypatch, mock_span_fixture
+):
+  """Test context cache attributes stay off unless experimental is opted in."""
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+
+  agent = LlmAgent(name='test_agent')
+  invocation_context = await _create_invocation_context(agent)
+  llm_request = LlmRequest(
+      model='gemini-pro',
+      contents=[
+          types.Content(role='user', parts=[types.Part(text='Hello')]),
+      ],
+  )
+  llm_response = LlmResponse(
+      turn_complete=True,
+      finish_reason=types.FinishReason.STOP,
+      cache_metadata=CacheMetadata(
+          cache_name='projects/p/locations/l/cachedContents/c',
+          expire_time=1893456000.0,
+          fingerprint='fp-123',
+          invocations_used=3,
+          contents_count=5,
+      ),
+  )
+
+  trace_call_llm(invocation_context, 'test_event_id', llm_request, llm_response)
+
+  # The span is still traced; only the experimental attributes are withheld.
+  mock_span_fixture.set_attribute.assert_any_call(
+      'gen_ai.system', 'gcp.vertex.agent'
+  )
+  set_keys = [
+      call.args[0] for call in mock_span_fixture.set_attribute.call_args_list
+  ]
+  for call in mock_span_fixture.set_attributes.call_args_list:
+    set_keys.extend(call.args[0])
+  assert not [key for key in set_keys if key.startswith('adk.experimental.')]
+
+
+@pytest.mark.asyncio
+async def test_trace_inference_result_with_context_cache(mock_span_fixture):
+  """Test the generate_content span also carries context cache state."""
+  agent = LlmAgent(name='test_agent')
+  invocation_context = await _create_invocation_context(
+      agent, run_config=_EXPERIMENTAL_TELEMETRY_ON
+  )
+  llm_response = LlmResponse(
+      turn_complete=True,
+      finish_reason=types.FinishReason.STOP,
+      cache_metadata=CacheMetadata(
+          cache_name='projects/p/locations/l/cachedContents/c',
+          expire_time=1893456000.0,
+          fingerprint='fp-123',
+          invocations_used=3,
+          contents_count=5,
+      ),
+  )
+
+  trace_inference_result(invocation_context, mock_span_fixture, llm_response)
+
+  mock_span_fixture.set_attributes.assert_any_call({
+      ADK_EXPERIMENTAL_CONTEXT_CACHE_HIT: True,
+      ADK_EXPERIMENTAL_CONTEXT_CACHE_FINGERPRINT: 'fp-123',
+      ADK_EXPERIMENTAL_CONTEXT_CACHE_CONTENTS_COUNT: 5,
+      ADK_EXPERIMENTAL_CONTEXT_CACHE_INVOCATIONS_USED: 3,
+  })
+
+
+@pytest.mark.asyncio
+async def test_trace_inference_result_omits_context_cache_without_opt_in(
+    mock_span_fixture,
+):
+  """Test the generate_content span withholds cache state without opt-in."""
+  agent = LlmAgent(name='test_agent')
+  invocation_context = await _create_invocation_context(agent)
+  llm_response = LlmResponse(
+      turn_complete=True,
+      finish_reason=types.FinishReason.STOP,
+      cache_metadata=CacheMetadata(fingerprint='fp-123', contents_count=5),
+  )
+
+  trace_inference_result(invocation_context, mock_span_fixture, llm_response)
+
+  set_keys = []
+  for call in mock_span_fixture.set_attributes.call_args_list:
+    set_keys.extend(call.args[0])
+  assert not [key for key in set_keys if key.startswith('adk.experimental.')]
+
+
+def _experimental_telemetry_run_config(
+    monkeypatch: pytest.MonkeyPatch, *, capture_content: bool
+) -> RunConfig:
+  """Builds an opted-in run config under the given span content setting.
+
+  `TelemetryConfig` reads its env fallbacks at construction, so the config has
+  to be built after the env var is set.
+  """
+  monkeypatch.setenv(
+      ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS, str(capture_content).lower()
+  )
+  return RunConfig(
+      telemetry=TelemetryConfig(adk_experimental_telemetry_opt_in=True)
+  )
+
+
+def _web_grounding_metadata() -> types.GroundingMetadata:
+  """What Gemini returns after a built-in google_search call."""
+  return types.GroundingMetadata(
+      web_search_queries=['adk release', 'google-adk pypi'],
+      grounding_chunks=[
+          types.GroundingChunk(
+              web=types.GroundingChunkWeb(uri='https://a.test/1', title='A')
+          ),
+          types.GroundingChunk(
+              web=types.GroundingChunkWeb(uri='https://b.test/2', title='B')
+          ),
+      ],
+  )
+
+
+def _grounding_attributes_set_on(span: mock.MagicMock) -> dict[str, Any]:
+  """Returns every `adk.experimental.grounding.*` attribute set on the span."""
+  attributes: dict[str, Any] = {}
+  for call in span.set_attributes.call_args_list:
+    attributes.update(call.args[0])
+  for call in span.set_attribute.call_args_list:
+    attributes[call.args[0]] = call.args[1]
+  return {
+      key: value
+      for key, value in attributes.items()
+      if key.startswith('adk.experimental.grounding.')
+  }
+
+
+@pytest.mark.asyncio
+async def test_trace_call_llm_records_a_built_in_search(
+    monkeypatch, mock_span_fixture
+):
+  """Test trace_call_llm records a built-in search on the span."""
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+  invocation_context = await _create_invocation_context(
+      LlmAgent(name='test_agent'),
+      run_config=_experimental_telemetry_run_config(
+          monkeypatch, capture_content=True
+      ),
+  )
+  llm_response = LlmResponse(
+      turn_complete=True,
+      finish_reason=types.FinishReason.STOP,
+      grounding_metadata=_web_grounding_metadata(),
+  )
+
+  trace_call_llm(
+      invocation_context,
+      'test_event_id',
+      LlmRequest(model='gemini-pro'),
+      llm_response,
+  )
+
+  assert _grounding_attributes_set_on(mock_span_fixture) == {
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_QUERY_COUNT: 2,
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_CHUNK_COUNT: 2,
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_WEB_SEARCH_QUERIES: [
+          'adk release',
+          'google-adk pypi',
+      ],
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_SOURCE_URIS: [
+          'https://a.test/1',
+          'https://b.test/2',
+      ],
+  }
+
+
+@pytest.mark.asyncio
+async def test_trace_call_llm_withholds_grounding_content_without_capture(
+    monkeypatch, mock_span_fixture
+):
+  """Test the queries and sources stay off the span when content is off.
+
+  The counts carry no user content, so they are what still tells a search ran.
+  """
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+  invocation_context = await _create_invocation_context(
+      LlmAgent(name='test_agent'),
+      run_config=_experimental_telemetry_run_config(
+          monkeypatch, capture_content=False
+      ),
+  )
+  llm_response = LlmResponse(
+      turn_complete=True,
+      finish_reason=types.FinishReason.STOP,
+      grounding_metadata=_web_grounding_metadata(),
+  )
+
+  trace_call_llm(
+      invocation_context,
+      'test_event_id',
+      LlmRequest(model='gemini-pro'),
+      llm_response,
+  )
+
+  assert _grounding_attributes_set_on(mock_span_fixture) == {
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_QUERY_COUNT: 2,
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_CHUNK_COUNT: 2,
+  }
+
+
+@pytest.mark.asyncio
+async def test_trace_call_llm_omits_grounding_without_opt_in(
+    monkeypatch, mock_span_fixture
+):
+  """Test grounding attributes stay off unless experimental is opted in."""
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+  invocation_context = await _create_invocation_context(
+      LlmAgent(name='test_agent')
+  )
+  llm_response = LlmResponse(
+      turn_complete=True,
+      finish_reason=types.FinishReason.STOP,
+      grounding_metadata=_web_grounding_metadata(),
+  )
+
+  trace_call_llm(
+      invocation_context,
+      'test_event_id',
+      LlmRequest(model='gemini-pro'),
+      llm_response,
+  )
+
+  assert not _grounding_attributes_set_on(mock_span_fixture)
+
+
+@pytest.mark.asyncio
+async def test_trace_call_llm_omits_grounding_for_an_ungrounded_response(
+    monkeypatch, mock_span_fixture
+):
+  """Test a response with no grounding metadata leaves the span unchanged."""
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+  invocation_context = await _create_invocation_context(
+      LlmAgent(name='test_agent'),
+      run_config=_experimental_telemetry_run_config(
+          monkeypatch, capture_content=True
+      ),
+  )
+  llm_response = LlmResponse(
+      turn_complete=True, finish_reason=types.FinishReason.STOP
+  )
+
+  trace_call_llm(
+      invocation_context,
+      'test_event_id',
+      LlmRequest(model='gemini-pro'),
+      llm_response,
+  )
+
+  assert not _grounding_attributes_set_on(mock_span_fixture)
+
+
+@pytest.mark.asyncio
+async def test_trace_call_llm_reports_a_search_tool_that_did_not_search(
+    monkeypatch, mock_span_fixture
+):
+  """Test empty grounding metadata records zero counts and omits empty lists."""
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+  invocation_context = await _create_invocation_context(
+      LlmAgent(name='test_agent'),
+      run_config=_experimental_telemetry_run_config(
+          monkeypatch, capture_content=True
+      ),
+  )
+  llm_response = LlmResponse(
+      turn_complete=True,
+      finish_reason=types.FinishReason.STOP,
+      grounding_metadata=types.GroundingMetadata(web_search_queries=['']),
+  )
+
+  trace_call_llm(
+      invocation_context,
+      'test_event_id',
+      LlmRequest(model='gemini-pro'),
+      llm_response,
+  )
+
+  # The exact dict also pins that the empty lists are left off the span.
+  assert _grounding_attributes_set_on(mock_span_fixture) == {
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_QUERY_COUNT: 0,
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_CHUNK_COUNT: 0,
+  }
+
+
+@pytest.mark.asyncio
+async def test_trace_call_llm_counts_unique_non_empty_web_search_queries(
+    monkeypatch, mock_span_fixture
+):
+  """Test query_count counts unique non-empty web queries and drops blanks."""
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+  invocation_context = await _create_invocation_context(
+      LlmAgent(name='test_agent'),
+      run_config=_experimental_telemetry_run_config(
+          monkeypatch, capture_content=True
+      ),
+  )
+  llm_response = LlmResponse(
+      turn_complete=True,
+      finish_reason=types.FinishReason.STOP,
+      grounding_metadata=types.GroundingMetadata(
+          web_search_queries=[
+              '',
+              'adk release',
+              'adk release',
+              'google-adk pypi',
+              '',
+          ],
+      ),
+  )
+
+  trace_call_llm(
+      invocation_context,
+      'test_event_id',
+      LlmRequest(model='gemini-pro'),
+      llm_response,
+  )
+
+  assert _grounding_attributes_set_on(mock_span_fixture) == {
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_QUERY_COUNT: 2,
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_CHUNK_COUNT: 0,
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_WEB_SEARCH_QUERIES: [
+          'adk release',
+          'adk release',
+          'google-adk pypi',
+      ],
+  }
+
+
+@pytest.mark.asyncio
+async def test_trace_call_llm_lists_a_source_cited_twice_once(
+    monkeypatch, mock_span_fixture
+):
+  """Test two chunks from one page are two chunks but a single source."""
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+  invocation_context = await _create_invocation_context(
+      LlmAgent(name='test_agent'),
+      run_config=_experimental_telemetry_run_config(
+          monkeypatch, capture_content=True
+      ),
+  )
+  page = types.GroundingChunkWeb(uri='https://a.test/1', title='A')
+  llm_response = LlmResponse(
+      turn_complete=True,
+      finish_reason=types.FinishReason.STOP,
+      grounding_metadata=types.GroundingMetadata(
+          web_search_queries=['adk release'],
+          grounding_chunks=[
+              types.GroundingChunk(web=page),
+              types.GroundingChunk(web=page),
+          ],
+      ),
+  )
+
+  trace_call_llm(
+      invocation_context,
+      'test_event_id',
+      LlmRequest(model='gemini-pro'),
+      llm_response,
+  )
+
+  attributes = _grounding_attributes_set_on(mock_span_fixture)
+  assert attributes[_adk_attributes.ADK_EXPERIMENTAL_GROUNDING_CHUNK_COUNT] == 2
+  assert attributes[_adk_attributes.ADK_EXPERIMENTAL_GROUNDING_SOURCE_URIS] == [
+      'https://a.test/1'
+  ]
+
+
+@pytest.mark.asyncio
+async def test_trace_call_llm_counts_a_chunk_that_names_no_source(
+    monkeypatch, mock_span_fixture
+):
+  """Test a chunk with no source is counted but adds no source URI."""
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+  invocation_context = await _create_invocation_context(
+      LlmAgent(name='test_agent'),
+      run_config=_experimental_telemetry_run_config(
+          monkeypatch, capture_content=True
+      ),
+  )
+  llm_response = LlmResponse(
+      turn_complete=True,
+      finish_reason=types.FinishReason.STOP,
+      grounding_metadata=types.GroundingMetadata(
+          grounding_chunks=[types.GroundingChunk()]
+      ),
+  )
+
+  trace_call_llm(
+      invocation_context,
+      'test_event_id',
+      LlmRequest(model='gemini-pro'),
+      llm_response,
+  )
+
+  assert _grounding_attributes_set_on(mock_span_fixture) == {
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_QUERY_COUNT: 0,
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_CHUNK_COUNT: 1,
+  }
+
+
+@pytest.mark.asyncio
+async def test_trace_call_llm_counts_an_image_search_as_grounding(
+    monkeypatch, mock_span_fixture
+):
+  """Test an image search chunk names its source page without a web query."""
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+  invocation_context = await _create_invocation_context(
+      LlmAgent(name='test_agent'),
+      run_config=_experimental_telemetry_run_config(
+          monkeypatch, capture_content=True
+      ),
+  )
+  llm_response = LlmResponse(
+      turn_complete=True,
+      finish_reason=types.FinishReason.STOP,
+      grounding_metadata=types.GroundingMetadata(
+          image_search_queries=['eiffel tower at night'],
+          grounding_chunks=[
+              types.GroundingChunk(
+                  image=types.GroundingChunkImage(
+                      source_uri='https://example.com/paris',
+                      image_uri='https://example.com/paris/tower.jpg',
+                  )
+              )
+          ],
+      ),
+  )
+
+  trace_call_llm(
+      invocation_context,
+      'test_event_id',
+      LlmRequest(model='gemini-pro'),
+      llm_response,
+  )
+
+  assert _grounding_attributes_set_on(mock_span_fixture) == {
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_QUERY_COUNT: 0,
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_CHUNK_COUNT: 1,
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_SOURCE_URIS: [
+          'https://example.com/paris'
+      ],
+  }
+
+
+@pytest.mark.asyncio
+async def test_trace_call_llm_lists_a_maps_place_as_a_source(
+    monkeypatch, mock_span_fixture
+):
+  """Test a Google Maps result is counted and names its place as a source."""
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+  invocation_context = await _create_invocation_context(
+      LlmAgent(name='test_agent'),
+      run_config=_experimental_telemetry_run_config(
+          monkeypatch, capture_content=True
+      ),
+  )
+  llm_response = LlmResponse(
+      turn_complete=True,
+      finish_reason=types.FinishReason.STOP,
+      grounding_metadata=types.GroundingMetadata(
+          grounding_chunks=[
+              types.GroundingChunk(
+                  maps=types.GroundingChunkMaps(
+                      uri='https://maps.google.com/?cid=1', title='Cafe'
+                  )
+              )
+          ],
+      ),
+  )
+
+  trace_call_llm(
+      invocation_context,
+      'test_event_id',
+      LlmRequest(model='gemini-pro'),
+      llm_response,
+  )
+
+  assert _grounding_attributes_set_on(mock_span_fixture) == {
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_QUERY_COUNT: 0,
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_CHUNK_COUNT: 1,
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_SOURCE_URIS: [
+          'https://maps.google.com/?cid=1'
+      ],
+  }
+
+
+@pytest.mark.asyncio
+async def test_trace_inference_result_records_a_retrieval_search(
+    mock_span_fixture,
+):
+  """Test the generate_content span records retrieved-context chunks.
+
+  Retrieval tools such as Vertex AI Search report retrieval queries and
+  retrieved-context chunks rather than web ones, so query_count stays 0.
+  """
+  invocation_context = await _create_invocation_context(
+      LlmAgent(name='test_agent'),
+      run_config=RunConfig(
+          telemetry=TelemetryConfig(
+              adk_experimental_telemetry_opt_in=True,
+              capture_message_content=ContentCapturingMode.SPAN_ONLY,
+          )
+      ),
+  )
+  llm_response = LlmResponse(
+      turn_complete=True,
+      finish_reason=types.FinishReason.STOP,
+      grounding_metadata=types.GroundingMetadata(
+          retrieval_queries=['refund policy'],
+          grounding_chunks=[
+              types.GroundingChunk(
+                  retrieved_context=types.GroundingChunkRetrievedContext(
+                      uri='gs://bucket/policy.pdf', title='policy'
+                  )
+              ),
+          ],
+      ),
+  )
+
+  trace_inference_result(invocation_context, mock_span_fixture, llm_response)
+
+  assert _grounding_attributes_set_on(mock_span_fixture) == {
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_QUERY_COUNT: 0,
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_CHUNK_COUNT: 1,
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_SOURCE_URIS: [
+          'gs://bucket/policy.pdf'
+      ],
+  }
+
+
+@pytest.mark.asyncio
+async def test_trace_inference_result_withholds_grounding_content_by_default(
+    mock_span_fixture,
+):
+  """Test the generate_content span withholds grounding content by default."""
+  invocation_context = await _create_invocation_context(
+      LlmAgent(name='test_agent'),
+      run_config=_EXPERIMENTAL_TELEMETRY_ON,
+  )
+  llm_response = LlmResponse(
+      turn_complete=True,
+      finish_reason=types.FinishReason.STOP,
+      grounding_metadata=_web_grounding_metadata(),
+  )
+
+  trace_inference_result(invocation_context, mock_span_fixture, llm_response)
+
+  assert _grounding_attributes_set_on(mock_span_fixture) == {
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_QUERY_COUNT: 2,
+      _adk_attributes.ADK_EXPERIMENTAL_GROUNDING_CHUNK_COUNT: 2,
+  }
+
+
+@pytest.mark.asyncio
+async def test_trace_inference_result_allows_a_response_without_cache_metadata(
+    mock_span_fixture,
+):
+  """Test a caller's own response object without cache_metadata is accepted."""
+
+  class ResponseWithoutCacheMetadata:
+    """Stands in for a caller's response type outside adk."""
+
+    partial = False
+    finish_reason = types.FinishReason.STOP
+    usage_metadata = None
+    content = None
+    model_version = 'gemini-pro'
+
+  agent = LlmAgent(name='test_agent')
+  invocation_context = await _create_invocation_context(agent)
+
+  trace_inference_result(
+      invocation_context, mock_span_fixture, ResponseWithoutCacheMetadata()
   )
 
 
@@ -602,24 +1370,336 @@ def test_trace_tool_call_with_dict_response(
   )
 
 
+@pytest.mark.parametrize(
+    ('response', 'expected_in_response'),
+    [
+        (
+            {
+                'auth_type': 'oauth2',
+                'client_secret': 'super-secret-client-secret',
+                'access_token': 'super-secret-access-token',
+                'client_id': 'legit-client-id',
+            },
+            'legit-client-id',
+        ),
+        (
+            {
+                'result': AuthCredential(
+                    auth_type=AuthCredentialTypes.OAUTH2,
+                    oauth2=OAuth2Auth(
+                        client_id='legit-client-id',
+                        client_secret='super-secret-client-secret',
+                        access_token='super-secret-access-token',
+                    ),
+                )
+            },
+            'legit-client-id',
+        ),
+        (
+            {
+                'auth_type': 'oauth2',
+                'client_secret': 'super-secret-client-secret',
+                'access_token': 'super-secret-access-token',
+                'client_id': 'legit-client-id',
+                'unserializable': object(),
+            },
+            'legit-client-id',
+        ),
+        (
+            {
+                'auth_type': 'oauth2',
+                'client_secret': 'super-secret-client-secret',
+                'access_token': 'super-secret-access-token',
+                'raw_bytes': b'\xff',
+            },
+            '<not serializable>',
+        ),
+        (
+            {
+                'token': 'next-page-token',
+                'apiKey': 'non-credential-key',
+                'credential': {
+                    'auth_type': 'oauth2',
+                    'oauth2': {
+                        'client_id': 'legit-client-id',
+                        'client_secret': 'super-secret-client-secret',
+                        'access_token': 'super-secret-access-token',
+                    },
+                },
+            },
+            'next-page-token',
+        ),
+    ],
+)
+def test_trace_tool_call_strips_credential_secrets_from_response(
+    monkeypatch,
+    mock_span_fixture,
+    mock_tool_fixture,
+    mock_event_fixture,
+    response,
+    expected_in_response,
+):
+  """A credential in a tool's own response is redacted on the per-tool span.
+
+  trace_merged_tool_calls redacts the same shape of leak on the merged
+  span (test_trace_merged_tool_calls_strips_credential_secrets_from_response).
+  This is the analogous case for trace_tool_call's own, separate
+  gcp.vertex.agent.tool_response attribute: a tool whose own response
+  dict happens to carry an exchanged credential -- either as a raw dict
+  or as a live AuthCredential wrapped under ``result`` -- must not
+  have that credential land here either, since this attribute is set
+  unconditionally for every real tool call whenever content capture is
+  enabled (the default).
+  """
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+
+  mock_event_fixture.content = types.Content(
+      role='user',
+      parts=[
+          types.Part(
+              function_response=types.FunctionResponse(
+                  id='tool_call_id_007',
+                  name='test_function_1',
+                  response=response,
+              )
+          ),
+      ],
+  )
+
+  trace_tool_call(
+      tool=mock_tool_fixture,
+      args={},
+      function_response_event=mock_event_fixture,
+  )
+
+  recorded_response = next(
+      call_obj.args[1]
+      for call_obj in mock_span_fixture.set_attribute.call_args_list
+      if call_obj.args[0] == 'gcp.vertex.agent.tool_response'
+  )
+  assert 'super-secret-client-secret' not in recorded_response
+  assert 'super-secret-access-token' not in recorded_response
+  # A field the client legitimately needs to see is not collateral damage.
+  assert expected_in_response in recorded_response
+
+
+def _trace_mcp_exchange(**overrides):
+  """Reports a plausible MCP exchange, with `overrides` applied."""
+  _trace_mcp_http_exchange(**{
+      'method': 'POST',
+      'url': 'https://mcp.example.com/messages',
+      'server_address': 'mcp.example.com',
+      'server_port': None,
+      'status_code': 200,
+      'mcp_session_id': None,
+      'mcp_protocol_version': None,
+      'request_headers': {'x-req': 'val'},
+      'request_body': '{"method": "tools/call"}',
+      'response_headers': {'content-type': 'application/json'},
+      'response_body': '{"result": {}}',
+      **overrides,
+  })
+
+
+@mock.patch('google.adk.telemetry.tracing.otel_logger')
+def test_trace_mcp_http_exchange_emits_debug_log_record(
+    mock_otel_logger, monkeypatch
+):
+  """Test that an exchange lands as one record with semconv attributes."""
+  monkeypatch.setenv(_ADK_CAPTURE_MCP_HTTP_BODIES, 'true')
+
+  _trace_mcp_exchange(
+      url='https://mcp.example.com:8443/messages?sessionId=REDACTED',
+      server_port=8443,
+      mcp_session_id='sess-1',
+      mcp_protocol_version='2025-06-18',
+  )
+
+  log_record: LogRecord = mock_otel_logger.emit.call_args.args[0]
+  assert (
+      log_record.event_name == 'adk.experimental.mcp.http.client.response.end'
+  )
+  assert log_record.severity_number == SeverityNumber.DEBUG
+  assert log_record.attributes == {
+      HTTP_REQUEST_METHOD: 'POST',
+      URL_FULL: 'https://mcp.example.com:8443/messages?sessionId=REDACTED',
+      SERVER_ADDRESS: 'mcp.example.com',
+      SERVER_PORT: 8443,
+      MCP_SESSION_ID: 'sess-1',
+      MCP_PROTOCOL_VERSION: '2025-06-18',
+      HTTP_RESPONSE_STATUS_CODE: 200,
+  }
+  assert log_record.body == {
+      _HTTP_REQUEST_BODY_CONTENT: '{"method": "tools/call"}',
+      _HTTP_RESPONSE_BODY_CONTENT: '{"result": {}}',
+  }
+
+
+def test_mcp_attribute_names_match_semconv():
+  """The names are spelled out locally, so nothing else would catch drift."""
+  mcp_attributes = pytest.importorskip(
+      'opentelemetry.semconv._incubating.attributes.mcp_attributes'
+  )
+
+  assert MCP_SESSION_ID == mcp_attributes.MCP_SESSION_ID
+  assert MCP_PROTOCOL_VERSION == mcp_attributes.MCP_PROTOCOL_VERSION
+
+
+@mock.patch('google.adk.telemetry.tracing.otel_logger')
+def test_trace_mcp_http_exchange_elides_bodies_by_default(
+    mock_otel_logger, monkeypatch
+):
+  """Bodies carry user content, so recording them has to be asked for."""
+  monkeypatch.delenv(_ADK_CAPTURE_MCP_HTTP_BODIES, raising=False)
+
+  _trace_mcp_exchange()
+
+  log_record: LogRecord = mock_otel_logger.emit.call_args.args[0]
+  # The attributes still describe the exchange; only the payload is elided.
+  assert log_record.attributes[HTTP_RESPONSE_STATUS_CODE] == 200
+  assert log_record.body == {
+      _HTTP_REQUEST_BODY_CONTENT: USER_CONTENT_ELIDED,
+      _HTTP_RESPONSE_BODY_CONTENT: USER_CONTENT_ELIDED,
+  }
+  assert SERVER_PORT not in log_record.attributes
+  assert MCP_SESSION_ID not in log_record.attributes
+  assert MCP_PROTOCOL_VERSION not in log_record.attributes
+
+
+@mock.patch('google.adk.telemetry.tracing.otel_logger')
+def test_trace_mcp_http_exchange_records_no_header_unasked(
+    mock_otel_logger, monkeypatch
+):
+  """No header is recorded that the OTel env vars do not name."""
+  monkeypatch.delenv(
+      _OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_CLIENT_REQUEST, raising=False
+  )
+  monkeypatch.delenv(
+      _OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_CLIENT_RESPONSE, raising=False
+  )
+
+  _trace_mcp_exchange(
+      request_headers={'x-req': 'val', 'content-type': 'application/json'}
+  )
+
+  log_record: LogRecord = mock_otel_logger.emit.call_args.args[0]
+  assert not [key for key in log_record.attributes if '.header.' in key]
+
+
+@mock.patch('google.adk.telemetry.tracing.otel_logger')
+def test_trace_mcp_http_exchange_captures_allowlisted_headers(
+    mock_otel_logger, monkeypatch
+):
+  """The OTel httpx env vars are the whole allowlist, regexes included."""
+  monkeypatch.setenv(
+      _OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_CLIENT_REQUEST,
+      'x-req,x-trace-.*',
+  )
+  monkeypatch.setenv(
+      _OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_CLIENT_RESPONSE, 'x-resp'
+  )
+
+  _trace_mcp_exchange(
+      request_headers={
+          'X-Req': 'val',
+          'x-trace-id': 'abc',
+          'x-other': 'dropped',
+          # Allowlisting a credential header still yields only the marker,
+          # because the caller redacts before we ever see it.
+          'authorization': '<redacted>',
+      },
+      response_headers={'x-resp': 'val'},
+  )
+
+  log_record: LogRecord = mock_otel_logger.emit.call_args.args[0]
+  assert log_record.attributes['http.request.header.x-req'] == ['val']
+  assert log_record.attributes['http.request.header.x-trace-id'] == ['abc']
+  assert log_record.attributes['http.response.header.x-resp'] == ['val']
+  assert 'http.request.header.x-other' not in log_record.attributes
+  assert 'http.request.header.authorization' not in log_record.attributes
+
+
+@mock.patch('google.adk.telemetry.tracing.otel_logger')
+def test_trace_mcp_http_exchange_ignores_malformed_header_pattern(
+    mock_otel_logger, monkeypatch
+):
+  """A bad regex drops its own entry rather than the whole record."""
+  monkeypatch.setenv(
+      _OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_CLIENT_REQUEST, 'x-re[,x-req'
+  )
+
+  _trace_mcp_exchange(request_headers={'x-req': 'val'})
+
+  log_record: LogRecord = mock_otel_logger.emit.call_args.args[0]
+  assert log_record.attributes['http.request.header.x-req'] == ['val']
+
+
+@pytest.mark.parametrize(
+    'env_value,reported',
+    [(None, False), ('false', False), ('true', True), ('1', True)],
+)
+def test_should_report_mcp_http_exchanges_follows_the_experimental_opt_in(
+    env_value, reported, monkeypatch
+):
+  """The record is experimental, so nothing is reported without the opt-in."""
+  if env_value is None:
+    monkeypatch.delenv(ADK_EXPERIMENTAL_TELEMETRY, raising=False)
+  else:
+    monkeypatch.setenv(ADK_EXPERIMENTAL_TELEMETRY, env_value)
+
+  assert _should_report_mcp_http_exchanges() is reported
+
+
+@mock.patch('google.adk.telemetry.tracing.otel_logger')
+def test_trace_mcp_http_exchange_sets_error_type_on_failure(mock_otel_logger):
+  """Test that a 4xx or 5xx status is also recorded as `error.type`."""
+  _trace_mcp_exchange(
+      server_address=None, status_code=403, response_body='Forbidden'
+  )
+
+  log_record: LogRecord = mock_otel_logger.emit.call_args.args[0]
+  assert log_record.attributes[ERROR_TYPE] == '403'
+  # An unknown host is omitted rather than recorded as None.
+  assert SERVER_ADDRESS not in log_record.attributes
+
+
 def test_trace_merged_tool_calls_sets_correct_attributes(
     monkeypatch, mock_span_fixture, mock_event_fixture
 ):
+  monkeypatch.setenv('ADK_TELEMETRY_SCHEMA_VERSION_OPT_IN', '1')
   monkeypatch.setattr(
       'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
   )
 
   test_response_event_id = 'merged_evt_id_001'
-  custom_event_json_output = (
-      '{"custom_event_payload": true, "details": "merged_details"}'
+  mock_event_fixture.content = types.Content(
+      role='user',
+      parts=[
+          types.Part(
+              function_response=types.FunctionResponse(
+                  id='tool_call_id_003',
+                  name='test_function_1',
+                  response={'data': 'merged_details'},
+              )
+          ),
+      ],
   )
-  mock_event_fixture.model_dumps_json.return_value = custom_event_json_output
 
   trace_merged_tool_calls(
       response_event_id=test_response_event_id,
       function_response_event=mock_event_fixture,
   )
 
+  expected_responses_json = json.dumps(
+      [{
+          'id': 'tool_call_id_003',
+          'name': 'test_function_1',
+          'response': {'data': 'merged_details'},
+      }],
+      ensure_ascii=False,
+  )
   expected_calls = [
       mock.call('gen_ai.operation.name', 'execute_tool'),
       mock.call('gen_ai.tool.name', '(merged tools)'),
@@ -627,7 +1707,7 @@ def test_trace_merged_tool_calls_sets_correct_attributes(
       mock.call('gen_ai.tool.call.id', test_response_event_id),
       mock.call('gcp.vertex.agent.tool_call_args', 'N/A'),
       mock.call('gcp.vertex.agent.event_id', test_response_event_id),
-      mock.call('gcp.vertex.agent.tool_response', custom_event_json_output),
+      mock.call('gcp.vertex.agent.tool_response', expected_responses_json),
       mock.call('gcp.vertex.agent.llm_request', '{}'),
       mock.call('gcp.vertex.agent.llm_response', '{}'),
   ]
@@ -636,7 +1716,224 @@ def test_trace_merged_tool_calls_sets_correct_attributes(
   mock_span_fixture.set_attribute.assert_has_calls(
       expected_calls, any_order=True
   )
-  mock_event_fixture.model_dumps_json.assert_called_once_with(exclude_none=True)
+  # The merged response must be the real serialized responses, not the
+  # "<not serializable>" fallback.
+  recorded_response = next(
+      call_obj.args[1]
+      for call_obj in mock_span_fixture.set_attribute.call_args_list
+      if call_obj.args[0] == 'gcp.vertex.agent.tool_response'
+  )
+  parsed = json.loads(recorded_response)
+  assert parsed[0]['id'] == 'tool_call_id_003'
+  assert 'merged_details' in recorded_response
+
+
+def test_trace_merged_tool_calls_records_no_content_under_schema_v2(
+    monkeypatch, mock_span_fixture, mock_event_fixture
+):
+  monkeypatch.setenv('ADK_TELEMETRY_SCHEMA_VERSION_OPT_IN', '2')
+  monkeypatch.setenv(
+      'OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT', 'SPAN_ONLY'
+  )
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+  mock_event_fixture.content = types.Content(
+      role='user',
+      parts=[
+          types.Part(
+              function_response=types.FunctionResponse(
+                  id='tool_call_id_003',
+                  name='test_function_1',
+                  response={'data': 'merged_details'},
+              )
+          ),
+      ],
+  )
+
+  trace_merged_tool_calls(
+      response_event_id='merged_evt_id_001',
+      function_response_event=mock_event_fixture,
+  )
+
+  assert mock_span_fixture.set_attribute.call_args_list == [
+      mock.call('gen_ai.operation.name', 'execute_tool'),
+      mock.call('gen_ai.tool.name', '(merged tools)'),
+      mock.call('gen_ai.tool.description', '(merged tools)'),
+      mock.call('gen_ai.tool.call.id', 'merged_evt_id_001'),
+      mock.call('gcp.vertex.agent.event_id', 'merged_evt_id_001'),
+  ]
+
+
+def test_trace_merged_tool_calls_omits_event_actions(
+    monkeypatch, mock_span_fixture, mock_event_fixture
+):
+  """Only the responses are recorded, not the state a tool wrote."""
+  monkeypatch.setenv('ADK_TELEMETRY_SCHEMA_VERSION_OPT_IN', '1')
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+
+  mock_event_fixture.content = types.Content(
+      role='user',
+      parts=[
+          types.Part(
+              function_response=types.FunctionResponse(
+                  id='tool_call_id_005',
+                  name='test_function_1',
+                  response={'data': 'merged_details'},
+              )
+          ),
+      ],
+  )
+  # Shape the openapi tool auth handler stores an exchanged credential in.
+  mock_event_fixture.actions.state_delta = {
+      'oauth2_existing_exchanged_credential': {
+          'oauth2': {
+              'access_token': 'access-token-value',
+              'refresh_token': 'refresh-token-value',
+          }
+      }
+  }
+
+  trace_merged_tool_calls(
+      response_event_id='merged_evt_id_003',
+      function_response_event=mock_event_fixture,
+  )
+
+  recorded_response = next(
+      call_obj.args[1]
+      for call_obj in mock_span_fixture.set_attribute.call_args_list
+      if call_obj.args[0] == 'gcp.vertex.agent.tool_response'
+  )
+  assert 'access-token-value' not in recorded_response
+  assert 'refresh-token-value' not in recorded_response
+  assert 'merged_details' in recorded_response
+
+
+def test_trace_merged_tool_calls_strips_credential_secrets_from_response(
+    monkeypatch, mock_span_fixture, mock_event_fixture
+):
+  """A credential exchanged via adk_request_credential is redacted.
+
+  Unlike test_trace_merged_tool_calls_omits_event_actions (which covers a
+  credential riding in event.actions.state_delta), this covers the shape a
+  client's *answer* to an adk_request_credential call takes: the exchanged
+  secret lands directly in a function_response.response dict, which is
+  serialized on every merged-tool-call span regardless of the response's
+  name.
+  """
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+
+  mock_event_fixture.content = types.Content(
+      role='user',
+      parts=[
+          types.Part(
+              function_response=types.FunctionResponse(
+                  id='tool_call_id_auth',
+                  name='adk_request_credential',
+                  response={
+                      'client_secret': 'super-secret-client-secret',
+                      'access_token': 'super-secret-access-token',
+                      'client_id': 'legit-client-id',
+                  },
+              )
+          ),
+          types.Part(
+              function_response=types.FunctionResponse(
+                  id='tool_call_id_page',
+                  name='list_items',
+                  response={
+                      'token': 'next-page-token',
+                      'apiKey': 'public-id',
+                  },
+              )
+          ),
+      ],
+  )
+
+  trace_merged_tool_calls(
+      response_event_id='merged_evt_id_006',
+      function_response_event=mock_event_fixture,
+  )
+
+  recorded_response = next(
+      call_obj.args[1]
+      for call_obj in mock_span_fixture.set_attribute.call_args_list
+      if call_obj.args[0] == 'gcp.vertex.agent.tool_response'
+  )
+  assert 'super-secret-client-secret' not in recorded_response
+  assert 'super-secret-access-token' not in recorded_response
+  # A field the client legitimately needs to see is not collateral damage.
+  assert 'legit-client-id' in recorded_response
+  assert 'next-page-token' in recorded_response
+  assert 'public-id' in recorded_response
+
+
+def test_trace_tool_call_skips_non_recording_span(
+    monkeypatch, mock_tool_fixture, mock_event_fixture
+):
+  span = mock.MagicMock()
+  span.is_recording.return_value = False
+  get_telemetry_config = mock.Mock()
+  serialize = mock.Mock(return_value='{}')
+  monkeypatch.setattr(
+      'google.adk.telemetry.tracing._telemetry_config_from_invocation_context',
+      get_telemetry_config,
+  )
+  monkeypatch.setattr(
+      'google.adk.telemetry.tracing.safe_json_serialize', serialize
+  )
+  mock_event_fixture.content = types.Content(
+      role='user',
+      parts=[
+          types.Part(
+              function_response=types.FunctionResponse(
+                  id='tool_call_id_004',
+                  name='test_function_1',
+                  response={'data': 'structured_data'},
+              )
+          ),
+      ],
+  )
+
+  trace_tool_call(
+      tool=mock_tool_fixture,
+      args={'query': 'details'},
+      function_response_event=mock_event_fixture,
+      span=span,
+  )
+
+  get_telemetry_config.assert_not_called()
+  serialize.assert_not_called()
+  span.set_attribute.assert_not_called()
+
+
+def test_trace_merged_tool_calls_skips_non_recording_span(
+    monkeypatch, mock_event_fixture
+):
+  span = mock.MagicMock()
+  span.is_recording.return_value = False
+  monkeypatch.setattr('opentelemetry.trace.get_current_span', lambda: span)
+  get_telemetry_config = mock.Mock()
+  monkeypatch.setattr(
+      'google.adk.telemetry.tracing._telemetry_config_from_invocation_context',
+      get_telemetry_config,
+  )
+
+  with mock.patch.object(
+      Event, 'model_dump_json', autospec=True
+  ) as serialize_event:
+    trace_merged_tool_calls(
+        response_event_id='merged_evt_id_002',
+        function_response_event=mock_event_fixture,
+    )
+
+  get_telemetry_config.assert_not_called()
+  serialize_event.assert_not_called()
+  span.set_attribute.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -758,10 +2055,6 @@ def test_trace_merged_tool_disabling_request_response_content(
   )
 
   test_response_event_id = 'merged_evt_id_001'
-  custom_event_json_output = (
-      '{"custom_event_payload": true, "details": "merged_details"}'
-  )
-  mock_event_fixture.model_dumps_json.return_value = custom_event_json_output
 
   # Act
   trace_merged_tool_calls(
@@ -810,6 +2103,123 @@ async def test_trace_send_data_disabling_request_response_content(
 
 
 @pytest.mark.asyncio
+async def test_trace_call_llm_summarizes_response_inline_data(
+    monkeypatch, mock_span_fixture
+):
+  """Inline binary data in the response is described, not copied to the span."""
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+
+  agent = LlmAgent(name='test_agent')
+  invocation_context = await _create_invocation_context(agent)
+  llm_request = LlmRequest(
+      model='gemini-pro', config=types.GenerateContentConfig()
+  )
+  llm_response = LlmResponse(
+      content=types.Content(
+          role='model',
+          parts=[
+              types.Part(text='hi'),
+              types.Part.from_bytes(data=b'test_data', mime_type='audio/pcm'),
+          ],
+      )
+  )
+
+  trace_call_llm(invocation_context, 'test_event_id', llm_request, llm_response)
+
+  llm_response_json = next(
+      call_obj.args[1]
+      for call_obj in mock_span_fixture.set_attribute.call_args_list
+      if call_obj.args[0] == 'gcp.vertex.agent.llm_response'
+  )
+
+  # b'test_data' base64-encodes to 'dGVzdF9kYXRh'.
+  assert 'dGVzdF9kYXRh' not in llm_response_json
+  assert 'hi' in llm_response_json
+  assert '<inline_data: audio/pcm, 9 bytes>' in llm_response_json
+
+
+@pytest.mark.asyncio
+async def test_trace_send_data_summarizes_inline_data(
+    monkeypatch, mock_span_fixture
+):
+  """Inline binary data is described on the span, never copied onto it."""
+  monkeypatch.setenv(ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS, 'true')
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+
+  agent = LlmAgent(name='test_agent')
+  invocation_context = await _create_invocation_context(agent)
+
+  trace_send_data(
+      invocation_context=invocation_context,
+      event_id='test_event_id',
+      data=[
+          types.Content(
+              role='user',
+              parts=[
+                  types.Part(text='hi'),
+                  types.Part.from_bytes(
+                      data=b'test_data', mime_type='audio/pcm'
+                  ),
+              ],
+          )
+      ],
+  )
+
+  data_json = next(
+      call_obj.args[1]
+      for call_obj in mock_span_fixture.set_attribute.call_args_list
+      if call_obj.args[0] == 'gcp.vertex.agent.data'
+  )
+
+  # b'test_data' base64-encodes to 'dGVzdF9kYXRh'.
+  assert 'dGVzdF9kYXRh' not in data_json
+  assert 'hi' in data_json
+  assert '<inline_data: audio/pcm, 9 bytes>' in data_json
+
+
+@pytest.mark.asyncio
+async def test_trace_send_data_summarizes_blob_without_mime_type(
+    monkeypatch, mock_span_fixture
+):
+  """A blob is described even when its mime type and bytes are unset.
+
+  The parts-less content in the same call pins that summarizing tolerates
+  ``Content.parts`` being unset.
+  """
+  monkeypatch.setenv(ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS, 'true')
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+
+  agent = LlmAgent(name='test_agent')
+  invocation_context = await _create_invocation_context(agent)
+
+  trace_send_data(
+      invocation_context=invocation_context,
+      event_id='test_event_id',
+      data=[
+          types.Content(role='user'),
+          types.Content(
+              role='user', parts=[types.Part(inline_data=types.Blob())]
+          ),
+      ],
+  )
+
+  data_json = next(
+      call_obj.args[1]
+      for call_obj in mock_span_fixture.set_attribute.call_args_list
+      if call_obj.args[0] == 'gcp.vertex.agent.data'
+  )
+
+  assert '<inline_data: unknown, 0 bytes>' in data_json
+  assert 'inlineData' not in data_json
+
+
+@pytest.mark.asyncio
 @mock.patch('google.adk.telemetry.tracing.otel_logger')
 @mock.patch('google.adk.telemetry.tracing.tracer')
 @mock.patch(
@@ -846,7 +2256,7 @@ async def test_generate_content_span(
       env_capture_value,
   )
   monkeypatch.setattr(
-      'google.adk.telemetry.tracing._instrumented_with_opentelemetry_instrumentation_google_genai',
+      'google.adk.telemetry._genai_instrumentor.is_instrumented',
       lambda: False,
   )
 
@@ -866,7 +2276,11 @@ async def test_generate_content_span(
   llm_request = LlmRequest(
       model='some-model',
       contents=[user_content1, user_content2],
-      config=types.GenerateContentConfig(system_instruction=system_instruction),
+      config=types.GenerateContentConfig(
+          system_instruction=system_instruction,
+          top_p=0.5,
+          max_output_tokens=100,
+      ),
   )
   llm_response = LlmResponse(
       content=model_content,
@@ -902,6 +2316,8 @@ async def test_generate_content_span(
       GEN_AI_OPERATION_NAME, 'generate_content'
   )
   mock_span.set_attribute.assert_any_call(GEN_AI_REQUEST_MODEL, 'some-model')
+  mock_span.set_attribute.assert_any_call('gen_ai.request.top_p', 0.5)
+  mock_span.set_attribute.assert_any_call('gen_ai.request.max_tokens', 100)
   mock_span.set_attribute.assert_any_call(
       GEN_AI_RESPONSE_FINISH_REASONS, ['stop']
   )
@@ -985,8 +2401,12 @@ async def test_generate_content_span_with_genai_instrumentation(
 ):
   """Test that genai-instrumentation delegation branch does not forward USER_ID in attributes."""
   monkeypatch.setattr(
-      'google.adk.telemetry.tracing._instrumented_with_opentelemetry_instrumentation_google_genai',
+      'google.adk.telemetry._genai_instrumentor.is_instrumented',
       lambda: True,
+  )
+  # ADK delegates only the experimental semconv to the instrumentor.
+  monkeypatch.setenv(
+      'OTEL_SEMCONV_STABILITY_OPT_IN', 'gen_ai_latest_experimental'
   )
   # _is_gemini_agent returns true for gemini models.
   agent = LlmAgent(name='test_agent', model='gemini-1.5-pro')
@@ -1079,7 +2499,7 @@ async def test_generate_content_span_with_experimental_semconv(
       'gen_ai_latest_experimental',
   )
   monkeypatch.setattr(
-      'google.adk.telemetry.tracing._instrumented_with_opentelemetry_instrumentation_google_genai',
+      'google.adk.telemetry._genai_instrumentor.is_instrumented',
       lambda: False,
   )
 
@@ -1352,6 +2772,8 @@ async def test_generate_content_span_with_experimental_semconv(
   assert attributes[GEN_AI_AGENT_NAME] == invocation_context.agent.name
   assert GEN_AI_CONVERSATION_ID in attributes
   assert attributes[GEN_AI_CONVERSATION_ID] == invocation_context.session.id
+  # Schema v1 keeps `gen_ai.system` only; `gen_ai.provider.name` is v2.
+  assert GEN_AI_PROVIDER_NAME not in attributes
 
 
 def test_trace_tool_call_with_tool_execution_error(
@@ -1443,6 +2865,212 @@ def test_trace_tool_call_with_standard_error(
   )
 
 
+def test_trace_tool_call_with_genai_api_error_uses_status_code(
+    monkeypatch, mock_span_fixture, mock_tool_fixture
+):
+  """A genai APIError surfaces its HTTP status code (not ``ClientError``)."""
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+
+  test_error = genai_errors.ClientError(
+      429, {'error': {'code': 429, 'status': 'RESOURCE_EXHAUSTED'}}
+  )
+
+  trace_tool_call(
+      tool=mock_tool_fixture,
+      args={'param': 1},
+      function_response_event=None,
+      error=test_error,
+  )
+
+  assert (
+      mock.call('error.type', '429')
+      in mock_span_fixture.set_attribute.call_args_list
+  )
+
+
+def test_trace_tool_call_with_dict_error_marks_span_as_failed(
+    monkeypatch, mock_span_fixture, mock_tool_fixture
+):
+  """A tool reporting failure in its response dict must not render as green."""
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+
+  trace_tool_call(
+      tool=mock_tool_fixture,
+      args={'param': 1},
+      function_response_event=None,
+      error_type='MCP_TOOL_ERROR',
+  )
+
+  mock_span_fixture.set_status.assert_called_once()
+  status = mock_span_fixture.set_status.call_args.args[0]
+  assert status.status_code is StatusCode.ERROR
+  assert status.description == 'MCP_TOOL_ERROR'
+  mock_span_fixture.record_exception.assert_not_called()
+
+
+def test_trace_tool_call_with_error_marks_span_as_failed_and_records_it(
+    monkeypatch, mock_span_fixture, mock_tool_fixture
+):
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+  test_error = ToolExecutionError(
+      message='Internal server error',
+      error_type=ToolErrorType.INTERNAL_SERVER_ERROR,
+  )
+
+  trace_tool_call(
+      tool=mock_tool_fixture,
+      args={'param': 1},
+      function_response_event=None,
+      error=test_error,
+  )
+
+  mock_span_fixture.record_exception.assert_called_once_with(test_error)
+  mock_span_fixture.set_status.assert_called_once()
+  status = mock_span_fixture.set_status.call_args.args[0]
+  assert status.status_code is StatusCode.ERROR
+  # The type, not the message, so tool content stays out of an attribute the
+  # content toggle cannot elide.
+  assert status.description == 'INTERNAL_SERVER_ERROR'
+
+
+def test_trace_tool_call_without_error_leaves_span_status_unset(
+    monkeypatch, mock_span_fixture, mock_tool_fixture, mock_event_fixture
+):
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+
+  trace_tool_call(
+      tool=mock_tool_fixture,
+      args={'param': 1},
+      function_response_event=mock_event_fixture,
+  )
+
+  mock_span_fixture.set_status.assert_not_called()
+  mock_span_fixture.record_exception.assert_not_called()
+
+
+@pytest.mark.asyncio
+@mock.patch('google.adk.telemetry.tracing.otel_logger')
+@mock.patch('google.adk.telemetry.tracing.tracer')
+@mock.patch(
+    'google.adk.telemetry.tracing._guess_gemini_system_name',
+    return_value='deployment_default',
+)
+@pytest.mark.parametrize(
+    'model,expected_system',
+    [
+        ('claude-sonnet-4-5', 'anthropic'),
+        ('claude-3-5-haiku-latest', 'anthropic'),
+        ('anthropic/claude-sonnet-4-5', 'anthropic'),
+        (
+            'projects/p/locations/l/publishers/anthropic/models/claude-sonnet-4-5',
+            'anthropic',
+        ),
+        ('openai/gpt-4o', 'openai'),
+        (
+            'projects/p/locations/l/publishers/meta/models/llama-3',
+            'deployment_default',
+        ),
+        ('tunedModels/my-tuned-model', 'deployment_default'),
+        ('gemini-2.0-flash', 'deployment_default'),
+        ('gemini/gemini-2.0-flash', 'deployment_default'),
+        ('some-model', 'deployment_default'),
+    ],
+)
+async def test_generate_content_span_system_name_follows_model(
+    mock_guess_system_name,
+    mock_tracer,
+    mock_otel_logger,
+    monkeypatch,
+    model,
+    expected_system,
+):
+  """The system name follows the served model, not just the deployment env."""
+  monkeypatch.setattr(
+      'google.adk.telemetry._genai_instrumentor.is_instrumented',
+      lambda: False,
+  )
+  agent = LlmAgent(name='test_agent', model=model)
+  invocation_context = await _create_invocation_context(agent)
+  llm_request = LlmRequest(model=model, contents=[])
+  llm_response = LlmResponse(
+      content=types.Content(role='model', parts=[types.Part(text='Response')]),
+      finish_reason=types.FinishReason.STOP,
+  )
+  model_response_event = mock.MagicMock()
+  model_response_event.id = 'event-123'
+  mock_span = (
+      mock_tracer.start_as_current_span.return_value.__enter__.return_value
+  )
+
+  async with use_inference_span(
+      llm_request, invocation_context, model_response_event
+  ) as gc_span:
+    trace_inference_result(invocation_context, gc_span, llm_response)
+
+  mock_span.set_attribute.assert_any_call(GEN_AI_SYSTEM, expected_system)
+  log_records: list[LogRecord] = [
+      call.args[0] for call in mock_otel_logger.emit.call_args_list
+  ]
+  assert log_records
+  for log_record in log_records:
+    assert log_record.attributes[GEN_AI_SYSTEM] == expected_system
+
+
+# Model ids that are resource paths: the leading segment is a resource
+# collection, so reading it as a provider prefix mislabels the model.
+_RESOURCE_PATH_MODELS = [
+    'projects/p/locations/l/publishers/meta/models/llama-3',
+    'projects/p/locations/l/endpoints/123456',
+    'tunedModels/my-tuned-model',
+]
+
+
+@pytest.mark.parametrize(
+    'model,expected_system',
+    [
+        # A Model Garden path names its publisher mid-path, never up front.
+        ('projects/p/locations/l/publishers/meta/models/llama-3', 'gemini'),
+        (
+            'projects/p/locations/l/publishers/anthropic/models/claude-4-5',
+            'anthropic',
+        ),
+        # Tuned models arrive as a path too, on either backend.
+        ('projects/p/locations/l/endpoints/123456', 'gemini'),
+        ('tunedModels/my-tuned-model', 'gemini'),
+        ('gemini-2.0-flash', 'gemini'),
+        ('claude-sonnet-4-5', 'anthropic'),
+        # What the provider-prefix rule is actually for.
+        ('openai/gpt-4o', 'openai'),
+    ],
+)
+def test_resolve_gen_ai_system_name(monkeypatch, model, expected_system):
+  """Only a real provider prefix names the provider; a path segment must not."""
+  monkeypatch.setattr(tracing, '_guess_gemini_system_name', lambda: 'gemini')
+
+  assert tracing._resolve_gen_ai_system_name(model) == expected_system
+
+
+@pytest.mark.parametrize('model', _RESOURCE_PATH_MODELS)
+def test_resolve_gen_ai_system_name_never_names_a_path_segment(
+    monkeypatch, model
+):
+  """A resource path must not be read as a `<provider>/<model>` id."""
+  monkeypatch.setattr(tracing, '_guess_gemini_system_name', lambda: 'gemini')
+
+  system_name = tracing._resolve_gen_ai_system_name(model)
+
+  assert system_name == 'gemini'
+  assert system_name not in {segment.lower() for segment in model.split('/')}
+
+
 def test_safe_json_serialize_circular_dict_returns_not_serializable():
   obj = {}
   obj['self'] = obj
@@ -1453,6 +3081,20 @@ def test_safe_json_serialize_no_whitespaces_circular_dict_returns_not_serializab
   obj = {}
   obj['self'] = obj
   assert _safe_json_serialize_no_whitespaces(obj) == '<not serializable>'
+
+
+def test_safe_json_serialize_recursion_error_returns_not_serializable():
+  with mock.patch.object(
+      json, 'dumps', side_effect=RecursionError('maximum recursion depth')
+  ):
+    assert safe_json_serialize({'a': 1}) == '<not serializable>'
+
+
+def test_safe_json_serialize_no_whitespaces_recursion_error_returns_not_serializable():
+  with mock.patch.object(
+      json, 'dumps', side_effect=RecursionError('maximum recursion depth')
+  ):
+    assert _safe_json_serialize_no_whitespaces({'a': 1}) == '<not serializable>'
 
 
 def test_use_extra_generate_content_attributes_upgraded_version(monkeypatch):
@@ -1745,3 +3387,487 @@ def test_trace_tool_call_no_error_no_error_type(
       if c == mock.call('error.type', mock.ANY)
   ]
   assert len(error_type_calls) == 0
+
+
+def test_build_llm_request_for_trace_excludes_thought_signatures():
+  """Opaque signature bytes must not be base64-encoded onto a span attribute.
+
+  A thought signature stays in history and is replayed on every later request,
+  so leaving it in would grow the serialized request on each call of a session.
+  """
+  from google.adk.telemetry.tracing import _build_llm_request_for_trace
+
+  llm_request = LlmRequest(
+      model='gemini-2.0-flash',
+      contents=[
+          types.Content(
+              role='model',
+              parts=[
+                  types.Part(
+                      function_call=types.FunctionCall(
+                          id='call-1', name='search', args={}
+                      ),
+                      thought_signature=b'opaque-signature-bytes' * 40,
+                  )
+              ],
+          )
+      ],
+  )
+
+  serialized = json.dumps(_build_llm_request_for_trace(llm_request))
+
+  assert 'thoughtSignature' not in serialized
+  assert 'thought_signature' not in serialized
+  # The part itself is still described on the span.
+  assert 'search' in serialized
+
+
+@pytest.mark.asyncio
+async def test_trace_call_llm_excludes_response_thought_signature(
+    monkeypatch, mock_span_fixture
+):
+  """A signature on the model's own response must not reach the span either."""
+  monkeypatch.setattr(
+      'opentelemetry.trace.get_current_span', lambda: mock_span_fixture
+  )
+  invocation_context = await _create_invocation_context(
+      LlmAgent(name='test_agent')
+  )
+  llm_request = LlmRequest(
+      model='gemini-pro', config=types.GenerateContentConfig()
+  )
+  llm_response = LlmResponse(
+      content=types.Content(
+          role='model',
+          parts=[
+              types.Part(
+                  text='done',
+                  thought_signature=b'opaque-signature-bytes' * 40,
+              )
+          ],
+      )
+  )
+
+  trace_call_llm(invocation_context, 'test_event_id', llm_request, llm_response)
+
+  llm_response_json = next(
+      call_obj.args[1]
+      for call_obj in mock_span_fixture.set_attribute.call_args_list
+      if call_obj.args[0] == 'gcp.vertex.agent.llm_response'
+  )
+  assert 'thoughtSignature' not in llm_response_json
+  assert 'thought_signature' not in llm_response_json
+  assert 'done' in llm_response_json
+
+
+def test_build_llm_request_for_trace_excludes_live_http_clients():
+  """Tracing must not crash when config.http_options holds live SDK clients.
+
+  HttpOptions.{httpx_client, httpx_async_client, aiohttp_client} are live
+  transport objects that pydantic cannot serialize; they must be excluded so
+  the trace serialization does not raise PydanticSerializationError.
+  """
+  from google.adk.telemetry.tracing import _build_llm_request_for_trace
+  import httpx
+
+  llm_request = LlmRequest(
+      model='gemini-2.0-flash',
+      config=types.GenerateContentConfig(
+          temperature=0.1,
+          http_options=types.HttpOptions(
+              httpx_async_client=httpx.AsyncClient()
+          ),
+      ),
+  )
+
+  result = _build_llm_request_for_trace(llm_request)
+
+  # Must be JSON-serializable (raised PydanticSerializationError before the fix).
+  json.dumps(result)
+  assert 'httpx_async_client' not in result['config'].get('http_options', {})
+  assert result['config']['temperature'] == 0.1
+
+
+def test_build_llm_request_for_trace_excludes_http_option_credentials():
+  """Credential-bearing http_options fields must never reach a span attribute.
+
+  `RunConfig.http_options` is a documented place for callers to put custom
+  headers (including `Authorization`), and it is copied onto
+  `llm_request.config.http_options`. Serializing it verbatim would export the
+  caller's credentials to the tracing backend on every model call.
+  """
+  from google.adk.telemetry.tracing import _build_llm_request_for_trace
+
+  llm_request = LlmRequest(
+      model='gemini-2.0-flash',
+      config=types.GenerateContentConfig(
+          temperature=0.1,
+          http_options=types.HttpOptions(
+              base_url='https://example.test',
+              headers={'Authorization': 'Bearer sentinel-secret-token'},
+              extra_body={'api_key': 'sentinel-secret-token'},
+              client_args={'auth': 'sentinel-secret-token'},
+              async_client_args={'auth': 'sentinel-secret-token'},
+          ),
+      ),
+  )
+
+  result = _build_llm_request_for_trace(llm_request)
+
+  assert 'sentinel-secret-token' not in json.dumps(result)
+  http_options = result['config'].get('http_options', {})
+  for field in ('headers', 'extra_body', 'client_args', 'async_client_args'):
+    assert field not in http_options
+  # Non-sensitive http_options fields are still traced.
+  assert http_options['base_url'] == 'https://example.test'
+
+
+# ---------------------------------------------------------------------------
+# safe_json_serialize tests
+# ---------------------------------------------------------------------------
+
+
+class _SampleToolResult(BaseModel):
+  query: str
+  total: int
+  items: list[str] = []
+
+
+class _NestedModel(BaseModel):
+  inner: _SampleToolResult
+
+
+def test_safe_json_serialize_plain_dict():
+  """Plain dicts serialize normally."""
+  result = safe_json_serialize({'key': 'value', 'num': 42})
+  assert json.loads(result) == {'key': 'value', 'num': 42}
+
+
+def test_safe_json_serialize_pydantic_model_in_dict():
+  """Pydantic models nested in a dict are serialized via model_dump."""
+  model = _SampleToolResult(query='test', total=2, items=['a', 'b'])
+  result = safe_json_serialize({'result': model})
+  parsed = json.loads(result)
+  assert parsed == {
+      'result': {'query': 'test', 'total': 2, 'items': ['a', 'b']}
+  }
+
+
+def test_safe_json_serialize_nested_pydantic_model():
+  """Nested Pydantic models are fully serialized."""
+  inner = _SampleToolResult(query='q', total=0, items=[])
+  outer = _NestedModel(inner=inner)
+  result = safe_json_serialize({'result': outer})
+  parsed = json.loads(result)
+  assert parsed['result']['inner'] == {'query': 'q', 'total': 0, 'items': []}
+
+
+def test_safe_json_serialize_top_level_pydantic_model():
+  """A top-level Pydantic model (not wrapped in a dict) is serialized."""
+  model = _SampleToolResult(query='direct', total=1, items=['x'])
+  result = safe_json_serialize(model)
+  parsed = json.loads(result)
+  assert parsed == {'query': 'direct', 'total': 1, 'items': ['x']}
+
+
+def test_safe_json_serialize_non_serializable_fallback():
+  """Objects that are neither JSON-native nor Pydantic fall back gracefully."""
+  result = safe_json_serialize({'value': object()})
+  assert '<not serializable>' in result
+
+
+# ---------------------------------------------------------------------------
+# resolve_error_type precedence.
+#
+# The three individual branches are exercised through ``trace_tool_call``
+# above; what is pinned here is which one wins when more than one applies.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_error_type_prefers_a_pre_classified_type_over_the_status():
+  """An ADK-classified type outranks the HTTP status: it is the higher
+
+  resolution label, and the status is only a fallback for SDK errors that
+  collapse every 4xx into one class.
+  """
+  error = genai_errors.ClientError(429, {'error': {'code': 429}})
+  error.error_type = 'QUOTA_EXHAUSTED'
+
+  assert resolve_error_type(error) == 'QUOTA_EXHAUSTED'
+
+
+def test_resolve_error_type_stringifies_a_non_string_classification():
+  """``error.type`` is a string span attribute, so a numeric classification
+
+  has to be coerced rather than handed to OTel as an int.
+  """
+  error = ToolExecutionError(message='boom')
+  error.error_type = 500
+
+  assert resolve_error_type(error) == '500'
+
+
+# ---------------------------------------------------------------------------
+# GenerateContentSpan.
+# ---------------------------------------------------------------------------
+
+
+def test_generate_content_span_attribute_stores_are_per_instance(
+    mock_span_fixture,
+):
+  """Each inference call accumulates its own experimental-semconv attributes;
+
+  sharing the dicts across instances would leak one call's prompt/response
+  attributes onto the next.
+  """
+  first = GenerateContentSpan(mock_span_fixture)
+  second = GenerateContentSpan(mock_span_fixture)
+
+  first.operation_details_attributes['some_key'] = 'some_value'
+  first.operation_details_common_attributes['other_key'] = 'other_value'
+
+  assert first.span is mock_span_fixture
+  assert second.operation_details_attributes == {}
+  assert second.operation_details_common_attributes == {}
+
+
+# ---------------------------------------------------------------------------
+# The deprecated use_generate_content_span / trace_generate_content_result
+# pair, kept until callers move to use_inference_span /
+# trace_inference_result.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@mock.patch('google.adk.telemetry.tracing.otel_logger')
+@mock.patch('google.adk.telemetry.tracing.tracer')
+@mock.patch(
+    'google.adk.telemetry.tracing._guess_gemini_system_name',
+    return_value='test_system',
+)
+async def test_use_generate_content_span_yields_the_bare_span(
+    mock_guess_system_name,
+    mock_tracer,
+    mock_otel_logger,
+    monkeypatch,
+):
+  """The deprecated manager yields the raw OTel span rather than the
+
+  ``GenerateContentSpan`` its replacement yields, because its result helper
+  takes a plain span.
+  """
+  monkeypatch.setattr(
+      'google.adk.telemetry._genai_instrumentor.is_instrumented',
+      lambda: False,
+  )
+  agent = LlmAgent(name='test_agent', model='not-a-gemini-model')
+  invocation_context = await _create_invocation_context(agent)
+  llm_request = LlmRequest(
+      model='some-model',
+      contents=[types.Content(role='user', parts=[types.Part(text='Hello')])],
+  )
+  model_response_event = mock.MagicMock()
+  model_response_event.id = 'event-123'
+
+  mock_span = (
+      mock_tracer.start_as_current_span.return_value.__enter__.return_value
+  )
+
+  with (
+      pytest.warns(DeprecationWarning, match='Replaced by use_inference_span'),
+      use_generate_content_span(
+          llm_request, invocation_context, model_response_event
+      ) as span,
+  ):
+    assert span is mock_span
+
+  mock_tracer.start_as_current_span.assert_called_once_with(
+      'generate_content some-model'
+  )
+  mock_span.set_attribute.assert_any_call(GEN_AI_SYSTEM, 'test_system')
+  mock_span.set_attribute.assert_any_call(
+      GEN_AI_OPERATION_NAME, 'generate_content'
+  )
+  mock_span.set_attribute.assert_any_call(GEN_AI_REQUEST_MODEL, 'some-model')
+  mock_span.set_attributes.assert_any_call({
+      GEN_AI_AGENT_NAME: 'test_agent',
+      GEN_AI_CONVERSATION_ID: invocation_context.session.id,
+      'gcp.vertex.agent.event_id': 'event-123',
+      'gcp.vertex.agent.invocation_id': invocation_context.invocation_id,
+  })
+
+
+@pytest.mark.asyncio
+@mock.patch(
+    'google.adk.telemetry.tracing._use_extra_generate_content_attributes'
+)
+async def test_use_generate_content_span_delegates_to_the_genai_instrumentor(
+    mock_use_extra,
+    monkeypatch,
+):
+  """With the genai instrumentation library wrapping a Gemini call, the span
+
+  belongs to that library: nothing is yielded, and the ADK attributes are
+  only stashed on the context for the library to pick up.
+  """
+  monkeypatch.setattr(
+      'google.adk.telemetry._genai_instrumentor.is_instrumented',
+      lambda: True,
+  )
+  # ADK delegates only the experimental semconv to the instrumentor.
+  monkeypatch.setenv(
+      'OTEL_SEMCONV_STABILITY_OPT_IN', 'gen_ai_latest_experimental'
+  )
+  agent = LlmAgent(name='test_agent', model='gemini-1.5-pro')
+  invocation_context = await _create_invocation_context(agent)
+  llm_request = LlmRequest(model='gemini-1.5-pro')
+  model_response_event = mock.MagicMock()
+  model_response_event.id = 'event-123'
+
+  with (
+      pytest.warns(DeprecationWarning, match='Replaced by use_inference_span'),
+      use_generate_content_span(
+          llm_request, invocation_context, model_response_event
+      ) as span,
+  ):
+    assert span is None
+
+  mock_use_extra.assert_called_once()
+  (common_attributes,) = mock_use_extra.call_args.args
+  assert common_attributes == {
+      GEN_AI_AGENT_NAME: 'test_agent',
+      GEN_AI_CONVERSATION_ID: invocation_context.session.id,
+      'gcp.vertex.agent.event_id': 'event-123',
+      'gcp.vertex.agent.invocation_id': invocation_context.invocation_id,
+  }
+
+
+@mock.patch('google.adk.telemetry.tracing.otel_logger')
+@mock.patch(
+    'google.adk.telemetry.tracing._guess_gemini_system_name',
+    return_value='test_system',
+)
+def test_trace_generate_content_result_records_outcome_and_choice_log(
+    mock_guess_system_name,
+    mock_otel_logger,
+    mock_span_fixture,
+):
+  """The finish reason is lower-cased into a list (semconv allows several)
+
+  and the token usage lands on the span, alongside a choice log record.
+  """
+  llm_response = LlmResponse(
+      content=types.Content(role='model', parts=[types.Part(text='hi')]),
+      finish_reason=types.FinishReason.STOP,
+      usage_metadata=types.GenerateContentResponseUsageMetadata(
+          prompt_token_count=10,
+          candidates_token_count=20,
+      ),
+  )
+
+  with pytest.warns(
+      DeprecationWarning, match='Replaced by trace_inference_result'
+  ):
+    trace_generate_content_result(mock_span_fixture, llm_response)
+
+  mock_span_fixture.set_attribute.assert_called_once_with(
+      GEN_AI_RESPONSE_FINISH_REASONS, ['stop']
+  )
+  mock_span_fixture.set_attributes.assert_called_once_with({
+      GEN_AI_USAGE_INPUT_TOKENS: 10,
+      GEN_AI_USAGE_OUTPUT_TOKENS: 20,
+  })
+  log_record: LogRecord = mock_otel_logger.emit.call_args.args[0]
+  assert log_record.event_name == 'gen_ai.choice'
+  assert log_record.attributes == {GEN_AI_SYSTEM: 'test_system'}
+
+
+@mock.patch('google.adk.telemetry.tracing.otel_logger')
+def test_trace_generate_content_result_skips_a_partial_response(
+    mock_otel_logger,
+    mock_span_fixture,
+):
+  """A partial streaming chunk is not the operation's result.
+
+  Recording it would emit a choice log per chunk and report a finish reason for
+  a call that has not finished.
+  """
+  llm_response = LlmResponse(
+      partial=True,
+      finish_reason=types.FinishReason.STOP,
+      usage_metadata=types.GenerateContentResponseUsageMetadata(
+          prompt_token_count=10,
+          candidates_token_count=20,
+      ),
+  )
+
+  with pytest.warns(
+      DeprecationWarning, match='Replaced by trace_inference_result'
+  ):
+    trace_generate_content_result(mock_span_fixture, llm_response)
+
+  mock_span_fixture.set_attribute.assert_not_called()
+  mock_span_fixture.set_attributes.assert_not_called()
+  mock_otel_logger.emit.assert_not_called()
+
+
+@mock.patch('google.adk.telemetry.tracing.otel_logger')
+def test_trace_generate_content_result_without_a_span_emits_nothing(
+    mock_otel_logger,
+):
+  """No span means the inference was not traced at all, so the choice log
+
+  would be an orphan; it must be suppressed too.
+  """
+  with pytest.warns(
+      DeprecationWarning, match='Replaced by trace_inference_result'
+  ):
+    trace_generate_content_result(
+        None, LlmResponse(finish_reason=types.FinishReason.STOP)
+    )
+
+  mock_otel_logger.emit.assert_not_called()
+
+
+def test_build_llm_request_for_trace_traces_content_without_parts():
+  from google.adk.telemetry.tracing import _build_llm_request_for_trace
+
+  llm_request = LlmRequest(
+      model='gemini-2.0-flash',
+      contents=[types.Content(role='user', parts=None)],
+  )
+
+  result = _build_llm_request_for_trace(llm_request)
+
+  assert result['contents'] == [{'role': 'user', 'parts': []}]
+
+
+@pytest.mark.asyncio
+async def test_use_inference_span_rejects_context_without_agent():
+  invocation_context = await _create_invocation_context(
+      LlmAgent(name='test_agent', model='gemini-pro')
+  )
+  invocation_context.agent = None
+
+  with pytest.raises(ValueError, match='must have an agent'):
+    async with use_inference_span(
+        LlmRequest(model='gemini-pro'), invocation_context, mock.MagicMock()
+    ):
+      pass
+
+
+@pytest.mark.asyncio
+async def test_use_generate_content_span_rejects_context_without_agent():
+  invocation_context = await _create_invocation_context(
+      LlmAgent(name='test_agent', model='gemini-pro')
+  )
+  invocation_context.agent = None
+
+  with (
+      pytest.warns(DeprecationWarning, match='Replaced by use_inference_span'),
+      pytest.raises(ValueError, match='must have an agent'),
+  ):
+    with use_generate_content_span(
+        LlmRequest(model='gemini-pro'), invocation_context, mock.MagicMock()
+    ):
+      pass

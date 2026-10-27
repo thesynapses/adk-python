@@ -13,28 +13,38 @@
 # limitations under the License.
 
 import asyncio
+import gc
+import logging
 from typing import Any
 from typing import AsyncGenerator
 
 from google.adk.agents.context import Context
 from google.adk.apps.app import App
 from google.adk.apps.app import ResumabilityConfig
+from google.adk.events._interrupts import extract_event_interrupt_ids
 from google.adk.events.event import Event
+from google.adk.events.request_input import RequestInput
 from google.adk.workflow import BaseNode
 from google.adk.workflow import START
 from google.adk.workflow._node import node
+from google.adk.workflow._node_status import NodeStatus
 from google.adk.workflow._parallel_worker import _ParallelWorker as ParallelWorker
 from google.adk.workflow._workflow import Workflow
-from google.adk.workflow.utils._workflow_hitl_utils import get_request_input_interrupt_ids
-from google.adk.workflow.utils._workflow_hitl_utils import has_request_input_function_call
 from google.genai import types
+from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 import pytest
 from typing_extensions import override
 
 from . import testing_utils
+from .workflow_testing_utils import get_request_input_events
 from .workflow_testing_utils import simplify_events_with_node
+
+# Upper bound on any wait between workers that are supposed to be running
+# concurrently. Reaching it means they are not, so the waiting test fails on
+# its own assertions rather than blocking until the whole target times out.
+_MAX_WAIT_S = 5.0
 
 
 class _ProducerNode(BaseNode):
@@ -330,8 +340,8 @@ async def test_parallel_worker_failure_propagates_and_cancels_others(
 ):
   """One worker failure cancels remaining workers and propagates the exception.
 
-  Setup: 3 items — task-1 completes fast, task-2 fails after delay,
-    task-3 is slow.
+  Setup: 3 items — task-1 completes, task-2 fails once task-1 has finished
+    and task-3 is parked, task-3 waits to be cancelled.
   Assert:
     - task-1 finishes before the failure.
     - task-2's ValueError propagates to the runner.
@@ -343,16 +353,25 @@ async def test_parallel_worker_failure_propagates_and_cancels_others(
 
   tracker = {}
   task_3_done_cancelled = False
+  # The interleaving the assertions below describe is established by handshake
+  # rather than by racing sleeps against each other: task-2 may only fail once
+  # task-1 has finished and task-3 is parked.
+  task_1_done = asyncio.Event()
+  task_3_parked = asyncio.Event()
 
   async def _worker_failable_func(node_input: str) -> AsyncGenerator[Any, None]:
     if node_input == 'task-1':
       yield f'{node_input}_processed'
     elif node_input == 'task-2':
-      await asyncio.sleep(0.05)
+      await asyncio.wait_for(task_1_done.wait(), timeout=_MAX_WAIT_S)
+      await asyncio.wait_for(task_3_parked.wait(), timeout=_MAX_WAIT_S)
       raise ValueError(f'{node_input} failed')
     elif node_input == 'task-3':
+      task_3_parked.set()
       try:
-        await asyncio.sleep(0.1)
+        # Long enough that only the cancellation task-2's failure delivers ends
+        # this wait; sleeping it out instead fails the assertions below.
+        await asyncio.sleep(_MAX_WAIT_S)
       except asyncio.CancelledError:
         nonlocal task_3_done_cancelled
         task_3_done_cancelled = True
@@ -360,6 +379,8 @@ async def test_parallel_worker_failure_propagates_and_cancels_others(
       yield f'{node_input}_processed'
 
     tracker[node_input] = True
+    if node_input == 'task-1':
+      task_1_done.set()
 
   worker = ParallelWorker(node=_worker_failable_func)
 
@@ -451,7 +472,6 @@ class _HitlWorkerNode(BaseNode):
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(reason='ctx.run_node needs barrier for parallel HITL')
 async def test_parallel_worker_pauses_for_human_input(
     request: pytest.FixtureRequest,
 ):
@@ -488,9 +508,9 @@ async def test_parallel_worker_pauses_for_human_input(
   events1 = await runner.run_async(testing_utils.get_user_content('start'))
 
   # Then item1 should complete and item2 should interrupt
-  req_events = [e for e in events1 if has_request_input_function_call(e)]
+  req_events = get_request_input_events(events1)
   assert len(req_events) == 1
-  interrupt_id = get_request_input_interrupt_ids(req_events[0])[0]
+  [interrupt_id] = extract_event_interrupt_ids(req_events[0])
   assert interrupt_id == 'req_item2'
   invocation_id = events1[0].invocation_id
 
@@ -506,11 +526,11 @@ async def test_parallel_worker_pauses_for_human_input(
           },
       ),
       (
-          'parallel_worker_hitl_agent@1/Worker@1',
+          'parallel_worker_hitl_agent@1/Worker@1/Worker@1',
           {'output': 'item1_processed'},
       ),
       (
-          'parallel_worker_hitl_agent',
+          'parallel_worker_hitl_agent@1/Worker@1/Worker@2',
           testing_utils.simplify_content(req_events[0].content),
       ),
   ]
@@ -533,7 +553,16 @@ async def test_parallel_worker_pauses_for_human_input(
 
   assert simplified_events2 == [
       (
-          'parallel_worker_hitl_agent@1/Worker@1',
+          'parallel_worker_hitl_agent@1/NodeA@1',
+          {
+              'output': [
+                  {'val': 'item1', 'ask': False},
+                  {'val': 'item2', 'ask': True},
+              ],
+          },
+      ),
+      (
+          'parallel_worker_hitl_agent@1/Worker@1/Worker@2',
           {'output': 'item2_resumed'},
       ),
       (
@@ -714,77 +743,10 @@ async def test_parallel_worker_can_wrap_nested_workflow(
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(reason='New Workflow has no parallel_worker field')
-async def test_workflow_auto_wraps_parallel_worker_when_flag_set(
+async def test_parallel_worker_limits_parallel_workers(
     request: pytest.FixtureRequest,
 ):
-  """Workflow with parallel_worker=True auto-wraps in ParallelWorker."""
-
-  # Given a nested workflow with parallel_worker=True
-  async def producer_func():
-    return ['item1', 'item2']
-
-  async def worker_func(node_input: Any):
-    return f'{node_input}_processed'
-
-  nested_agent = Workflow(
-      name='nested_agent',
-      edges=[('START', worker_func)],
-      parallel_worker=True,
-  )
-
-  outer_agent = Workflow(
-      name='outer_agent',
-      edges=[
-          ('START', producer_func),
-          (producer_func, nested_agent),
-      ],
-  )
-
-  app = App(
-      name=request.function.__name__,
-      root_agent=outer_agent,
-  )
-  runner = testing_utils.InMemoryRunner(app=app)
-
-  # When the workflow is run
-  events = await runner.run_async(testing_utils.get_user_content('start'))
-
-  # Then it should process items in parallel
-  simplified_events = simplify_events_with_node(events)
-
-  assert simplified_events == [
-      (
-          'outer_agent@1/producer_func@1',
-          {
-              'output': ['item1', 'item2'],
-          },
-      ),
-      (
-          'nested_agent@1/worker_func@1',
-          {'output': 'item1_processed'},
-      ),
-      (
-          'nested_agent@1/worker_func@1',
-          {'output': 'item2_processed'},
-      ),
-      (
-          'outer_agent@1/nested_agent@1',
-          {
-              'output': [
-                  'item1_processed',
-                  'item2_processed',
-              ],
-          },
-      ),
-  ]
-
-
-@pytest.mark.asyncio
-async def test_parallel_worker_limits_concurrency(
-    request: pytest.FixtureRequest,
-):
-  """max_concurrency limits the number of concurrent workers at any time."""
+  """max_parallel_workers limits the number of concurrent workers at any time."""
   # Given items and events to control concurrency
   items = ['item1', 'item2', 'item3', 'item4']
   started_events = {item: asyncio.Event() for item in items}
@@ -798,10 +760,10 @@ async def test_parallel_worker_limits_concurrency(
     yield f'{node_input}_processed'
 
   node_a = _ProducerNode(items=items, name='NodeA')
-  worker = ParallelWorker(node=_concurrency_worker_func, max_concurrency=2)
+  worker = ParallelWorker(node=_concurrency_worker_func, max_parallel_workers=2)
 
   agent = Workflow(
-      name='max_concurrency_agent',
+      name='max_parallel_workers_agent',
       edges=[
           (START, node_a),
           (node_a, worker),
@@ -861,35 +823,35 @@ async def test_parallel_worker_limits_concurrency(
 
   assert simplified_events == [
       (
-          'max_concurrency_agent@1/NodeA@1',
+          'max_parallel_workers_agent@1/NodeA@1',
           {'output': items},
       ),
       (
-          'max_concurrency_agent@1/_concurrency_worker_func@1/_concurrency_worker_func@2',
+          'max_parallel_workers_agent@1/_concurrency_worker_func@1/_concurrency_worker_func@2',
           {
               'output': 'item2_processed',
           },
       ),
       (
-          'max_concurrency_agent@1/_concurrency_worker_func@1/_concurrency_worker_func@3',
+          'max_parallel_workers_agent@1/_concurrency_worker_func@1/_concurrency_worker_func@3',
           {
               'output': 'item3_processed',
           },
       ),
       (
-          'max_concurrency_agent@1/_concurrency_worker_func@1/_concurrency_worker_func@1',
+          'max_parallel_workers_agent@1/_concurrency_worker_func@1/_concurrency_worker_func@1',
           {
               'output': 'item1_processed',
           },
       ),
       (
-          'max_concurrency_agent@1/_concurrency_worker_func@1/_concurrency_worker_func@4',
+          'max_parallel_workers_agent@1/_concurrency_worker_func@1/_concurrency_worker_func@4',
           {
               'output': 'item4_processed',
           },
       ),
       (
-          'max_concurrency_agent@1/_concurrency_worker_func@1',
+          'max_parallel_workers_agent@1/_concurrency_worker_func@1',
           {
               'output': [
                   'item1_processed',
@@ -903,13 +865,12 @@ async def test_parallel_worker_limits_concurrency(
 
 
 @pytest.mark.asyncio
-@pytest.mark.skip(reason='Hangs: ctx.run_node needs barrier for parallel HITL')
-async def test_parallel_worker_hitl_respects_concurrency_limits(
+async def test_parallel_worker_hitl_respects_parallel_workers_limits(
     request: pytest.FixtureRequest,
 ):
-  """HITL resume under max_concurrency schedules next worker after resolution.
+  """HITL resume under max_parallel_workers schedules next worker after resolution.
 
-  Setup: 3 items, max_concurrency=2. item1 waits, item2 does HITL,
+  Setup: 3 items, max_parallel_workers=2. item1 waits, item2 does HITL,
     item3 does HITL.
   Act:
     - Run 1: item1 and item2 start. item2 interrupts. Signal item1 to finish.
@@ -951,10 +912,10 @@ async def test_parallel_worker_hitl_respects_concurrency_limits(
       yield Event(output=f'{val}_processed')
 
   node_a = _ProducerNode(items=items, name='NodeA')
-  worker = ParallelWorker(node=hitl_concurrency_worker, max_concurrency=2)
+  worker = ParallelWorker(node=hitl_concurrency_worker, max_parallel_workers=2)
 
   agent = Workflow(
-      name='max_concurrency_hitl_agent',
+      name='max_parallel_workers_hitl_agent',
       edges=[
           (START, node_a),
           (node_a, worker),
@@ -990,26 +951,26 @@ async def test_parallel_worker_hitl_respects_concurrency_limits(
   events1 = await run_task
   events.extend(events1)
 
-  req_events = [e for e in events1 if has_request_input_function_call(e)]
+  req_events = get_request_input_events(events1)
   assert len(req_events) == 1
-  interrupt_id_2 = get_request_input_interrupt_ids(req_events[0])[0]
+  [interrupt_id_2] = extract_event_interrupt_ids(req_events[0])
   assert interrupt_id_2 == 'req_item2'
   invocation_id_1 = events1[0].invocation_id
 
   simplified_events1 = simplify_events_with_node(events1)
   assert simplified_events1 == [
       (
-          'max_concurrency_hitl_agent@1/NodeA@1',
+          'max_parallel_workers_hitl_agent@1/NodeA@1',
           {
               'output': items,
           },
       ),
       (
-          'max_concurrency_hitl_agent',
+          'max_parallel_workers_hitl_agent@1/Worker@1/Worker@2',
           testing_utils.simplify_content(req_events[0].content),
       ),
       (
-          'max_concurrency_hitl_agent@1/Worker__0@1',
+          'max_parallel_workers_hitl_agent@1/Worker@1/Worker@1',
           {'output': 'item1_processed'},
       ),
   ]
@@ -1038,20 +999,26 @@ async def test_parallel_worker_hitl_respects_concurrency_limits(
   events2 = await run_task_2
   events.extend(events2)
 
-  req_events_2 = [e for e in events2 if has_request_input_function_call(e)]
+  req_events_2 = get_request_input_events(events2)
   assert len(req_events_2) == 1
-  interrupt_id_3 = get_request_input_interrupt_ids(req_events_2[0])[0]
+  [interrupt_id_3] = extract_event_interrupt_ids(req_events_2[0])
   assert interrupt_id_3 == 'req_item3'
   invocation_id_2 = events2[0].invocation_id
 
   simplified_events2 = simplify_events_with_node(events2)
   assert simplified_events2 == [
       (
-          'max_concurrency_hitl_agent@1/Worker__1@1',
+          'max_parallel_workers_hitl_agent@1/NodeA@1',
+          {
+              'output': items,
+          },
+      ),
+      (
+          'max_parallel_workers_hitl_agent@1/Worker@1/Worker@2',
           {'output': 'item2_resumed'},
       ),
       (
-          'max_concurrency_hitl_agent',
+          'max_parallel_workers_hitl_agent@1/Worker@1/Worker@3',
           testing_utils.simplify_content(req_events_2[0].content),
       ),
   ]
@@ -1080,13 +1047,535 @@ async def test_parallel_worker_hitl_respects_concurrency_limits(
 
   assert simplified_events3 == [
       (
-          'max_concurrency_hitl_agent@1/Worker__2@1',
+          'max_parallel_workers_hitl_agent@1/NodeA@1',
+          {
+              'output': items,
+          },
+      ),
+      (
+          'max_parallel_workers_hitl_agent@1/Worker@1/Worker@3',
           {'output': 'item3_resumed'},
       ),
       (
-          'max_concurrency_hitl_agent@1/Worker@1',
+          'max_parallel_workers_hitl_agent@1/Worker@1',
           {
               'output': ['item1_processed', 'item2_resumed', 'item3_resumed'],
           },
       ),
   ]
+
+
+@pytest.mark.asyncio
+async def test_parallel_worker_simultaneous_failures_raise_lowest_index(
+    request: pytest.FixtureRequest,
+):
+  """The exception surfaced from concurrent failures is deterministic.
+
+  Setup: 2 items whose workers both fail immediately, so both tasks can
+    complete within the same asyncio.wait wake-up.
+  Assert: the propagated exception is always the lowest-index item's.
+    Previously the failed task was picked by iterating the unordered set
+    returned by asyncio.wait, so the surfaced exception could differ
+    between runs (and between record and replay).
+  """
+
+  async def _worker_always_fails(node_input: str) -> str:
+    raise ValueError(f'{node_input} failed')
+
+  for _ in range(10):
+    node_a = _ProducerNode(items=['item-0', 'item-1'], name='NodeA')
+    worker = ParallelWorker(node=_worker_always_fails)
+    agent = Workflow(
+        name='test_agent_simultaneous_fail',
+        edges=[
+            (START, node_a),
+            (node_a, worker),
+        ],
+    )
+    app = App(name=request.function.__name__, root_agent=agent)
+    runner = testing_utils.InMemoryRunner(app=app)
+
+    with pytest.raises(ValueError, match='item-0 failed'):
+      await runner.run_async(testing_utils.get_user_content('start'))
+
+
+@pytest.mark.asyncio
+async def test_parallel_worker_cancels_in_flight_items(
+    request: pytest.FixtureRequest,
+):
+  """Cancelling the worker cancels the items it still has in flight.
+
+  Setup: 2 items that never finish on their own, driven by a plain node so
+    the worker is the only owner of the item tasks.
+  Assert: cancelling the run cancels both items. Previously asyncio.wait was
+    left to abandon them, and an orphaned item kept running and then blocked
+    forever emitting into a run nobody consumes any more.
+  """
+  items = ['item1', 'item2']
+  started = {item: asyncio.Event() for item in items}
+  cancelled = {item: asyncio.Event() for item in items}
+
+  async def _never_finishing_worker_func(node_input: str) -> str:
+    started[node_input].set()
+    try:
+      await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+      cancelled[node_input].set()
+      raise
+    return f'{node_input}_processed'
+
+  worker = ParallelWorker(node=_never_finishing_worker_func)
+
+  @node(name='Driver', rerun_on_resume=True)
+  async def driver(ctx: Context, node_input: Any) -> AsyncGenerator[Any, None]:
+    yield Event(output=await ctx.run_node(worker, node_input=items))
+
+  app = App(name=request.function.__name__, root_agent=driver)
+  runner = testing_utils.InMemoryRunner(app=app)
+  run_task = asyncio.create_task(
+      runner.run_async(testing_utils.get_user_content('start'))
+  )
+  await asyncio.wait_for(
+      asyncio.gather(*(event.wait() for event in started.values())), timeout=5
+  )
+
+  # When the run is cancelled while both items are still in flight
+  run_task.cancel()
+  with pytest.raises(asyncio.CancelledError):
+    # Bounded so that a worker which waits on abandoned items fails here
+    # instead of hanging the suite.
+    await asyncio.wait_for(run_task, timeout=5)
+
+  # Then both items were cancelled rather than left running
+  await asyncio.wait_for(
+      asyncio.gather(*(event.wait() for event in cancelled.values())), timeout=1
+  )
+
+
+@pytest.mark.asyncio
+async def test_parallel_worker_waits_for_in_flight_items_on_interrupt(
+    request: pytest.FixtureRequest,
+):
+  """An interrupted item does not cancel its siblings still in flight.
+
+  Setup: 2 items. item1 blocks on a gate the test controls; item2 requests
+    input while item1 is still running.
+  Assert: the run is still going after item2 interrupts, and once item1 is
+    released its output is part of run 1 while the worker checkpoints as
+    WAITING. Previously the interrupt was treated as a failure, which
+    cancelled item1 and lost its result.
+  """
+  item1_release = asyncio.Event()
+  item2_interrupted = asyncio.Event()
+
+  @node(name='Worker')
+  async def gated_hitl_worker(
+      ctx: Context, node_input: str
+  ) -> AsyncGenerator[Any, None]:
+    if node_input == 'item2':
+      item2_interrupted.set()
+      yield RequestInput(interrupt_id='req_item2', message='Input for item2')
+    else:
+      await item1_release.wait()
+      yield Event(output='item1_processed')
+
+  node_a = _ProducerNode(items=['item1', 'item2'], name='NodeA')
+  worker = ParallelWorker(node=gated_hitl_worker)
+  agent = Workflow(
+      name='in_flight_interrupt_agent',
+      edges=[(START, node_a), (node_a, worker)],
+  )
+  app = App(
+      name=request.function.__name__,
+      root_agent=agent,
+      resumability_config=ResumabilityConfig(is_resumable=True),
+  )
+  runner = testing_utils.InMemoryRunner(app=app)
+  run_task = asyncio.create_task(
+      runner.run_async(testing_utils.get_user_content('start'))
+  )
+
+  # When item2 interrupts while item1 is still blocked on its gate
+  await asyncio.wait_for(item2_interrupted.wait(), timeout=_MAX_WAIT_S)
+  # Give the interrupt time to reach the worker. Before the fix this is where
+  # it cancelled item1 and finished the run.
+  await asyncio.sleep(0.1)
+
+  # Then the run is still waiting on item1 rather than finished without it
+  assert not run_task.done()
+
+  # When item1 is released
+  item1_release.set()
+  events1 = await asyncio.wait_for(run_task, timeout=_MAX_WAIT_S)
+
+  # Then item1's output is part of run 1 and the worker is WAITING on item2
+  assert (
+      'in_flight_interrupt_agent@1/Worker@1/Worker@1',
+      {'output': 'item1_processed'},
+  ) in simplify_events_with_node(events1)
+  checkpoints = [
+      e.actions.agent_state for e in events1 if e.actions.agent_state
+  ]
+  worker_state = checkpoints[-1]['nodes']['Worker']
+  assert worker_state['status'] == NodeStatus.WAITING.value
+  assert worker_state['interrupts'] == ['req_item2']
+
+
+@pytest.mark.asyncio
+async def test_parallel_worker_retrieves_every_simultaneous_failure(
+    request: pytest.FixtureRequest,
+):
+  """Concurrent failures are all retrieved from their tasks.
+
+  Setup: 2 items whose workers both fail immediately, so both tasks complete
+    within the same asyncio.wait wake-up.
+  Assert: asyncio does not report "Task exception was never retrieved" for
+    the failure that is not the one propagated.
+  """
+  unretrieved: list[str] = []
+  loop = asyncio.get_running_loop()
+  previous_handler = loop.get_exception_handler()
+  loop.set_exception_handler(
+      lambda _, context: unretrieved.append(context.get('message', ''))
+  )
+  try:
+
+    async def _worker_always_fails(node_input: str) -> str:
+      raise ValueError(f'{node_input} failed')
+
+    node_a = _ProducerNode(items=['item-0', 'item-1'], name='NodeA')
+    worker = ParallelWorker(node=_worker_always_fails)
+    agent = Workflow(
+        name='test_agent_retrieved_failures',
+        edges=[
+            (START, node_a),
+            (node_a, worker),
+        ],
+    )
+    app = App(name=request.function.__name__, root_agent=agent)
+    runner = testing_utils.InMemoryRunner(app=app)
+
+    # When both items fail. The error is caught by hand rather than with
+    # pytest.raises, whose ExceptionInfo holds the traceback (and so the task
+    # objects) alive past the point where asyncio would report them.
+    error_message = None
+    try:
+      await runner.run_async(testing_utils.get_user_content('start'))
+    except ValueError as e:
+      error_message = str(e)
+    assert error_message == 'item-0 failed'
+
+    gc.collect()
+    await asyncio.sleep(0)
+  finally:
+    loop.set_exception_handler(previous_handler)
+
+  # Then nothing was left unretrieved
+  assert [
+      message for message in unretrieved if 'never retrieved' in message
+  ] == []
+
+
+@pytest.mark.asyncio
+async def test_parallel_worker_gives_up_on_item_that_ignores_cancellation(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+  """An item that swallows cancellation does not hang the worker.
+
+  Setup: 1 item that catches CancelledError and keeps running, driven by a
+    plain node so the worker is the only owner of the item task.
+  Assert: the worker stops waiting once the drain timeout elapses and says
+    so, rather than waiting on the item forever.
+  """
+  monkeypatch.setattr(
+      'google.adk.workflow._parallel_worker'
+      '._CANCELLED_ITEM_DRAIN_TIMEOUT_SECONDS',
+      0.1,
+  )
+  started = asyncio.Event()
+  release = asyncio.Event()
+
+  async def _ignores_cancellation(node_input: str) -> str:
+    started.set()
+    try:
+      await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+      # Keep running past the cancellation until the test lets go.
+      await release.wait()
+    return f'{node_input}_processed'
+
+  worker = ParallelWorker(node=_ignores_cancellation)
+
+  @node(name='Driver', rerun_on_resume=True)
+  async def driver(ctx: Context, node_input: Any) -> AsyncGenerator[Any, None]:
+    yield Event(output=await ctx.run_node(worker, node_input=['item1']))
+
+  app = App(name=request.function.__name__, root_agent=driver)
+  runner = testing_utils.InMemoryRunner(app=app)
+  run_task = asyncio.create_task(
+      runner.run_async(testing_utils.get_user_content('start'))
+  )
+  await asyncio.wait_for(started.wait(), timeout=5)
+
+  # When the run is cancelled and the item refuses to stop
+  run_task.cancel()
+  with caplog.at_level(logging.WARNING):
+    with pytest.raises(asyncio.CancelledError):
+      # Well past the drain timeout, so an unbounded wait fails here.
+      await asyncio.wait_for(run_task, timeout=3)
+
+  # Then the worker gave up on it and said so
+  assert 'did not stop within' in caplog.text
+
+  release.set()
+  await asyncio.sleep(0)
+
+
+def _outputs_for(events: list[Event], path: str) -> list[Any]:
+  return [
+      e.output
+      for e in events
+      if e.node_info and e.node_info.path == path and e.output is not None
+  ]
+
+
+@pytest.mark.asyncio
+async def test_parallel_worker_directly_after_start_json_array_untyped(
+    request: pytest.FixtureRequest,
+) -> None:
+  """ParallelWorker placed directly after START unwraps a JSON array Content."""
+
+  @node(parallel_worker=True)
+  def review_case(node_input):
+    return {
+        'order_id': node_input['order_id'],
+        'decision': 'APPROVE' if node_input['amount'] < 100 else 'REVIEW',
+    }
+
+  def collect_decisions(node_input: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        'approved': [
+            d['order_id'] for d in node_input if d['decision'] == 'APPROVE'
+        ],
+        'needs_review': [
+            d['order_id'] for d in node_input if d['decision'] == 'REVIEW'
+        ],
+    }
+
+  agent = Workflow(
+      name='batch_review',
+      edges=[(START, review_case, collect_decisions)],
+  )
+  app = App(name=request.function.__name__, root_agent=agent)
+  runner = testing_utils.InMemoryRunner(app=app)
+
+  payload = (
+      '[{"order_id": "ORD-1", "amount": 420}, '
+      '{"order_id": "ORD-2", "amount": 85}]'
+  )
+  events = await runner.run_async(testing_utils.get_user_content(payload))
+  assert _outputs_for(events, 'batch_review@1/collect_decisions@1') == [
+      {'approved': ['ORD-2'], 'needs_review': ['ORD-1']}
+  ]
+
+
+@pytest.mark.asyncio
+async def test_parallel_worker_directly_after_start_json_array_typed_model(
+    request: pytest.FixtureRequest,
+) -> None:
+  """ParallelWorker after START coerces each JSON item to inner BaseModel."""
+
+  class _OrderCase(BaseModel):
+    order_id: str
+    amount: int
+
+  @node(parallel_worker=True)
+  def review_case(node_input: _OrderCase) -> str:
+    return f'{node_input.order_id}:{node_input.amount}'
+
+  agent = Workflow(name='typed_batch', edges=[(START, review_case)])
+  app = App(name=request.function.__name__, root_agent=agent)
+  runner = testing_utils.InMemoryRunner(app=app)
+
+  payload = (
+      '[{"order_id": "ORD-1", "amount": 420}, '
+      '{"order_id": "ORD-2", "amount": 85}]'
+  )
+  events = await runner.run_async(testing_utils.get_user_content(payload))
+  assert _outputs_for(events, 'typed_batch@1/review_case@1') == [
+      ['ORD-1:420', 'ORD-2:85']
+  ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('raw_text', 'expected'),
+    [
+        ('{"order_id": "ORD-1"}', {'order_id': 'ORD-1'}),
+        ('plain_text_item', 'plain_text_item'),
+    ],
+)
+async def test_parallel_worker_directly_after_start_non_list_payload(
+    request: pytest.FixtureRequest,
+    raw_text: str,
+    expected: Any,
+) -> None:
+  """ParallelWorker after START unwraps single JSON objects and plain text."""
+
+  @node(parallel_worker=True)
+  def echo_worker(node_input):
+    return {'received': node_input}
+
+  agent = Workflow(name='single_or_text', edges=[(START, echo_worker)])
+  app = App(name=request.function.__name__, root_agent=agent)
+  runner = testing_utils.InMemoryRunner(app=app)
+
+  events = await runner.run_async(testing_utils.get_user_content(raw_text))
+  assert _outputs_for(events, 'single_or_text@1/echo_worker@1') == [
+      [{'received': expected}]
+  ]
+
+
+@pytest.mark.asyncio
+async def test_parallel_worker_str_annotated_worker_receives_raw_json_text(
+    request: pytest.FixtureRequest,
+) -> None:
+  """ParallelWorker wrapping a str-annotated node passes raw JSON text."""
+
+  @node(parallel_worker=True)
+  def string_worker(node_input: str) -> dict[str, str]:
+    return {'received_type': type(node_input).__name__, 'val': node_input}
+
+  agent = Workflow(name='str_worker_wf', edges=[(START, string_worker)])
+  app = App(name=request.function.__name__, root_agent=agent)
+  runner = testing_utils.InMemoryRunner(app=app)
+
+  events = await runner.run_async(
+      testing_utils.get_user_content('{"order_id": "ORD-1"}')
+  )
+  assert _outputs_for(events, 'str_worker_wf@1/string_worker@1') == [
+      [{'received_type': 'str', 'val': '{"order_id": "ORD-1"}'}]
+  ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('optional', [False, True])
+async def test_parallel_worker_content_annotated_worker_preserves_content(
+    request: pytest.FixtureRequest,
+    optional: bool,
+) -> None:
+  """ParallelWorker preserves Content when inner node expects Content."""
+  if optional:
+
+    @node(parallel_worker=True)
+    def content_worker(node_input: types.Content | None) -> str:
+      assert node_input is not None
+      return node_input.parts[0].text or ''
+
+  else:
+
+    @node(parallel_worker=True)
+    def content_worker(node_input: types.Content) -> str:
+      return node_input.parts[0].text or ''
+
+  agent = Workflow(name='content_worker_wf', edges=[(START, content_worker)])
+  app = App(name=request.function.__name__, root_agent=agent)
+  runner = testing_utils.InMemoryRunner(app=app)
+
+  events = await runner.run_async(
+      testing_utils.get_user_content('[{"order_id": "ORD-1"}]')
+  )
+  assert _outputs_for(events, 'content_worker_wf@1/content_worker@1') == [
+      ['[{"order_id": "ORD-1"}]']
+  ]
+
+
+@pytest.mark.asyncio
+async def test_parallel_worker_multimodal_content_preserved_untouched(
+    request: pytest.FixtureRequest,
+) -> None:
+  """ParallelWorker with multimodal non-text parts leaves Content untouched."""
+
+  @node(parallel_worker=True)
+  def raw_worker(node_input):
+    return {'is_content': isinstance(node_input, types.Content)}
+
+  agent = Workflow(name='multimodal_wf', edges=[(START, raw_worker)])
+  app = App(name=request.function.__name__, root_agent=agent)
+  runner = testing_utils.InMemoryRunner(app=app)
+
+  blob = types.Blob(mime_type='image/png', data=b'123')
+  content = types.Content(role='user', parts=[types.Part(inline_data=blob)])
+  events = await runner.run_async(content)
+  assert _outputs_for(events, 'multimodal_wf@1/raw_worker@1') == [
+      [{'is_content': True}]
+  ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('structured', [False, True])
+async def test_parallel_worker_fans_out_json_list_without_thoughts(
+    request: pytest.FixtureRequest,
+    structured: bool,
+) -> None:
+  """ParallelWorker unwraps a JSON list from Content without thoughts."""
+
+  class _OutputModel(BaseModel):
+    name: str
+    value: int
+
+  received: list[Any] = []
+
+  def process_text(node_input: str) -> str:
+    received.append(node_input)
+    return 'ok'
+
+  def process_model(node_input: _OutputModel) -> str:
+    received.append(node_input)
+    return 'ok'
+
+  answer = (
+      '[{"name": "first", "value": 1}, {"name": "second", "value": 2}]'
+      if structured
+      else '["first", "second"]'
+  )
+
+  def produce() -> Event:
+    return Event(
+        output=types.Content(
+            role='model',
+            parts=[
+                types.Part(text='Let me think first.', thought=True),
+                types.Part(text=answer),
+            ],
+        )
+    )
+
+  worker = node(
+      process_model if structured else process_text, parallel_worker=True
+  )
+  agent = Workflow(
+      name='parallel_answer', edges=[(START, produce), (produce, worker)]
+  )
+  app = App(name=request.function.__name__, root_agent=agent)
+  runner = testing_utils.InMemoryRunner(app=app)
+  await runner.run_async(testing_utils.get_user_content('start'))
+
+  assert received == (
+      [
+          _OutputModel(name='first', value=1),
+          _OutputModel(name='second', value=2),
+      ]
+      if structured
+      else ['first', 'second']
+  )
+
+
+def test_parallel_worker_iter_static_children():
+  """_ParallelWorker._iter_static_children yields the wrapped node."""
+  inner = BaseNode(name='wrapped_node')
+  worker = ParallelWorker(node=inner)
+  children = list(worker._iter_static_children())
+  assert children == [inner]

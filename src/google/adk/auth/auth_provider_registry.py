@@ -16,17 +16,14 @@
 
 from __future__ import annotations
 
-from ..features import experimental
-from ..features import FeatureName
 from .auth_schemes import AuthScheme
 from .base_auth_provider import BaseAuthProvider
 
 
-@experimental(FeatureName.PLUGGABLE_AUTH)
 class AuthProviderRegistry:
   """Registry for auth provider instances."""
 
-  def __init__(self):
+  def __init__(self) -> None:
     self._providers: dict[type[AuthScheme], BaseAuthProvider] = {}
 
   def register(

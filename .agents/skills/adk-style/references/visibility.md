@@ -1,6 +1,6 @@
 # Visibility Style Guide
 
-Python does not have native access modifiers (like `public`, `private`, or `package-private`). ADK relies on naming conventions and module structure to define visibility boundaries.
+ADK defines its visibility boundaries with naming conventions and module structure, since Python has no access modifiers to enforce them.
 
 ## Conventions
 
@@ -23,7 +23,7 @@ Since Python lacks true package-private access, we simulate it by:
 - **Not exporting** the symbol in the package's `__init__.py`.
 - Using `_`-prefixed modules for internal implementation details.
 - Code within the same package can import from these `_` modules, but code outside should not.
-- **Direct Imports Required**: Within the ADK framework, importing from `__init__.py` is **not allowed**. You must import from the specific module directly. This helps keep `__init__.py` minimal and keeps packages as self-contained as possible.
+- **Direct Imports Required**: Within the ADK framework, import from the specific module, never from a package's `__init__.py` — see the imports reference.
 
 ### 4. Public API Export
 
@@ -31,6 +31,11 @@ Since Python lacks true package-private access, we simulate it by:
 - **Use `__all__`**: The `__init__.py` file should define `__all__` to explicitly list the symbols that are part of the public API.
 - **Only public names** (symbols intended for use outside the package) should be imported into `__init__.py` and listed in `__all__`.
 - Users should be able to import public symbols directly from the package level, rather than digging into internal modules.
+
+### 5. Implicit Workflow Wrapper Nodes Stay Private
+
+- A node class whose only job is to wrap an object the user already holds (such as `_ToolNode` for a `BaseTool`, `_ToolsetNode` for a `toolset['name']` descriptor, or `_LlmAgentWrapper` for a `BaseAgent`) must stay private (`_`-prefixed) and must **not** be exported from `google.adk.workflow`.
+- Users pass `NodeLike` targets directly into `Workflow(edges=...)` or `ctx.run_node(...)` (which normalize them via `build_node`), and configure per-node overrides (`name`, `rerun_on_resume`, `retry_config`, `timeout`) through the public `node()` helper (e.g., `node(toolset['read_file'], name='reader', timeout=30)`).
 
 ## Examples
 

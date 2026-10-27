@@ -6,6 +6,10 @@
 - **Test behavior, not implementation** — verify outcomes (outputs, side effects, errors), not internal mechanics.
 - **Refactor-proof** — if an internal refactor preserves the same behavior, all tests should still pass.
 
+`pytest` runs with `asyncio_mode = "auto"`, so a bare `async def test_...`
+works without `@pytest.mark.asyncio`. Many older tests still carry the marker;
+it is harmless, and not worth a cleanup pass.
+
 ## Rules
 
 ### 1. Test names describe the behavior, not the mechanism
@@ -121,7 +125,6 @@ Extract to module level only when 3+ tests share the same helper.
 
 ```python
 # Good — helper defined inline, right next to the test
-@pytest.mark.asyncio
 async def test_state_delta_bundled_with_output():
     """State set before yield is flushed onto the output event."""
 
@@ -203,6 +206,40 @@ def test_cache_behavior():
     assert cache.size == 2
 ```
 
+### 10. One test file per unit under test, not per change
+
+Add a new test to the existing test file for the module or feature under test.
+Never create a test file named after a CL, bug, or change — it fragments a
+module's coverage across files and rots, because the next person editing that
+module looks in the module's file, not in a file named after a one-time cleanup.
+
+Before adding a file, look for an existing home (`test_<module>*.py`). ADK
+already splits some modules by concern, so the home may be feature-specific
+(e.g. an `LlmAgent` error-message test belongs in
+`test_llm_agent_error_messages.py`, a runner test in `test_runners.py`). If a
+sibling test already asserts the same behavior, extend that assertion rather
+than duplicating it in a new file. Only create a new file for a genuinely new
+module or feature area, naming it `test_<module>_<feature>.py`.
+
+```python
+# Bad — a file named after the change; splits llm_agent/runner/llm_request
+#       coverage across a grab-bag no one will maintain
+tests/unittests/agents/test_improved_error_messages.py
+
+# Good — each test lands in the existing file for its unit
+tests/unittests/agents/test_llm_agent_error_messages.py  # LlmAgent messages
+tests/unittests/models/test_llm_request.py               # LlmRequest messages
+tests/unittests/test_runners.py                          # Runner messages
+```
+
+### 11. Parameterize variations instead of copy-pasting tests
+
+When verifying the same contract across a matrix of modes or configurations
+(such as `AgentMode.SINGLE_TURN` vs `AgentMode.CHAT`, `include_contents='none'`
+vs `'default'`, or resumable vs non-resumable apps), use
+`@pytest.mark.parametrize` on a single focused test rather than duplicating the
+test body across multiple functions.
+
 ### Test Structure Template
 
 ```python
@@ -230,3 +267,27 @@ def test_<behavior_description>():
     # Then the result matches expectations
     assert result == expected
 ```
+
+## ADK Test Fakes
+
+Use the fakes in `tests/unittests/testing_utils.py` (or
+`tests/unittests/workflow/testing_utils.py` for workflow tests) instead of
+patching ADK internals or constructing a bare `google.adk.runners.Runner`:
+
+- `testing_utils.MockModel.create(responses=[...])` builds a model that
+  replies with canned responses in order and records each request in
+  `.requests`.
+- `testing_utils.InMemoryRunner(root_agent=agent)` (or `node=wf` in
+  `workflow/testing_utils.py`) and `testing_utils.TestInMemoryRunner` run an
+  agent or workflow on in-memory services and automatically attach
+  `InvariantPlugin` (`check_invariants=True`) to validate event-stream
+  invariants on every turn. `await runner.run_async('hi')` returns the events,
+  and `testing_utils.simplify_events(events)` reduces them to
+  `(author, content)` pairs.
+
+Request the `env_variables` fixture from `conftest.py` to run a test against
+both the Gemini API and Vertex AI.
+
+A test that passes alone but fails in the full suite has usually inherited
+global state from an earlier test: reset that state with `monkeypatch` rather
+than changing your fixtures to dodge it.

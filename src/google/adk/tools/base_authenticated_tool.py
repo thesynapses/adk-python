@@ -17,37 +17,34 @@ from __future__ import annotations
 from abc import abstractmethod
 import logging
 from typing import Any
-from typing import Optional
-from typing import Union
+from typing import cast
 
 from typing_extensions import override
 
 from ..auth.auth_credential import AuthCredential
 from ..auth.auth_tool import AuthConfig
 from ..auth.credential_manager import CredentialManager
-from ..features import experimental
-from ..features import FeatureName
 from .base_tool import BaseTool
 from .tool_context import ToolContext
 
 logger = logging.getLogger("google_adk." + __name__)
 
 
-@experimental(FeatureName.BASE_AUTHENTICATED_TOOL)
 class BaseAuthenticatedTool(BaseTool):
-  """A base tool class that handles authentication before the actual tool logic
-  gets called. Functions can accept a special `credential` argument which is the
-  credential ready for use.(Experimental)
+  """A base tool class that handles authentication before the actual tool logic.
+
+  Functions can accept a special `credential` argument which is the credential
+  ready for use.
   """
 
   def __init__(
       self,
       *,
-      name,
-      description,
-      auth_config: AuthConfig = None,
-      response_for_auth_required: Optional[Union[dict[str, Any], str]] = None,
-  ):
+      name: str,
+      description: str,
+      auth_config: AuthConfig | None = None,
+      response_for_auth_required: dict[str, Any] | str | None = None,
+  ) -> None:
     """
     Args:
       name: The name of the tool.
@@ -67,6 +64,7 @@ class BaseAuthenticatedTool(BaseTool):
         description=description,
     )
     self._auth_config = auth_config
+    self._credentials_manager: CredentialManager | None
 
     if auth_config and auth_config.auth_scheme:
       self._credentials_manager = CredentialManager(auth_config=auth_config)
@@ -94,7 +92,10 @@ class BaseAuthenticatedTool(BaseTool):
     return await self._run_async_impl(
         args=args,
         tool_context=tool_context,
-        credential=credential,
+        # A tool with no credentials manager runs unauthenticated, so this is
+        # None on that path. Widening the abstract signature instead would
+        # invalidate every subclass that declares the narrower type.
+        credential=cast(AuthCredential, credential),
     )
 
   @abstractmethod

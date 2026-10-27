@@ -14,44 +14,74 @@
 
 """Development server with all ADK endpoints.
 
-This module provides the DevServer class which extends ApiServer with development-only endpoints.
+This module provides the DevServer class which extends ApiServer with
+development-only endpoints.
 All production endpoints are inherited from ApiServer.
-All dev-only endpoints (eval, debug, graph, test management) are added by DevServer.
+All dev-only endpoints (eval, debug, graph, test management, deploy) are added by DevServer.
 
 Use this for local development with `adk web`.
 For production deployments, use api_server.py instead.
+
+Security: like ApiServer, every endpoint here is unauthenticated, and the
+dev-only endpoints additionally read and write agent files on disk and run
+evaluation and debugging code. This server is intended solely for local
+development on a trusted machine. Never expose it to an untrusted or public
+network, and never use it for a production or multi-user deployment.
+
+Mutating ``/dev`` endpoints (and the Agent Builder YAML readback) additionally
+reject callers that are not on the loopback interface, so that binding the
+server to a routable address does not by itself hand out write or code-execution
+access over the network. See ``_require_local_agent_builder_client``.
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+import importlib.util
 import json
 import logging
 import os
 from pathlib import Path
 import shutil
+import signal
+import subprocess
+import sys
 import time
 from typing import Any
+from typing import cast
+from typing import Iterator
 from typing import Optional
+from typing import TYPE_CHECKING
 
+import anyio
+from fastapi import Depends
 from fastapi import FastAPI
 from fastapi import HTTPException
+from fastapi import Request as FastAPIRequest
+from fastapi import Response
 from fastapi import UploadFile
 from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
 from fastapi.responses import PlainTextResponse
 from fastapi.responses import StreamingResponse
 import graphviz
 from pydantic import Field
+from pydantic import TypeAdapter
 from pydantic import ValidationError
 from typing_extensions import deprecated
 import yaml
 
 from . import agent_graph
+from ..apps.app import App
+from ..auth.auth_credential import _redact_credential_secrets
 from ..errors.not_found_error import NotFoundError
 from ..evaluation.base_eval_service import InferenceConfig
 from ..evaluation.base_eval_service import InferenceRequest
 from ..evaluation.eval_case import EvalCase
 from ..evaluation.eval_case import SessionInput
+from ..evaluation.eval_config import _UserSimulatorConfig
+from ..evaluation.eval_config import LiveModelConfig
 from ..evaluation.eval_metrics import EvalMetric
 from ..evaluation.eval_metrics import EvalMetricResult
 from ..evaluation.eval_metrics import EvalMetricResultPerInvocation
@@ -59,23 +89,83 @@ from ..evaluation.eval_metrics import EvalStatus
 from ..evaluation.eval_metrics import MetricInfo
 from ..evaluation.eval_result import EvalSetResult
 from ..evaluation.eval_set import EvalSet
+from ..sessions.session import Session
+from ..telemetry._web_ui import ui_telemetry_from_otel
+from ..telemetry._web_ui import WebUiLogExporter
+from ..telemetry._web_ui import WebUiSpan
+from ..utils._telemetry_config import read_telemetry_consent
+from ..utils._telemetry_config import write_telemetry_consent
+from ._dev_deploy import register_dev_deploy_endpoints
+from .api_server import _is_local_client
 from .api_server import ApiServer
+
+NESTED_APP_SEPARATOR = "."
 from .utils import common
 from .utils import evals
 from .utils.graph_serialization import serialize_app_info
 from .utils.graph_visualization import plot_workflow_graph
 from .utils.state import create_empty_state
 
+if TYPE_CHECKING:
+  from opentelemetry.util.types import AttributeValue
+
 logger = logging.getLogger("google_adk." + __name__)
 
 _EVAL_SET_FILE_EXTENSION = ".evalset.json"
+_INITIAL_STATE_FILENAME = "initial_state.json"
+_PROCESS_TERMINATION_GRACE_SECONDS = 0.5
+_PROCESS_TERMINATOR_TIMEOUT_SECONDS = 1.0
+_TEST_OUTPUT_CHUNK_BYTES = 64 * 1024
+_IS_WINDOWS = os.name == "nt"
 
 TAG_DEBUG = "Debug"
 TAG_EVALUATION = "Evaluation"
 
+_ALLOW_REMOTE_AGENT_BUILDER_ENV = "ADK_ALLOW_REMOTE_AGENT_BUILDER"
+_TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes"})
+
+
+def _require_local_agent_builder_client(request: FastAPIRequest) -> None:
+  """Rejects mutating ``/dev`` and Agent Builder requests from remote callers.
+
+  Mutating ``/dev`` endpoints (and the Agent Builder YAML readback) read and
+  write files under ``agents_dir`` or spawn test, evaluation and deployment
+  runs, and like every other endpoint on this server, are unauthenticated. The
+  origin check in ``_OriginCheckMiddleware`` only stops a browser from being
+  used as a confused deputy; it lets a request through when ``Origin`` is
+  absent, so a non-browser client skips it just by omitting the header.
+  Restricting these endpoints to loopback peers is what keeps
+  ``adk web --host 0.0.0.0``, a forwarded container port or a tunnel from
+  handing anyone on the network access to them.
+
+  Args:
+    request: The incoming request.
+
+  Raises:
+    HTTPException: 403, if the caller is not on the loopback interface and
+      ``ADK_ALLOW_REMOTE_AGENT_BUILDER`` is not set.
+  """
+  if _is_local_client(request.scope):
+    return
+  if (
+      os.environ.get(_ALLOW_REMOTE_AGENT_BUILDER_ENV, "").strip().lower()
+      in _TRUTHY_ENV_VALUES
+  ):
+    return
+  raise HTTPException(
+      status_code=403,
+      detail=(
+          "This /dev endpoint only accepts requests from the machine running"
+          " the server. Set"
+          f" {_ALLOW_REMOTE_AGENT_BUILDER_ENV}=1 to allow remote access, and"
+          " only on a network you trust: these endpoints are unauthenticated"
+          " and write agent files to disk."
+      ),
+  )
+
 
 class CreateTestRequest(common.BaseModel):
-  session_data: dict
+  session_data: dict[Any, Any]
 
 
 class AddSessionToEvalSetRequest(common.BaseModel):
@@ -98,6 +188,22 @@ class RunEvalRequest(common.BaseModel):
       ),
   )
   eval_metrics: list[EvalMetric]
+  live_model_config: Optional[LiveModelConfig] = Field(
+      default=None,
+      description=(
+          "Config for running inference in live (bidirectional streaming) mode."
+          " Required for Live API models (e.g. `gemini-*-live-*`)."
+      ),
+  )
+  # A raw mapping, not the typed `UserSimulatorConfig` union: the union is not
+  # JSON-schema-able and would break OpenAPI generation. `run_eval` validates it.
+  user_simulator_config: Optional[dict[str, Any]] = Field(
+      default=None,
+      description=(
+          "Optional user-simulator configuration. The concrete type is selected"
+          ' via the `type` discriminator (e.g. `{"type": "llm_audio", ...}`).'
+      ),
+  )
 
 
 class RunEvalResult(common.BaseModel):
@@ -150,25 +256,411 @@ class ListMetricsInfoResponse(common.BaseModel):
   metrics_info: list[MetricInfo]
 
 
+class TelemetryConsentRequest(common.BaseModel):
+  """Request body for setting the telemetry consent configuration."""
+
+  telemetry: bool
+
+
+# Agent config fields whose value names Python code that the agent loader
+# imports and calls.
+_CODE_REFERENCE_KEYS = frozenset({
+    "after_agent_callbacks",
+    "after_model_callbacks",
+    "after_tool_callbacks",
+    "agent_class",
+    "before_agent_callbacks",
+    "before_model_callbacks",
+    "before_tool_callbacks",
+    "code",
+    "input_schema",
+    "model_code",
+    "output_schema",
+    "tools",
+})
+
+# The namespaces the agent loader searches when a reference has no dots.
+_ADK_BUILT_IN_NAMESPACES = ("google.adk.agents.", "google.adk.tools.")
+
+
+def _iter_code_references(value: Any) -> Iterator[str]:
+  """Yields the names a code-reference field carries, whatever its shape."""
+  if isinstance(value, str):
+    yield value
+  elif isinstance(value, list):
+    for item in value:
+      yield from _iter_code_references(item)
+  elif isinstance(value, dict):
+    name = value.get("name")
+    if isinstance(name, str):
+      yield name
+
+
+def _is_adk_built_in(reference: str) -> bool:
+  """Whether a qualified name reaches what an undotted name would reach.
+
+  One segment after the namespace is a name that namespace exports. A deeper
+  path walks into a submodule and can reach code an undotted reference cannot,
+  so it does not count as a built-in.
+
+  Args:
+    reference: A dotted Python name.
+
+  Returns:
+    Whether the reference names an ADK built-in.
+  """
+  for namespace in _ADK_BUILT_IN_NAMESPACES:
+    if reference.startswith(namespace):
+      return "." not in reference[len(namespace) :]
+  return False
+
+
+def _app_name_shadows_module(app_name: str, app_root: Path) -> bool:
+  """Whether importing the app name would load code from outside the app."""
+  # find_spec imports a dotted name's parents, so only look up the first part.
+  try:
+    spec = importlib.util.find_spec(app_name.partition(".")[0])
+  except ValueError:
+    return True
+  if spec is None:
+    return False
+  locations = list(spec.submodule_search_locations or [])
+  if spec.has_location and spec.origin is not None:
+    locations.append(spec.origin)
+  return not locations or not all(
+      Path(location).resolve().is_relative_to(app_root)
+      for location in locations
+  )
+
+
+def _check_code_reference(
+    reference: str,
+    *,
+    app_name: str,
+    app_root: Path,
+    filename: str,
+    field_name: str,
+) -> None:
+  """Checks that a code reference stays inside the app being edited.
+
+  Args:
+    reference: The name found in the uploaded document.
+    app_name: The app the document belongs to.
+    app_root: The app's resolved directory.
+    filename: The uploaded path, used in the error message.
+    field_name: The config field the reference came from.
+
+  Raises:
+    ValueError: If the reference can reach code outside the app.
+  """
+  if "." not in reference:
+    # The loader resolves an undotted name against ADK's own built-ins.
+    return
+  if _is_adk_built_in(reference):
+    return
+  if not reference.startswith(f"{app_name}."):
+    raise ValueError(
+        f"Blocked code reference {reference!r} in {filename!r}. The"
+        f" '{field_name}' field may only reference code under"
+        f" '{app_name}' or an ADK built-in."
+    )
+  if _app_name_shadows_module(app_name, app_root):
+    raise ValueError(
+        f"Blocked code reference {reference!r} in {filename!r}. The app name"
+        f" {app_name!r} shadows an importable Python module, so a reference to"
+        " the app cannot be told apart from one that leaves it."
+    )
+
+
+async def _signal_process_tree(
+    process: asyncio.subprocess.Process,
+    *,
+    force: bool,
+) -> None:
+  """Requests termination of a subprocess and its descendants."""
+  if _IS_WINDOWS:
+    command = ["taskkill", "/PID", str(process.pid), "/T"]
+    if force:
+      command.append("/F")
+    try:
+      terminator = await asyncio.create_subprocess_exec(
+          *command,
+          stdout=asyncio.subprocess.DEVNULL,
+          stderr=asyncio.subprocess.DEVNULL,
+      )
+      try:
+        await asyncio.wait_for(
+            terminator.wait(), timeout=_PROCESS_TERMINATOR_TIMEOUT_SECONDS
+        )
+      except asyncio.TimeoutError:
+        terminator.kill()
+        try:
+          await asyncio.wait_for(
+              terminator.wait(), timeout=_PROCESS_TERMINATION_GRACE_SECONDS
+          )
+        except asyncio.TimeoutError:
+          logger.warning("taskkill did not exit for process %d", process.pid)
+    except OSError:
+      logger.warning("Unable to run taskkill for process %d", process.pid)
+      if force and process.returncode is None:
+        process.kill()
+    return
+
+  kill_process_group = getattr(os, "killpg", None)
+  if kill_process_group is not None:
+    try:
+      kill_process_group(
+          process.pid,
+          (
+              getattr(signal, "SIGKILL", signal.SIGTERM)
+              if force
+              else signal.SIGTERM
+          ),
+      )
+      return
+    except ProcessLookupError:
+      # No such group: everything already exited, or the child never led one.
+      # The returncode check below tells those apart.
+      pass
+    except OSError:
+      logger.warning("Unable to signal process group %d", process.pid)
+  if process.returncode is None:
+    (process.kill if force else process.terminate)()
+
+
+async def _terminate_process_tree(
+    process: asyncio.subprocess.Process,
+) -> None:
+  """Terminates a process tree within bounded waits."""
+  if process.returncode is not None:
+    return
+
+  for force in (False, True):
+    await _signal_process_tree(process, force=force)
+    try:
+      await asyncio.wait_for(
+          process.wait(), timeout=_PROCESS_TERMINATION_GRACE_SECONDS
+      )
+      return
+    except asyncio.TimeoutError:
+      pass
+
+  logger.error("Process tree %d did not terminate cleanly", process.pid)
+
+
+async def _stream_test_output(
+    *,
+    agent_dir: str,
+    test_name: str | None,
+) -> AsyncIterator[bytes]:
+  """Runs pytest and yields bounded output chunks until completion."""
+  cmd_args = [
+      sys.executable,
+      "-m",
+      "pytest",
+      os.path.join(os.path.dirname(__file__), "agent_test_runner.py"),
+      "-s",
+      "-vv",
+  ]
+  if test_name:
+    name_to_use = test_name[:-5] if test_name.endswith(".json") else test_name
+    cmd_args.extend(["-k", name_to_use])
+
+  env = os.environ.copy()
+  env["ADK_TEST_FOLDER"] = agent_dir
+  process = await asyncio.create_subprocess_exec(
+      *cmd_args,
+      stdout=subprocess.PIPE,
+      stderr=subprocess.STDOUT,
+      env=env,
+      creationflags=(
+          getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+          if _IS_WINDOWS
+          else 0
+      ),
+      start_new_session=not _IS_WINDOWS,
+  )
+
+  try:
+    if process.stdout is None:
+      raise RuntimeError("pytest output pipe was not created")
+    while chunk := await process.stdout.read(_TEST_OUTPUT_CHUNK_BYTES):
+      yield chunk
+    await process.wait()
+  finally:
+    with anyio.CancelScope(shield=True):
+      await _terminate_process_tree(process)
+
+
 class DevServer(ApiServer):
   """Development server that extends ApiServer with dev-only endpoints.
 
   Inherits all production endpoints from ApiServer and adds development-specific
   endpoints for evaluation, debugging, and developer UI features.
+
+  Like ApiServer, all endpoints are unauthenticated. This server is intended
+  for local development only and must not be exposed to untrusted networks.
   """
+
+  _allow_special_agents: bool = True
+  _serves_debug_trace_endpoints: bool = True
+
+  def _get_agent_dir(self, app_name: str) -> str:
+    """Resolves the agent directory and validates the app name to prevent path traversal."""
+    if not self.agents_dir:
+      raise HTTPException(
+          status_code=500, detail="Agents directory is not configured"
+      )
+    if not app_name:
+      raise HTTPException(status_code=400, detail="App name cannot be empty")
+
+    # Validate app_name structure (must be dot-separated identifiers)
+    parts = app_name.split(NESTED_APP_SEPARATOR)
+    for part in parts:
+      if not part or not part.isidentifier():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid app name: {app_name!r}. App names must be valid "
+                "Python identifiers or paths separated by dots."
+            ),
+        )
+
+    # Resolve path
+    app_path = app_name.replace(NESTED_APP_SEPARATOR, "/")
+    agents_base = Path(self.agents_dir).resolve()
+    resolved_path = (agents_base / app_path).resolve()
+
+    if not resolved_path.is_relative_to(agents_base):
+      raise HTTPException(
+          status_code=400,
+          detail=f"Access denied: {app_name!r} is outside the agents directory",
+      )
+
+    return str(resolved_path)
+
+  def _load_initial_state(self, app_name: str) -> dict[str, Any]:
+    """Reads the optional ``initial_state.json`` next to an agent.
+
+    The file is read on every call, so edits apply to the next session without
+    restarting the server. A missing, unreadable or malformed file yields an
+    empty state rather than failing session creation.
+    """
+    try:
+      path = Path(self._get_agent_dir(app_name)) / _INITIAL_STATE_FILENAME
+    except HTTPException:
+      return {}
+    if not path.is_file():
+      return {}
+    try:
+      with open(path, "r", encoding="utf-8") as f:
+        initial_state = json.load(f)
+    except (OSError, ValueError) as e:
+      logger.warning("Ignoring %s: %s", path, e)
+      return {}
+    if not isinstance(initial_state, dict):
+      logger.warning("Ignoring %s: expected a JSON object", path)
+      return {}
+    return initial_state
+
+  async def _create_session(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      session_id: Optional[str] = None,
+      state: Optional[dict[str, Any]] = None,
+  ) -> Session:
+    """Creates a session seeded from the agent's ``initial_state.json``.
+
+    State supplied by the caller takes precedence over the file's values, key by
+    key. Only explicit session creation is seeded; a session that the runner
+    creates itself (``--auto_create_session``) is not. ``app:`` and ``user:``
+    keys in the file follow the usual state scoping.
+    """
+    initial_state = self._load_initial_state(app_name)
+    if initial_state:
+      state = {**initial_state, **(state or {})}
+    return await super()._create_session(
+        app_name=app_name,
+        user_id=user_id,
+        session_id=session_id,
+        state=state,
+    )
+
+  def _get_test_file_path(self, *, app_name: str, test_name: str) -> str:
+    """Resolves a test file to a path inside the app's own tests directory.
+
+    Every endpoint that turns a caller-supplied test name into a path goes
+    through here, so that none of them can be steered elsewhere on disk.
+
+    Raises:
+      HTTPException: if the app name is invalid, or the test name is anything
+        other than a plain file name sitting directly in that directory.
+    """
+    tests_dir = Path(self._get_agent_dir(app_name)) / "tests"
+    invalid_test_name = HTTPException(
+        status_code=400,
+        detail=(
+            f"Invalid test name: {test_name!r}. A test name must be the name"
+            " of a file directly inside the app's tests directory, not a path."
+        ),
+    )
+
+    # A bare file name only. Backslash is rejected because it separates path
+    # components on Windows, where the route's single-segment match lets it
+    # through.
+    if not test_name or Path(test_name).name != test_name or "\\" in test_name:
+      raise invalid_test_name
+
+    if not test_name.endswith(".json"):
+      test_name += ".json"
+
+    # Resolve before testing containment, so a symlinked test file cannot
+    # point outside either. A name the filesystem cannot resolve at all is
+    # refused rather than allowed through unchecked.
+    try:
+      test_file_path = (tests_dir / test_name).resolve()
+      resolved_tests_dir = tests_dir.resolve()
+    except (OSError, ValueError) as exc:
+      raise invalid_test_name from exc
+
+    if test_file_path.parent != resolved_tests_dir:
+      raise invalid_test_name
+
+    return str(test_file_path)
 
   def _register_dev_endpoints(
       self,
       app: FastAPI,
-      trace_dict: dict,
+      trace_dict: dict[str, dict[str, AttributeValue]],
       memory_exporter: Any,
+      log_exporter: WebUiLogExporter,
       web_assets_dir: Optional[str] = None,
-  ):
+  ) -> None:
     """Register all development-only endpoints.
 
-    This includes debug, evaluation, and graph visualization endpoints.
-    These endpoints should NOT be exposed in production deployments.
+    This includes debug, evaluation, graph visualization, and telemetry consent
+    endpoints. These endpoints should NOT be exposed in production deployments.
     """
+
+    @app.get("/config/telemetry")
+    async def get_telemetry_consent() -> dict[str, Any]:
+      """Gets the user configuration for telemetry consent."""
+      return {"telemetry": read_telemetry_consent()}
+
+    @app.post("/config/telemetry")
+    async def set_telemetry_consent(
+        req: TelemetryConsentRequest, request: FastAPIRequest
+    ) -> dict[str, Any]:
+      """Sets the user configuration for telemetry consent."""
+      if request.headers.get("x-adk-telemetry-request") != "true":
+        raise HTTPException(
+            status_code=400,
+            detail="Forbidden: missing required security header",
+        )
+      write_telemetry_consent(req.telemetry)
+      return {"telemetry": req.telemetry}
 
     # Import needed for eval endpoints
     from ..evaluation.constants import MISSING_EVAL_DEPENDENCIES_MESSAGE
@@ -197,8 +689,11 @@ class DevServer(ApiServer):
     # --- YAML content security ---
     _BLOCKED_YAML_KEYS = frozenset({"args"})
 
-    def _check_yaml_for_blocked_keys(content: bytes, filename: str) -> None:
-      """Raise if the YAML document contains any blocked keys."""
+    def _check_uploaded_yaml(
+        content: bytes, *, filename: str, app_name: str
+    ) -> None:
+      """Raise if the YAML would let the loader run code outside the app."""
+      app_root = _get_app_root(app_name)
       try:
         docs = list(yaml.safe_load_all(content))
       except yaml.YAMLError as exc:
@@ -213,6 +708,15 @@ class DevServer(ApiServer):
                   f"The '{key}' field is not allowed in builder uploads "
                   "because it can execute arbitrary code."
               )
+            if key in _CODE_REFERENCE_KEYS:
+              for reference in _iter_code_references(value):
+                _check_code_reference(
+                    reference,
+                    app_name=app_name,
+                    app_root=app_root,
+                    filename=filename,
+                    field_name=key,
+                )
             _walk(value)
         elif isinstance(node, list):
           for item in node:
@@ -356,7 +860,9 @@ class DevServer(ApiServer):
       return True
 
     @app.post(
-        "/dev/apps/{app_name}/builder/save", response_model_exclude_none=True
+        "/dev/apps/{app_name}/builder/save",
+        response_model_exclude_none=True,
+        dependencies=[Depends(_require_local_agent_builder_client)],
     )
     async def builder_build(
         app_name: str, files: list[UploadFile], tmp: Optional[bool] = False
@@ -369,7 +875,11 @@ class DevServer(ApiServer):
           uploads.append((rel_path, content))
 
         for rel_path, content in uploads:
-          _check_yaml_for_blocked_keys(content, f"{app_name}/{rel_path}")
+          _check_uploaded_yaml(
+              content,
+              filename=f"{app_name}/{rel_path}",
+              app_name=app_name,
+          )
 
         if tmp:
           app_root = _get_app_root(app_name)
@@ -404,21 +914,25 @@ class DevServer(ApiServer):
         return False
 
     @app.post(
-        "/dev/apps/{app_name}/builder/cancel", response_model_exclude_none=True
+        "/dev/apps/{app_name}/builder/cancel",
+        response_model_exclude_none=True,
+        dependencies=[Depends(_require_local_agent_builder_client)],
     )
     async def builder_cancel(app_name: str) -> bool:
       return cleanup_tmp(app_name)
 
     @app.get(
         "/dev/apps/{app_name}/builder",
+        response_model=None,
         response_model_exclude_none=True,
         response_class=PlainTextResponse,
+        dependencies=[Depends(_require_local_agent_builder_client)],
     )
     async def get_agent_builder(
         app_name: str,
         file_path: Optional[str] = None,
         tmp: Optional[bool] = False,
-    ):
+    ) -> str | FileResponse:
       try:
         app_root = _get_app_root(app_name)
       except ValueError as exc:
@@ -469,22 +983,13 @@ class DevServer(ApiServer):
         "/dev/apps/{app_name}/debug/trace/session/{session_id}",
         tags=[TAG_DEBUG],
     )
-    async def get_session_trace(app_name: str, session_id: str) -> Any:
+    async def get_session_trace(
+        app_name: str, session_id: str
+    ) -> list[WebUiSpan]:
       spans = memory_exporter.get_finished_spans(session_id)
       if not spans:
         return []
-      return [
-          {
-              "name": s.name,
-              "span_id": s.context.span_id,
-              "trace_id": s.context.trace_id,
-              "start_time": s.start_time,
-              "end_time": s.end_time,
-              "attributes": dict(s.attributes),
-              "parent_span_id": s.parent.span_id if s.parent else None,
-          }
-          for s in spans
-      ]
+      return ui_telemetry_from_otel(spans, log_exporter.get_finished_logs())
 
     if web_assets_dir:
       # TODO: remove this endpoint once build_graph_image is completed
@@ -502,7 +1007,8 @@ class DevServer(ApiServer):
         if self.agents_dir:
           import os
 
-          readme_path = os.path.join(self.agents_dir, app_name, "README.md")
+          agent_dir = self._get_agent_dir(app_name)
+          readme_path = os.path.join(agent_dir, "README.md")
           if os.path.exists(readme_path):
             try:
               with open(readme_path, "r", encoding="utf-8") as f:
@@ -557,7 +1063,7 @@ class DevServer(ApiServer):
     @app.get("/dev/apps/{app_name}/tests")
     async def list_tests(app_name: str) -> list[str]:
       """Lists all test JSON files for the given app."""
-      agent_dir = os.path.join(self.agents_dir, app_name)
+      agent_dir = self._get_agent_dir(app_name)
       tests_dir = os.path.join(agent_dir, "tests")
       if not os.path.exists(tests_dir):
         return []
@@ -568,118 +1074,68 @@ class DevServer(ApiServer):
       test_files = glob.glob(pattern)
       return sorted([os.path.basename(f) for f in test_files])
 
-    @app.post("/dev/apps/{app_name}/tests/rebuild")
+    @app.post(
+        "/dev/apps/{app_name}/tests/rebuild",
+        dependencies=[Depends(_require_local_agent_builder_client)],
+    )
     async def rebuild_app_tests(
         app_name: str, test_name: Optional[str] = None
     ) -> dict[str, str]:
       """Rebuilds tests for the app."""
-      agent_dir = os.path.join(self.agents_dir, app_name)
-
       if test_name:
-        if not test_name.endswith(".json"):
-          test_name += ".json"
-        path = os.path.join(agent_dir, "tests", test_name)
+        path = self._get_test_file_path(app_name=app_name, test_name=test_name)
       else:
-        path = agent_dir
+        path = self._get_agent_dir(app_name)
 
       from .agent_test_runner import rebuild_tests
 
       await asyncio.to_thread(rebuild_tests, path)
       return {"status": "success"}
 
-    @app.post("/dev/apps/{app_name}/tests/run")
+    @app.post(
+        "/dev/apps/{app_name}/tests/run",
+        dependencies=[Depends(_require_local_agent_builder_client)],
+    )
     async def run_app_tests(
         app_name: str, test_name: Optional[str] = None
     ) -> StreamingResponse:
       """Runs tests and streams pytest output."""
-      agent_dir = os.path.join(self.agents_dir, app_name)
+      agent_dir = self._get_agent_dir(app_name)
+      return StreamingResponse(
+          _stream_test_output(agent_dir=agent_dir, test_name=test_name),
+          media_type="text/plain",
+      )
 
-      import subprocess
-      import sys
-
-      queue = asyncio.Queue()
-
-      async def run_pytest_subprocess():
-        cmd_args = [
-            sys.executable,
-            "-m",
-            "pytest",
-            os.path.join(os.path.dirname(__file__), "agent_test_runner.py"),
-            "-s",
-            "-vv",
-        ]
-        if test_name:
-          name_to_use = (
-              test_name[:-5] if test_name.endswith(".json") else test_name
-          )
-          cmd_args.extend(["-k", name_to_use])
-
-        # Ensure environment variable is set
-        env = os.environ.copy()
-        env["ADK_TEST_FOLDER"] = agent_dir
-
-        try:
-          process = await asyncio.create_subprocess_exec(
-              *cmd_args,
-              stdout=subprocess.PIPE,
-              stderr=subprocess.STDOUT,
-              env=env,
-          )
-
-          while True:
-            line = await process.stdout.readline()
-            if not line:
-              break
-            await queue.put(line.decode("utf-8"))
-
-          await process.wait()
-        finally:
-          # Signal completion to generator
-          await queue.put(None)
-
-      # Start pytest in a background task
-      asyncio.create_task(run_pytest_subprocess())
-
-      async def generate():
-        while True:
-          item = await queue.get()
-          if item is None:
-            break
-          yield item.encode("utf-8")
-
-      return StreamingResponse(generate(), media_type="text/plain")
-
-    @app.put("/dev/apps/{app_name}/tests/{test_name}")
+    @app.put(
+        "/dev/apps/{app_name}/tests/{test_name}",
+        dependencies=[Depends(_require_local_agent_builder_client)],
+    )
     async def create_test(
         app_name: str, test_name: str, req: CreateTestRequest
     ) -> dict[str, str]:
       """Creates or updates a test file from session data."""
-      # Sanitize test_name to prevent directory traversal
-      test_name = os.path.basename(test_name)
-      agent_dir = os.path.join(self.agents_dir, app_name)
-      tests_dir = os.path.join(agent_dir, "tests")
-      os.makedirs(tests_dir, exist_ok=True)
+      test_file_path = self._get_test_file_path(
+          app_name=app_name, test_name=test_name
+      )
+      os.makedirs(os.path.dirname(test_file_path), exist_ok=True)
 
-      if not test_name.endswith(".json"):
-        test_name += ".json"
+      with open(test_file_path, "w", encoding="utf-8") as f:
+        json.dump(
+            req.session_data, f, indent=2, sort_keys=True, ensure_ascii=False
+        )
+        f.write("\n")
 
-      test_file_path = os.path.join(tests_dir, test_name)
+      return {"status": "success", "file": os.path.basename(test_file_path)}
 
-      with open(test_file_path, "w") as f:
-        json.dump(req.session_data, f, indent=2, sort_keys=True)
-
-      return {"status": "success", "file": test_name}
-
-    @app.delete("/dev/apps/{app_name}/tests/{test_name}")
+    @app.delete(
+        "/dev/apps/{app_name}/tests/{test_name}",
+        dependencies=[Depends(_require_local_agent_builder_client)],
+    )
     async def delete_test(app_name: str, test_name: str) -> dict[str, str]:
       """Deletes a specific test file."""
-      agent_dir = os.path.join(self.agents_dir, app_name)
-      tests_dir = os.path.join(agent_dir, "tests")
-
-      if not test_name.endswith(".json"):
-        test_name += ".json"
-
-      test_file_path = os.path.join(tests_dir, test_name)
+      test_file_path = self._get_test_file_path(
+          app_name=app_name, test_name=test_name
+      )
 
       if not os.path.exists(test_file_path):
         raise HTTPException(status_code=404, detail="Test file not found")
@@ -690,19 +1146,16 @@ class DevServer(ApiServer):
     @app.get("/dev/apps/{app_name}/tests/{test_name}")
     async def get_test_content(app_name: str, test_name: str) -> dict[str, Any]:
       """Fetches the content of a specific test file."""
-      agent_dir = os.path.join(self.agents_dir, app_name)
-      tests_dir = os.path.join(agent_dir, "tests")
-
-      if not test_name.endswith(".json"):
-        test_name += ".json"
-
-      test_file_path = os.path.join(tests_dir, test_name)
+      test_file_path = self._get_test_file_path(
+          app_name=app_name, test_name=test_name
+      )
 
       if not os.path.exists(test_file_path):
         raise HTTPException(status_code=404, detail="Test file not found")
 
-      with open(test_file_path, "r") as f:
-        return json.load(f)
+      with open(test_file_path, "r", encoding="utf-8") as f:
+        # A test file is a serialized JSON object.
+        return cast(dict[str, Any], json.load(f))
 
     # ========== EVALUATION ENDPOINTS ==========
 
@@ -710,6 +1163,7 @@ class DevServer(ApiServer):
         "/dev/apps/{app_name}/eval-sets",
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
+        dependencies=[Depends(_require_local_agent_builder_client)],
     )
     async def create_eval_set(
         app_name: str, create_eval_set_request: CreateEvalSetRequest
@@ -726,49 +1180,52 @@ class DevServer(ApiServer):
         ) from ve
 
     # TODO - remove after migration
+    @app.post(
+        "/dev/apps/{app_name}/eval_sets/{eval_set_id}",
+        response_model=None,
+        response_model_exclude_none=True,
+        tags=[TAG_EVALUATION],
+        dependencies=[Depends(_require_local_agent_builder_client)],
+    )
     @deprecated(
         "Please use create_eval_set instead. This will be removed in future"
         " releases."
     )
-    @app.post(
-        "/dev/apps/{app_name}/eval_sets/{eval_set_id}",
-        response_model_exclude_none=True,
-        tags=[TAG_EVALUATION],
-    )
     async def create_eval_set_legacy(
         app_name: str,
         eval_set_id: str,
-    ):
+    ) -> None:
       """Creates an eval set, given the id."""
       await create_eval_set(
           app_name=app_name,
           create_eval_set_request=CreateEvalSetRequest(
-              eval_set=UserEvalSet(eval_set_id=eval_set_id, eval_cases=[]),
+              eval_set=EvalSet(eval_set_id=eval_set_id, eval_cases=[]),
           ),
       )
 
     # TODO - remove after migration
-    @deprecated(
-        "Please use list_eval_sets instead. This will be removed in future"
-        " releases."
-    )
     @app.get(
         "/dev/apps/{app_name}/eval_sets",
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
+    )
+    @deprecated(
+        "Please use list_eval_sets instead. This will be removed in future"
+        " releases."
     )
     async def list_eval_sets_legacy(app_name: str) -> list[str]:
       list_eval_sets_response = await list_eval_sets(app_name)
       return list_eval_sets_response.eval_set_ids
 
     # TODO - remove after migration
-    @deprecated(
-        "Please use run_eval instead. This will be removed in future releases."
-    )
     @app.post(
         "/dev/apps/{app_name}/eval_sets/{eval_set_id}/run_eval",
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
+        dependencies=[Depends(_require_local_agent_builder_client)],
+    )
+    @deprecated(
+        "Please use run_eval instead. This will be removed in future releases."
     )
     async def run_eval_legacy(
         app_name: str, eval_set_id: str, req: RunEvalRequest
@@ -779,37 +1236,45 @@ class DevServer(ApiServer):
       return run_eval_response.run_eval_results
 
     # TODO - remove after migration
+    @app.get(
+        "/dev/apps/{app_name}/eval_results/{eval_result_id}",
+        response_model=EvalSetResult,
+        response_model_exclude_none=True,
+        tags=[TAG_EVALUATION],
+    )
     @deprecated(
         "Please use get_eval_result instead. This will be removed in future"
         " releases."
     )
-    @app.get(
-        "/dev/apps/{app_name}/eval_results/{eval_result_id}",
-        response_model_exclude_none=True,
-        tags=[TAG_EVALUATION],
-    )
     async def get_eval_result_legacy(
         app_name: str,
         eval_result_id: str,
-    ) -> EvalSetResult:
+    ) -> Response:
       try:
-        return self.eval_set_results_manager.get_eval_set_result(
+        eval_set_result = self.eval_set_results_manager.get_eval_set_result(
             app_name, eval_result_id
         )
-      except ValueError as ve:
-        raise HTTPException(status_code=404, detail=str(ve)) from ve
+        return JSONResponse(
+            content=_redact_credential_secrets(
+                eval_set_result.model_dump(
+                    exclude_none=True, by_alias=True, mode="json"
+                )
+            )
+        )
+      except (NotFoundError, ValueError) as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
       except ValidationError as ve:
         raise HTTPException(status_code=500, detail=str(ve)) from ve
 
     # TODO - remove after migration
-    @deprecated(
-        "Please use list_eval_results instead. This will be removed in future"
-        " releases."
-    )
     @app.get(
         "/dev/apps/{app_name}/eval_results",
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
+    )
+    @deprecated(
+        "Please use list_eval_results instead. This will be removed in future"
+        " releases."
     )
     async def list_eval_results_legacy(app_name: str) -> list[str]:
       list_eval_results_response = await list_eval_results(app_name)
@@ -832,22 +1297,27 @@ class DevServer(ApiServer):
 
     @app.post(
         "/dev/apps/{app_name}/eval-sets/{eval_set_id}/add-session",
+        response_model=None,
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
+        dependencies=[Depends(_require_local_agent_builder_client)],
     )
     @app.post(
         "/dev/apps/{app_name}/eval_sets/{eval_set_id}/add_session",
+        response_model=None,
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
+        dependencies=[Depends(_require_local_agent_builder_client)],
     )
     async def add_session_to_eval_set(
         app_name: str, eval_set_id: str, req: AddSessionToEvalSetRequest
-    ):
+    ) -> None:
       # Get the session
       session = await self.session_service.get_session(
           app_name=app_name, user_id=req.user_id, session_id=req.session_id
       )
-      assert session, "Session not found."
+      if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
 
       # Convert the session data to eval invocations
       invocations = evals.convert_session_to_eval_invocations(session)
@@ -872,6 +1342,8 @@ class DevServer(ApiServer):
         self.eval_sets_manager.add_eval_case(
             app_name, eval_set_id, new_eval_case
         )
+      except NotFoundError as nfe:
+        raise HTTPException(status_code=404, detail=str(nfe)) from nfe
       except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve)) from ve
 
@@ -896,24 +1368,32 @@ class DevServer(ApiServer):
 
     @app.get(
         "/dev/apps/{app_name}/eval-sets/{eval_set_id}/eval-cases/{eval_case_id}",
+        response_model=EvalCase,
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
     )
     @app.get(
         "/dev/apps/{app_name}/eval_sets/{eval_set_id}/evals/{eval_case_id}",
+        response_model=EvalCase,
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
     )
     async def get_eval(
         app_name: str, eval_set_id: str, eval_case_id: str
-    ) -> EvalCase:
+    ) -> Response:
       """Gets an eval case in an eval set."""
       eval_case_to_find = self.eval_sets_manager.get_eval_case(
           app_name, eval_set_id, eval_case_id
       )
 
       if eval_case_to_find:
-        return eval_case_to_find
+        return JSONResponse(
+            content=_redact_credential_secrets(
+                eval_case_to_find.model_dump(
+                    exclude_none=True, by_alias=True, mode="json"
+                )
+            )
+        )
 
       raise HTTPException(
           status_code=404,
@@ -924,20 +1404,24 @@ class DevServer(ApiServer):
 
     @app.put(
         "/dev/apps/{app_name}/eval-sets/{eval_set_id}/eval-cases/{eval_case_id}",
+        response_model=None,
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
+        dependencies=[Depends(_require_local_agent_builder_client)],
     )
     @app.put(
         "/dev/apps/{app_name}/eval_sets/{eval_set_id}/evals/{eval_case_id}",
+        response_model=None,
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
+        dependencies=[Depends(_require_local_agent_builder_client)],
     )
     async def update_eval(
         app_name: str,
         eval_set_id: str,
         eval_case_id: str,
         updated_eval_case: EvalCase,
-    ):
+    ) -> None:
       if (
           updated_eval_case.eval_id
           and updated_eval_case.eval_id != eval_case_id
@@ -962,10 +1446,12 @@ class DevServer(ApiServer):
     @app.delete(
         "/dev/apps/{app_name}/eval-sets/{eval_set_id}/eval-cases/{eval_case_id}",
         tags=[TAG_EVALUATION],
+        dependencies=[Depends(_require_local_agent_builder_client)],
     )
     @app.delete(
         "/dev/apps/{app_name}/eval_sets/{eval_set_id}/evals/{eval_case_id}",
         tags=[TAG_EVALUATION],
+        dependencies=[Depends(_require_local_agent_builder_client)],
     )
     async def delete_eval(
         app_name: str, eval_set_id: str, eval_case_id: str
@@ -981,6 +1467,7 @@ class DevServer(ApiServer):
         "/dev/apps/{app_name}/eval-sets/{eval_set_id}/run",
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
+        dependencies=[Depends(_require_local_agent_builder_client)],
     )
     async def run_eval(
         app_name: str, eval_set_id: str, req: RunEvalRequest
@@ -989,7 +1476,9 @@ class DevServer(ApiServer):
       # Create a mapping from eval set file to all the evals that needed to be
       # run.
       try:
+        from ..evaluation.eval_config import append_default_efficiency_metrics
         from ..evaluation.local_eval_service import LocalEvalService
+        from ..evaluation.simulation.user_simulator_provider import UserSimulatorProvider
         from .cli_eval import _collect_eval_results
         from .cli_eval import _collect_inferences
 
@@ -1002,8 +1491,20 @@ class DevServer(ApiServer):
 
         agent_or_app = self.agent_loader.load_agent(app_name)
         root_agent = self._get_root_agent(agent_or_app)
+        app = agent_or_app if isinstance(agent_or_app, App) else None
 
         eval_case_results = []
+
+        # The request carries the config as a raw mapping (OpenAPI-safe), so
+        # validate it into the typed `UserSimulatorConfig` union here.
+        if req.user_simulator_config is not None:
+          user_simulator_provider = UserSimulatorProvider(
+              user_simulator_config=TypeAdapter(
+                  _UserSimulatorConfig
+              ).validate_python(req.user_simulator_config)
+          )
+        else:
+          user_simulator_provider = UserSimulatorProvider()
 
         eval_service = LocalEvalService(
             root_agent=root_agent,
@@ -1011,21 +1512,38 @@ class DevServer(ApiServer):
             eval_set_results_manager=self.eval_set_results_manager,
             session_service=self.session_service,
             artifact_service=self.artifact_service,
+            user_simulator_provider=user_simulator_provider,
+            app=app,
         )
-        inference_request = InferenceRequest(
-            app_name=app_name,
-            eval_set_id=eval_set.eval_set_id,
-            eval_case_ids=req.eval_case_ids or req.eval_ids,
-            inference_config=InferenceConfig(),
-        )
+        if req.live_model_config:
+          inference_config = InferenceConfig(
+              use_live=True,
+              live_timeout_seconds=req.live_model_config.timeout_seconds,
+          )
+        else:
+          inference_config = InferenceConfig(use_live=False)
+
         inference_results = await _collect_inferences(
-            inference_requests=[inference_request], eval_service=eval_service
+            inference_requests=[
+                InferenceRequest(
+                    app_name=app_name,
+                    eval_set_id=eval_set.eval_set_id,
+                    eval_case_ids=req.eval_case_ids or req.eval_ids,
+                    inference_config=inference_config,
+                )
+            ],
+            eval_service=eval_service,
         )
 
+        # The request carries only what the user selected in the run dialog,
+        # and the efficiency metrics are not selectable there: they take no
+        # threshold, so the dialog has nothing to ask about. Adding them here
+        # is what makes "reported for every eval" hold for a run started from
+        # the Dev UI, and not only for one started from `adk eval`.
         eval_case_results = await _collect_eval_results(
             inference_results=inference_results,
             eval_service=eval_service,
-            eval_metrics=req.eval_metrics,
+            eval_metrics=append_default_efficiency_metrics(req.eval_metrics),
         )
       except ModuleNotFoundError as e:
         logger.exception("%s", e)
@@ -1052,21 +1570,29 @@ class DevServer(ApiServer):
 
     @app.get(
         "/dev/apps/{app_name}/eval-results/{eval_result_id}",
+        response_model=EvalResult,
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
     )
     async def get_eval_result(
         app_name: str,
         eval_result_id: str,
-    ) -> EvalResult:
+    ) -> Response:
       """Gets the eval result for the given eval id."""
       try:
         eval_set_result = self.eval_set_results_manager.get_eval_set_result(
             app_name, eval_result_id
         )
-        return EvalResult(**eval_set_result.model_dump())
-      except ValueError as ve:
-        raise HTTPException(status_code=404, detail=str(ve)) from ve
+        eval_result = EvalResult(**eval_set_result.model_dump())
+        return JSONResponse(
+            content=_redact_credential_secrets(
+                eval_result.model_dump(
+                    exclude_none=True, by_alias=True, mode="json"
+                )
+            )
+        )
+      except (NotFoundError, ValueError) as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
       except ValidationError as ve:
         raise HTTPException(status_code=500, detail=str(ve)) from ve
 
@@ -1094,10 +1620,15 @@ class DevServer(ApiServer):
 
         # Right now we ignore the app_name as eval metrics are not tied to the
         # app_name, but they could be moving forward.
-        metrics_info = (
-            DEFAULT_METRIC_EVALUATOR_REGISTRY.get_registered_metrics()
+        #
+        # Every registered metric is listed, including the ones that need no
+        # threshold. A caller that asks the user to set thresholds decides for
+        # itself which to offer -- `MetricInfo.requires_threshold` says which
+        # those are -- while a caller that only describes metrics, such as the
+        # Dev UI's result tooltips, needs the whole list.
+        return ListMetricsInfoResponse(
+            metrics_info=DEFAULT_METRIC_EVALUATOR_REGISTRY.get_registered_metrics()
         )
-        return ListMetricsInfoResponse(metrics_info=metrics_info)
       except ModuleNotFoundError as e:
         logger.exception("%s\n%s", MISSING_EVAL_DEPENDENCIES_MESSAGE, e)
         raise HTTPException(
@@ -1113,7 +1644,7 @@ class DevServer(ApiServer):
     )
     async def get_app_graph_dot(
         app_name: str, dark_mode: bool = False
-    ) -> GetEventGraphResult | dict:
+    ) -> GetEventGraphResult | dict[Any, Any]:
       """Returns the base agent graph in DOT format without any highlights.
 
       This endpoint allows the frontend to fetch the graph structure once
@@ -1139,12 +1670,13 @@ class DevServer(ApiServer):
     # TODO: This endpoint can be removed once we update adk web to stop consuming it
     @app.get(
         "/dev/apps/{app_name}/users/{user_id}/sessions/{session_id}/events/{event_id}/graph",
+        response_model=None,
         response_model_exclude_none=True,
         tags=[TAG_DEBUG],
     )
     async def get_event_graph(
         app_name: str, user_id: str, session_id: str, event_id: str
-    ):
+    ) -> GetEventGraphResult | dict[str, object]:
       session = await self.session_service.get_session(
           app_name=app_name, user_id=user_id, session_id=session_id
       )
@@ -1161,8 +1693,8 @@ class DevServer(ApiServer):
       if function_calls:
         function_call_highlights = []
         for function_call in function_calls:
-          from_name = event.author
-          to_name = function_call.name
+          from_name: str | None = event.author
+          to_name: str | None = function_call.name
           function_call_highlights.append((from_name, to_name))
           dot_graph = await agent_graph.get_agent_graph(
               root_agent, function_call_highlights
@@ -1187,7 +1719,15 @@ class DevServer(ApiServer):
       else:
         return {}
 
-  def _navigate_to_node(self, app_info: dict, node_path: str) -> dict | None:
+    register_dev_deploy_endpoints(
+        app,
+        get_agent_dir=self._get_agent_dir,
+        dependencies=[Depends(_require_local_agent_builder_client)],
+    )
+
+  def _navigate_to_node(
+      self, app_info: dict[str, Any], node_path: str
+  ) -> dict[str, Any] | None:
     """Navigate to a specific node in the agent hierarchy.
 
     Args:
@@ -1202,7 +1742,8 @@ class DevServer(ApiServer):
 
     # Strip leading/trailing slashes and split, filter out empty strings
     path_parts = [p for p in node_path.strip("/").split("/") if p]
-    current = app_info.get("root_agent")
+    # serialize_app_info emits every agent node as a dict.
+    current: dict[str, Any] | None = app_info.get("root_agent")
 
     if not current:
       return None
@@ -1213,7 +1754,7 @@ class DevServer(ApiServer):
       start_idx = 1
 
     for part in path_parts[start_idx:]:
-      found = None
+      found: dict[str, Any] | None = None
       # Check potential containers in order of preference
       containers = []
       if current.get("graph") and current["graph"].get("nodes"):
@@ -1238,8 +1779,8 @@ class DevServer(ApiServer):
     return current
 
   def _get_all_sub_workflows(
-      self, app_info: dict, current_path: str = ""
-  ) -> dict[str, dict]:
+      self, app_info: dict[str, Any], current_path: str = ""
+  ) -> dict[str, dict[str, Any]]:
     """Recursively discover all sub-workflows within the given app info.
 
     Args:
@@ -1249,7 +1790,7 @@ class DevServer(ApiServer):
     Returns:
       A dictionary mapping the node path to the corresponding agent info dict.
     """
-    workflows = {}
+    workflows: dict[str, dict[str, Any]] = {}
 
     agent_info = app_info.get("root_agent", app_info)
     if agent_info.get("graph"):
@@ -1274,7 +1815,8 @@ class DevServer(ApiServer):
 
     return workflows
 
-  def get_fast_api_app(self, **kwargs):
+  # Takes keyword arguments only, unlike ApiServer.get_fast_api_app.
+  def get_fast_api_app(self, **kwargs: Any) -> FastAPI:  # type: ignore[override]
     """Override to add dev endpoints after production endpoints.
 
     Calls parent's get_fast_api_app() to get the base app with production
@@ -1284,7 +1826,11 @@ class DevServer(ApiServer):
 
     web_assets_dir = kwargs.get("web_assets_dir", None)
     self._register_dev_endpoints(
-        app, self._trace_dict, self._memory_exporter, web_assets_dir
+        app,
+        self._trace_dict,
+        self._memory_exporter,
+        self._log_exporter,
+        web_assets_dir,
     )
 
     return app
